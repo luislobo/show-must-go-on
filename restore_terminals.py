@@ -849,7 +849,7 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
               file=sys.stderr)
         return list(sessions)
 
-    selected = [True] * len(sessions)
+    selected = [False] * len(sessions)
 
     def run(stdscr):
         curses.curs_set(0)
@@ -924,7 +924,10 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                 for i in range(len(selected)):
                     selected[i] = not selected[i]
             elif c in (10, 13, curses.KEY_ENTER):
-                return [s for s, keep in zip(sessions, selected) if keep]
+                picked = [s for s, keep in zip(sessions, selected) if keep]
+                if not picked:
+                    picked = [sessions[idx]]
+                return picked
 
     try:
         import curses
