@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -53,6 +54,9 @@ class Session:
     topic: str | None = None        # short label from AI (used as window title)
     abstract: str | None = None     # 1-2 sentence summary from AI
     summary_error: str | None = None
+    search_matches: list[dict] = field(default_factory=list)  # [{timestamp, role, snippet}]
+    git_remote: str | None = None
+    git_branch: str | None = None
 
     @property
     def span_minutes(self) -> float:
@@ -434,6 +438,165 @@ def summarize(session: Session, timeout: int = 90) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+_git_cache: dict[str, dict] = {}
+
+
+def _git_info(cwd: str | None) -> dict:
+    if not cwd:
+        return {}
+    if cwd in _git_cache:
+        return _git_cache[cwd]
+    info: dict = {}
+    if not Path(cwd).is_dir():
+        _git_cache[cwd] = info
+        return info
+    try:
+        r = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            info["remote"] = r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    try:
+        r = subprocess.run(["git", "-C", cwd, "branch", "--show-current"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            info["branch"] = r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    _git_cache[cwd] = info
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Content search (--find)
+# ---------------------------------------------------------------------------
+
+
+def _snippet_around(text: str, pattern: re.Pattern, ctx: int = 80) -> str:
+    m = pattern.search(text)
+    if not m:
+        return _truncate(text, 160)
+    start = max(0, m.start() - ctx)
+    end = min(len(text), m.end() + ctx)
+    snip = text[start:end]
+    if start > 0:
+        snip = "…" + snip
+    if end < len(text):
+        snip = snip + "…"
+    return " ".join(snip.split())
+
+
+def _extract_all_text_claude(d: dict) -> tuple[str, str, str]:
+    """(timestamp, role, all_text) from a Claude JSONL line."""
+    ts = d.get("timestamp") or ""
+    t = d.get("type") or ""
+    msg = d.get("message") if isinstance(d.get("message"), dict) else None
+    role = (msg or {}).get("role") or t
+    content = (msg or {}).get("content") if msg else None
+    text = ""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                for key in ("text", "content", "output", "input"):
+                    v = p.get(key)
+                    if isinstance(v, str):
+                        parts.append(v)
+        text = "\n".join(parts)
+    return ts, role, text
+
+
+def _extract_all_text_codex(d: dict) -> tuple[str, str, str]:
+    """(timestamp, role, all_text) from a Codex JSONL line."""
+    ts = d.get("timestamp") or ""
+    t = d.get("type") or ""
+    p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+    subt = p.get("type") or "" if isinstance(p, dict) else ""
+    role = subt or t
+    text = ""
+    for key in ("message", "text", "content", "output", "command"):
+        v = p.get(key) if isinstance(p, dict) else None
+        if isinstance(v, str) and v.strip():
+            text += v + "\n"
+    content = p.get("content") if isinstance(p, dict) else None
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict):
+                for key in ("text", "content"):
+                    v = c.get(key)
+                    if isinstance(v, str):
+                        text += v + "\n"
+    return ts, role, text
+
+
+def search_session(session: Session, pattern: re.Pattern,
+                   max_matches: int = 10) -> bool:
+    """Search a session's JSONL for pattern. Populates session.search_matches
+    and git info. Returns True if any match found."""
+    extractor = (_extract_all_text_claude if session.tool == "claude"
+                 else _extract_all_text_codex)
+    matches: list[dict] = []
+    try:
+        with session.path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # fast reject: raw line doesn't contain pattern → skip parse
+                if not pattern.search(line):
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts, role, text = extractor(d)
+                if text and pattern.search(text) and len(matches) < max_matches:
+                    matches.append({
+                        "timestamp": ts,
+                        "role": role,
+                        "snippet": _snippet_around(text, pattern),
+                    })
+    except OSError:
+        return False
+    # also check cwd and git metadata
+    gi = _git_info(session.cwd) if session.cwd else {}
+    session.git_remote = gi.get("remote")
+    session.git_branch = gi.get("branch")
+    cwd_match = bool(session.cwd and pattern.search(session.cwd))
+    remote_match = bool(session.git_remote and pattern.search(session.git_remote))
+    branch_match = bool(session.git_branch and pattern.search(session.git_branch))
+    if not matches and not cwd_match and not remote_match and not branch_match:
+        return False
+    session.search_matches = matches
+    return True
+
+
+def search_relevance(s: Session) -> float:
+    """Higher = more relevant. Factors: match count, recency, user-msg ratio."""
+    score = len(s.search_matches) * 10.0
+    # weight user/assistant matches higher than tool output
+    for m in s.search_matches:
+        if m["role"] in ("user", "user_message"):
+            score += 5.0
+        elif m["role"] in ("assistant", "agent_message"):
+            score += 2.0
+    # recency bonus: sessions from today score +20, 7d ago → +0
+    if s.last_ts:
+        days = s.age_days
+        score += max(0.0, 20.0 - days * (20.0 / 7.0))
+    # branch/remote exact match bonus
+    if s.git_branch and s.search_matches:
+        score += 15.0
+    return score
+
+
+# ---------------------------------------------------------------------------
 # Terminator command rendering
 # ---------------------------------------------------------------------------
 
@@ -532,6 +695,13 @@ def print_plan(sessions: list[Session], use_summary: bool) -> None:
         print(f"    last act: {fmt_dt(s.last_ts)}  ({s.age_days:.1f}d ago)")
         print(f"    msgs    : {s.message_count} total · {s.user_message_count} user · "
               f"{s.span_minutes:.0f}min span")
+        if s.git_remote or s.git_branch:
+            git_parts = []
+            if s.git_remote:
+                git_parts.append(f"remote={s.git_remote}")
+            if s.git_branch:
+                git_parts.append(f"branch={s.git_branch}")
+            print(f"    git     : {'  '.join(git_parts)}")
         if use_summary:
             if s.topic:
                 print(f"    topic   : {s.topic}")
@@ -542,6 +712,12 @@ def print_plan(sessions: list[Session], use_summary: bool) -> None:
         if not (use_summary and s.topic):
             print(f"    first   : {_truncate(s.first_user_prompt, 100)}")
             print(f"    last    : {_truncate(s.last_user_prompt, 100)}")
+        if s.search_matches:
+            print(f"    hits    : {len(s.search_matches)} match(es)")
+            for j, m in enumerate(s.search_matches[:3]):
+                ts_short = m["timestamp"][:16] if m["timestamp"] else ""
+                print(f"      [{j+1}] {ts_short} [{m['role']}] "
+                      f"{_truncate(m['snippet'], 140)}")
         print(f"    title   : {title}")
         argv = terminator_argv(s, title)
         print(f"    cmd     : {' '.join(shlex.quote(a) for a in argv)}")
@@ -656,9 +832,9 @@ def _row_text(s: Session, width: int) -> str:
     tool = f"{s.tool:<6}"
     cwd = short_cwd(s.cwd) or "?"
     label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
-    # budget: [x] ! 0.0d claude <cwd> — <label>
-    left = f"{tag} {age} {tool} {cwd}"
-    remaining = max(10, width - len(left) - 7)  # 7 = "[x] " + " — "
+    hits = f" ({len(s.search_matches)} hits)" if s.search_matches else ""
+    left = f"{tag} {age} {tool} {cwd}{hits}"
+    remaining = max(10, width - len(left) - 7)
     return f"{left}  {_truncate(label, remaining)}"
 
 
@@ -708,10 +884,13 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                     stdscr.addnstr(1 + (i - top), 0, text[:w], w, attr)
                 except curses.error:
                     pass
-            # footer: show abstract of current row
+            # footer: show match snippet (search mode) or abstract
             cur = sessions[idx]
-            footer = (cur.abstract or _truncate(cur.last_user_prompt, 200)
-                      or "(no preview)")
+            if cur.search_matches:
+                footer = cur.search_matches[0]["snippet"]
+            else:
+                footer = (cur.abstract or _truncate(cur.last_user_prompt, 200)
+                          or "(no preview)")
             try:
                 stdscr.addnstr(h - 1, 0, _truncate(footer, w - 1)[:w], w,
                                curses.A_DIM)
@@ -769,16 +948,22 @@ def main() -> int:
             "  restore              # preview plan — last 7 days, TUI-pick, cached summaries\n"
             "  restore --execute    # same but actually open each Terminator window\n"
             "\n"
+            "Search for sessions by content:\n"
+            "  restore --find feature/my-branch           # find by branch name\n"
+            "  restore --find DSBF-491                    # find by ticket\n"
+            "  restore --find feature/my-branch --execute  # find + launch\n"
+            "\n"
             "Other examples:\n"
             "  restore 14                     # lookback 14 days\n"
             "  restore --refresh              # regenerate AI summaries\n"
             "  restore --no-pick              # print everything, skip TUI\n"
-            "  restore 3 --execute --no-pick  # non-interactive: launch all from last 3 days\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("days", nargs="?", type=int, default=7,
                     help="lookback window in days (default: 7)")
+    ap.add_argument("--find", metavar="PATTERN",
+                    help="search sessions by content (branch, repo, ticket, any text)")
     ap.add_argument("--refresh", action="store_true",
                     help="regenerate AI summaries (otherwise uses ~/.ai/sessions.jsonl cache)")
     ap.add_argument("--no-pick", action="store_true",
@@ -803,17 +988,42 @@ def main() -> int:
     args.pick = (not args.no_pick) and sys.stdout.isatty() and sys.stdin.isatty()
 
     tools = {"claude", "codex"} if args.only == "all" else {args.only}
-    all_found = discover(tools)
-    filtered = apply_filters(
-        all_found,
-        days=args.days,
-        min_user_msgs=args.min_messages,
-        min_span_minutes=args.min_span_minutes,
-        project_glob=args.project,
-    )
-    ranked = rank(filtered)
 
-    print_stats(all_found, filtered, ranked)
+    # --find mode: content search, then rank by relevance
+    if args.find:
+        try:
+            pat = re.compile(args.find, re.IGNORECASE)
+        except re.error as e:
+            print(f"Invalid regex '{args.find}': {e}", file=sys.stderr)
+            return 1
+        # In search mode, relax the activity filters (min msgs=1, min span=0)
+        # so we don't miss sessions that briefly touched the topic.
+        all_found = discover(tools)
+        filtered = apply_filters(
+            all_found, days=args.days,
+            min_user_msgs=1, min_span_minutes=0.0,
+            project_glob=args.project,
+        )
+        print(f"  searching {len(filtered)} sessions (last {args.days}d) "
+              f"for /{args.find}/i ...")
+        hits = [s for s in filtered if search_session(s, pat)]
+        hits.sort(key=search_relevance, reverse=True)
+        if not hits:
+            print(f"\n  No sessions match '{args.find}'.\n")
+            return 0
+        print(f"  {len(hits)} session(s) match, ranked by relevance\n")
+        ranked = hits
+    else:
+        # Normal mode: activity-based
+        all_found = discover(tools)
+        filtered = apply_filters(
+            all_found, days=args.days,
+            min_user_msgs=args.min_messages,
+            min_span_minutes=args.min_span_minutes,
+            project_glob=args.project,
+        )
+        ranked = rank(filtered)
+        print_stats(all_found, filtered, ranked)
 
     cache_path = Path(args.cache).expanduser()
     cache = load_cache(cache_path)
