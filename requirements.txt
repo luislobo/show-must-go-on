@@ -1,0 +1,10 @@
+# No Python package dependencies — stdlib only (Python 3.10+)
+#
+# System requirements (install via package manager):
+#   - i3        (window manager — i3-msg for workspace detection/placement)
+#   - wmctrl    (X11 window list + PID mapping)
+#   - terminator (terminal emulator — terminator -u for standalone windows)
+#
+# Optional:
+#   - claude    (Claude Code CLI — for AI summaries via `claude -p`)
+#   - codex     (OpenAI Codex CLI — one of the session sources)
