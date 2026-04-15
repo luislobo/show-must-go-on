@@ -30,6 +30,7 @@ HOME = Path.home()
 CLAUDE_ROOT = HOME / ".claude" / "projects"
 CODEX_ROOT = HOME / ".codex" / "sessions"
 DEFAULT_CACHE = HOME / ".ai" / "sessions.jsonl"
+SNAPSHOTS_DIR = HOME / ".ai" / "snapshots"
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -57,6 +58,8 @@ class Session:
     search_matches: list[dict] = field(default_factory=list)  # [{timestamp, role, snippet}]
     git_remote: str | None = None
     git_branch: str | None = None
+    workspace: str | None = None    # i3 workspace name (e.g. " 1 ")
+    window_title: str | None = None # terminal window title at snapshot time
 
     @property
     def span_minutes(self) -> float:
@@ -624,37 +627,51 @@ def launch(sessions: list[Session]) -> int:
     """Spawn one detached Terminator window per session. Returns count launched."""
     import time
     launched = 0
-    procs: list[tuple[Session, subprocess.Popen]] = []
+    procs: list[tuple[Session, subprocess.Popen, str]] = []  # (session, proc, title)
     for s in sessions:
         title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
         argv = terminator_argv(s, title)
         try:
-            # stdin -> /dev/null; stdout/stderr inherited so Terminator errors
-            # (e.g. DBUS issues, missing DISPLAY) surface in this terminal.
             p = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,   # detach — survives this script exiting
+                start_new_session=True,
                 close_fds=True,
             )
-            procs.append((s, p))
+            ws_label = f" → ws={s.workspace!r}" if s.workspace and s.workspace != "?" else ""
+            procs.append((s, p, title))
             launched += 1
-            print(f"  ✓ spawned pid={p.pid}: {short_cwd(s.cwd)}  —  {title}")
+            print(f"  ✓ spawned pid={p.pid}: {short_cwd(s.cwd)}  —  {title}{ws_label}")
         except FileNotFoundError:
             print(f"  ✗ terminator not found in PATH — aborting", file=sys.stderr)
             return launched
         except OSError as e:
             print(f"  ✗ failed for {short_cwd(s.cwd)}: {e}", file=sys.stderr)
-        # small stagger so i3 / Terminator dbus don't race
         time.sleep(0.2)
-    # brief sanity check: any that died immediately?
-    time.sleep(0.8)
-    for s, p in procs:
+    # wait for windows to appear, then move to saved workspaces
+    time.sleep(1.0)
+    for s, p, title in procs:
         rc = p.poll()
         if rc is not None and rc != 0:
             print(f"  [!] pid={p.pid} exited rc={rc} ({short_cwd(s.cwd)}) — "
-                  f"Terminator likely folded into an existing instance or died; "
-                  f"see its output above.", file=sys.stderr)
+                  f"see Terminator output above.", file=sys.stderr)
+            continue
+        if s.workspace and s.workspace != "?":
+            # find the window by PID via wmctrl and move it
+            try:
+                wm = subprocess.run(["wmctrl", "-lp"], capture_output=True, text=True, timeout=3)
+                for line in wm.stdout.strip().splitlines():
+                    parts = line.split(None, 4)
+                    if len(parts) >= 3 and int(parts[2]) == p.pid:
+                        wid = parts[0]
+                        subprocess.run(
+                            ["i3-msg", f'[id={wid}] move to workspace {s.workspace}'],
+                            capture_output=True, timeout=3,
+                        )
+                        print(f"    → moved to workspace {s.workspace!r}")
+                        break
+            except (subprocess.TimeoutExpired, ValueError):
+                pass
     return launched
 
 
@@ -729,6 +746,244 @@ def print_stats(all_found: list[Session], after_filter: list[Session],
     print(f"  scanned: {len(all_found)} sessions on disk  "
           f"→ {len(after_filter)} after filters  "
           f"→ {len(ranked)} ranked by last activity")
+
+
+# ---------------------------------------------------------------------------
+# Live snapshot: detect running sessions from /proc
+# ---------------------------------------------------------------------------
+
+
+def _encode_cwd_to_project(cwd: str) -> str:
+    """Encode a cwd the way Claude Code names project dirs: /a/b.c → -a-b-c"""
+    import re
+    return re.sub(r'[^a-zA-Z0-9]', '-', cwd)
+
+
+def _most_recent_jsonl(project_dir: Path) -> tuple[str, Path] | None:
+    """Return (session_id, path) of the most recently modified JSONL in a project dir."""
+    best: tuple[float, str, Path] | None = None
+    for f in project_dir.glob("*.jsonl"):
+        if "subagents" in f.parts:
+            continue
+        try:
+            mt = f.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or mt > best[0]:
+            best = (mt, f.stem, f)
+    return (best[1], best[2]) if best else None
+
+
+def _find_claude_session(pid: int, argv: list[str], cwd: str) -> str | None:
+    """Find session_id for a running Claude process."""
+    # 1. If --resume <id> is in argv, take it directly
+    for i, arg in enumerate(argv):
+        if arg == "--resume" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--resume="):
+            return arg.split("=", 1)[1]
+    # 2. If --continue, it's the most recent session in project dir
+    # 3. Fallback: map cwd → project dir → most recent JSONL
+    encoded = _encode_cwd_to_project(cwd)
+    project_dir = CLAUDE_ROOT / encoded
+    if project_dir.is_dir():
+        result = _most_recent_jsonl(project_dir)
+        if result:
+            return result[0]
+    return None
+
+
+def _find_codex_session(pid: int) -> tuple[str, Path] | None:
+    """Find session_id for a running Codex process via its open fds."""
+    fd_dir = Path(f"/proc/{pid}/fd")
+    try:
+        fds = list(fd_dir.iterdir())
+    except OSError:
+        return None
+    codex_root = str(CODEX_ROOT)
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.startswith(codex_root) and target.endswith(".jsonl"):
+            p = Path(target)
+            # session_id is in the filename: rollout-<timestamp>-<uuid>.jsonl
+            return (p.stem, p)
+    return None
+
+
+def _get_i3_window_info() -> dict[int, tuple[str, str]]:
+    """Return {pid: (workspace_name, window_title)} from i3 tree + wmctrl."""
+    try:
+        tree = json.loads(subprocess.run(
+            ["i3-msg", "-t", "get_tree"], capture_output=True, text=True, timeout=5
+        ).stdout)
+        wmout = subprocess.run(
+            ["wmctrl", "-lp"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    # wid → workspace name from i3 tree
+    wid_to_ws: dict[int, str] = {}
+    def walk(node, ws_name=None):
+        if node.get("type") == "workspace":
+            ws_name = node.get("name", "?")
+        wid = node.get("window")
+        if wid:
+            wid_to_ws[wid] = ws_name or "?"
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            walk(child, ws_name)
+    walk(tree)
+    # pid → (ws, title) from wmctrl, resolved via i3 tree
+    pid_info: dict[int, tuple[str, str]] = {}
+    for line in wmout.strip().splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 4:
+            continue
+        wid_int = int(parts[0], 16)
+        pid = int(parts[2])
+        title = parts[4] if len(parts) > 4 else "?"
+        ws = wid_to_ws.get(wid_int, "?")
+        pid_info[pid] = (ws, title)
+    return pid_info
+
+
+def _find_window_for_pid(pid: int, pid_info: dict[int, tuple[str, str]]) -> tuple[str, str]:
+    """Walk up parent chain to find the terminal window hosting a process."""
+    check = pid
+    for _ in range(5):
+        if check in pid_info:
+            return pid_info[check]
+        try:
+            ppid = int(Path(f"/proc/{check}/stat").read_text().split()[3])
+            check = ppid
+        except (OSError, ValueError, IndexError):
+            break
+    return ("?", "?")
+
+
+def snapshot_active() -> list[dict]:
+    """Scan /proc for running claude/codex processes and return their session info."""
+    my_uid = os.getuid()
+    results: dict[str, dict] = {}  # keyed by session_id to dedupe
+    pid_info = _get_i3_window_info()
+
+    proc = Path("/proc")
+    for pid_dir in proc.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        pid = int(pid_dir.name)
+        try:
+            if pid_dir.stat().st_uid != my_uid:
+                continue
+        except OSError:
+            continue
+        # read cmdline
+        try:
+            raw = (pid_dir / "cmdline").read_bytes()
+            argv = [a for a in raw.decode("utf-8", errors="replace").split("\0") if a]
+        except OSError:
+            continue
+        if not argv:
+            continue
+        exe = os.path.basename(argv[0])
+        # identify tool
+        tool: str | None = None
+        if exe == "claude":
+            tool = "claude"
+        elif exe == "codex":
+            tool = "codex"
+        elif exe in ("node", "bash") and any("codex" in a for a in argv[1:3]):
+            tool = "codex"
+        else:
+            continue
+        # get cwd
+        try:
+            cwd = os.readlink(pid_dir / "cwd")
+        except OSError:
+            continue
+        # find session_id
+        session_id: str | None = None
+        jsonl_path: str | None = None
+        if tool == "claude":
+            session_id = _find_claude_session(pid, argv, cwd)
+            if session_id:
+                encoded = _encode_cwd_to_project(cwd)
+                p = CLAUDE_ROOT / encoded / f"{session_id}.jsonl"
+                if p.exists():
+                    jsonl_path = str(p)
+        elif tool == "codex":
+            found = _find_codex_session(pid)
+            if found:
+                session_id, jp = found
+                jsonl_path = str(jp)
+        if not session_id:
+            continue
+        # workspace + window title from i3
+        ws, win_title = _find_window_for_pid(pid, pid_info)
+        # dedupe: keep first seen (lowest PID tends to be the "real" one)
+        if session_id not in results:
+            results[session_id] = {
+                "tool": tool,
+                "session_id": session_id,
+                "cwd": cwd,
+                "pid": pid,
+                "jsonl_path": jsonl_path,
+                "workspace": ws,
+                "window_title": win_title,
+            }
+    return list(results.values())
+
+
+def save_snapshot(entries: list[dict]) -> Path:
+    """Write snapshot to ~/.ai/snapshots/<timestamp>.json, return path."""
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    path = SNAPSHOTS_DIR / f"{ts}.json"
+    # also symlink "latest"
+    latest = SNAPSHOTS_DIR / "latest.json"
+    with path.open("w") as f:
+        json.dump({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "sessions": entries,
+        }, f, indent=2)
+    try:
+        latest.unlink(missing_ok=True)
+        latest.symlink_to(path.name)
+    except OSError:
+        pass
+    return path
+
+
+def load_snapshot(path: Path | None = None) -> list[dict]:
+    """Load a snapshot file. Default: latest."""
+    if path is None:
+        path = SNAPSHOTS_DIR / "latest.json"
+    if not path.exists():
+        return []
+    with path.open() as f:
+        data = json.load(f)
+    return data.get("sessions", [])
+
+
+def snapshot_to_sessions(entries: list[dict]) -> list[Session]:
+    """Convert snapshot records to Session objects by parsing the JSONL files."""
+    sessions: list[Session] = []
+    for rec in entries:
+        path_str = rec.get("jsonl_path")
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if not p.exists():
+            continue
+        tool = rec["tool"]
+        parsed = parse_claude(p) if tool == "claude" else parse_codex(p)
+        if parsed:
+            parsed.workspace = rec.get("workspace")
+            parsed.window_title = rec.get("window_title")
+            sessions.append(parsed)
+    return sessions
 
 
 # ---------------------------------------------------------------------------
@@ -948,18 +1203,20 @@ def main() -> int:
         description="Show which Claude/Codex sessions to reopen as Terminator windows.",
         epilog=(
             "Typical flow:\n"
-            "  restore              # preview plan — last 7 days, TUI-pick, cached summaries\n"
-            "  restore --execute    # same but actually open each Terminator window\n"
+            "  restore              # preview — last 7 days, TUI-pick, cached summaries\n"
+            "  restore --execute    # same, but open each Terminator window\n"
+            "\n"
+            "Save + restore running sessions:\n"
+            "  restore --save                 # snapshot all running sessions now\n"
+            "  restore --load                 # restore from last snapshot\n"
+            "  restore --load --execute       # restore + launch\n"
             "\n"
             "Search for sessions by content:\n"
-            "  restore --find feature/my-branch           # find by branch name\n"
-            "  restore --find DSBF-491                    # find by ticket\n"
-            "  restore --find feature/my-branch --execute  # find + launch\n"
+            "  restore --find feature/branch  # find by branch name, ticket, any text\n"
             "\n"
-            "Other examples:\n"
-            "  restore 14                     # lookback 14 days\n"
-            "  restore --refresh              # regenerate AI summaries\n"
-            "  restore --no-pick              # print everything, skip TUI\n"
+            "Other:\n"
+            "  restore 14           # lookback 14 days\n"
+            "  restore --refresh    # regenerate AI summaries\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -973,6 +1230,10 @@ def main() -> int:
                     help="don't launch the TUI picker, print everything")
     ap.add_argument("--execute", action="store_true",
                     help="actually launch each Terminator window (default: dry-run only)")
+    ap.add_argument("--save", action="store_true",
+                    help="snapshot currently running sessions to ~/.ai/snapshots/")
+    ap.add_argument("--load", nargs="?", const="latest", default=None, metavar="FILE",
+                    help="restore from a snapshot (default: latest)")
 
     # Power-user knobs. Hidden from --help to keep the surface small.
     ap.add_argument("--min-messages", type=int, default=5, help=argparse.SUPPRESS)
@@ -991,6 +1252,81 @@ def main() -> int:
     args.pick = (not args.no_pick) and sys.stdout.isatty() and sys.stdin.isatty()
 
     tools = {"claude", "codex"} if args.only == "all" else {args.only}
+
+    # --save: snapshot currently running sessions and exit
+    if args.save:
+        active = snapshot_active()
+        if not active:
+            print("  no running claude/codex sessions found.")
+            return 0
+        path = save_snapshot(active)
+        print(f"  saved {len(active)} session(s) to {path}")
+        for entry in active:
+            ws = entry.get('workspace', '?')
+            wt = entry.get('window_title', '?')
+            print(f"    ws={ws!r:<6}  {entry['tool']:<6}  "
+                  f"{short_cwd(entry['cwd']):<50}  title={wt[:60]}")
+        print(f"  restore with: restore --load")
+        return 0
+
+    # --load: restore from a saved snapshot
+    if args.load is not None:
+        snap_path = (SNAPSHOTS_DIR / "latest.json" if args.load == "latest"
+                     else Path(args.load).expanduser())
+        entries = load_snapshot(snap_path)
+        if not entries:
+            print(f"  no snapshot found at {snap_path}")
+            return 1
+        print(f"  loaded {len(entries)} session(s) from {snap_path}")
+        # Skip sessions already running
+        already_running = {r["session_id"] for r in snapshot_active()}
+        before = len(entries)
+        entries = [e for e in entries if e["session_id"] not in already_running]
+        skipped = before - len(entries)
+        if skipped:
+            print(f"  skipped {skipped} already-running session(s)")
+        if not entries:
+            print("  all sessions are already running — nothing to restore.")
+            return 0
+        ranked = snapshot_to_sessions(entries)
+        if not ranked:
+            print("  none of the saved sessions could be parsed (files gone?)")
+            return 1
+        # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
+        cache_path = Path(args.cache).expanduser()
+        cache = load_cache(cache_path)
+        hydrate_from_cache(ranked, cache)
+        if args.summarize:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            targets = [s for s in ranked if needs_summary(s, cache, args.refresh)]
+            if targets:
+                print(f"  summarizing {len(targets)} session(s)...")
+                with ThreadPoolExecutor(max_workers=args.summary_workers) as ex:
+                    futs = {ex.submit(summarize, s): s for s in targets}
+                    for fut in as_completed(futs):
+                        s = futs[fut]
+                        marker = "✓" if s.topic else "·"
+                        print(f"    {marker} {short_cwd(s.cwd)} — "
+                              f"{s.topic or s.summary_error or '?'}")
+                for s in targets:
+                    if s.topic or s.abstract:
+                        cache[(s.tool, s.session_id)] = cache_record(s)
+                save_cache(cache_path, cache)
+        to_show = ranked
+        if args.pick:
+            picked = tui_pick(ranked)
+            if picked is None:
+                print("  (cancelled)")
+                return 0
+            to_show = picked
+        print_plan(to_show, use_summary=args.summarize)
+        if args.execute and to_show:
+            print(f"  launching {len(to_show)} Terminator window(s)...")
+            n = launch(to_show)
+            print(f"  done — {n}/{len(to_show)} launched\n")
+        else:
+            print("  (dry-run — add --execute to launch)\n")
+        return 0
 
     # --find mode: content search, then rank by relevance
     if args.find:
