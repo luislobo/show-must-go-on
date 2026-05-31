@@ -2,7 +2,7 @@
 
 Recover and relaunch your AI coding sessions after a reboot.
 
-If you run multiple terminals with AI coding agents (Claude Code, Codex) and lose them to a restart, crash, or reboot — this tool scans their session history on disk, figures out what you were working on, and reopens everything as Terminator windows on the correct i3 workspaces.
+If you run multiple terminals with AI coding agents (Claude Code, Codex) and lose them to a restart, crash, or reboot, this tool scans their session history on disk, figures out what you were working on, and reopens everything as Terminator windows on the correct i3 workspaces. For remote or headless work, it can also rebuild the selected sessions as tmux/byobu panes.
 
 ## The problem
 
@@ -35,25 +35,45 @@ restore --execute        # recover from session history on disk
 - **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q)
 - **i3 workspace-aware** — saves and restores the exact i3 workspace (including custom names like `" 1 "`) for each session
 - **One Terminator window per session** — `terminator -u` (no-dbus) so i3 sees each as a separate window to tile
+- **Byobu/tmux backend** — `--target=byobu` rebuilds sessions into panes/windows for SSH or non-GUI machines
 - **Duplicate detection** — `--load` checks `/proc` for already-running sessions and skips them
 - **Git metadata** — resolves each session's working directory to its git remote and current branch
+- **GitHub PR metadata** — when `gh` is installed and authenticated, shows PR number, state, title, and URL for matching branches
+- **Fast search prefilter** — when `rg` is installed, `--find` narrows candidate JSONL files before Python parsing
 - **Zero non-stdlib dependencies** — Python 3.10+ stdlib only; no pip install needed
 
 ## Requirements
 
-- **Python 3.10+**
+- **Python 3.10+** — no pip packages required
+- **Claude Code** and/or **Codex** CLI — the tools whose sessions you want to recover
+- **Linux** — session discovery and duplicate detection read `/proc`
+
+For the default GUI backend:
+
 - **i3 window manager** — required for workspace detection and window placement (`i3-msg`)
 - **wmctrl** — required for mapping process PIDs to X11 windows and workspaces
-- **Terminator** terminal emulator — required for `--execute` (uses `terminator -u` for standalone windows)
-- **Claude Code** and/or **Codex** CLI — the tools whose sessions you want to recover
-- **Linux with X11** — `/proc` scanning for live detection, `xdotool`/`wmctrl` for window management
-- **`claude` CLI on PATH** — optional, for AI summaries (works without it, you just get raw prompt previews)
-- **git** — optional, for git remote/branch display
+- **Terminator** — required for `restore --execute` with the default `--target=terminator`
+- **X11 session** — required for i3/wmctrl window placement
+
+For remote/headless use:
+
+- **tmux** or **byobu** — required for `restore --target=byobu --execute`
+
+Optional tools:
+
+- **claude** — AI summaries via `claude -p`; without it, restore still works with raw prompt previews
+- **git** — git remote/branch display
+- **gh** — GitHub PR metadata; run `gh auth login` first
+- **ripgrep** (`rg`) — faster `--find` pre-filtering
 
 ### Install requirements (Debian/Ubuntu)
 
 ```bash
-sudo apt install i3 terminator wmctrl
+# Full local desktop setup
+sudo apt install python3 git i3 terminator wmctrl ripgrep gh byobu tmux
+
+# Minimal SSH/headless setup for --target=byobu
+sudo apt install python3 git ripgrep gh byobu tmux
 ```
 
 ## Installation
@@ -63,12 +83,44 @@ sudo apt install i3 terminator wmctrl
 git clone https://github.com/luislobo/show-must-go-on.git
 cd show-must-go-on
 
-# Symlink to somewhere on your PATH
-ln -s "$(pwd)/restore_terminals.py" ~/bin/restore
-ln -s "$(pwd)/find_session.py" ~/bin/find-session
+# Install command symlinks into ~/bin
+./install.sh
+
+# If ~/bin is not already on PATH, add it to your shell profile
+export PATH="$HOME/bin:$PATH"
+```
+
+Manual install is just two symlinks:
+
+```bash
+mkdir -p ~/bin
+ln -sfn "$(pwd)/restore_terminals.py" ~/bin/restore
+ln -sfn "$(pwd)/find_session.py" ~/bin/find-session
 ```
 
 That's it. No `pip install`, no virtualenv, no build step.
+
+### Verify installation
+
+```bash
+restore --help
+find-session --help
+python3 -m py_compile restore_terminals.py find_session.py
+```
+
+### Moving to another computer
+
+The repo contains the scripts and installer, but it does not contain your private AI session history. On the new computer, install Claude Code and/or Codex first, then clone this repo and run `./install.sh`.
+
+To restore sessions from this computer on another one, copy the relevant session data too:
+
+```bash
+rsync -a ~/.claude/projects/ user@new-host:~/.claude/projects/
+rsync -a ~/.codex/sessions/ user@new-host:~/.codex/sessions/
+rsync -a ~/.ai/snapshots/ user@new-host:~/.ai/snapshots/
+```
+
+`~/.ai/sessions.jsonl` is only a summary cache. Copying it is optional; the tool can regenerate summaries.
 
 ## Usage
 
@@ -103,6 +155,22 @@ restore --refresh
 
 # Skip TUI, print everything to stdout
 restore --no-pick
+```
+
+### Remote/headless restore with byobu/tmux
+
+```bash
+# Preview the tmux/byobu plan
+restore --target=byobu
+
+# Build a tmux session named "restore"; attach after it prints the command
+restore --target=byobu --execute
+
+# Put each restored session in its own tmux window
+restore --target=byobu --layout=windows --execute
+
+# Put up to six panes in each tmux window
+restore --target=byobu --layout=hybrid --max-splits=6 --execute
 ```
 
 ### Search sessions
@@ -173,6 +241,16 @@ Each Terminator window:
 - Gets moved to its saved i3 workspace (exact name match, including spaces)
 - Resumes the AI agent session
 - Falls back to a shell when the agent exits
+
+### Byobu/tmux placement
+
+With `--target=byobu`, restore builds a tmux session instead of GUI windows:
+
+- Default session name is `restore`; override with `--byobu-session`
+- `--layout=hybrid` puts up to `--max-splits` panes in a window, then creates another window
+- `--layout=splits` puts all selected sessions in one window
+- `--layout=windows` creates one tmux window per session
+- Pane/window names use AI-generated slugs when summaries are available
 
 ## File layout
 

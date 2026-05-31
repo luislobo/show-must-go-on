@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-restore_terminals.py — dry-run prototype.
+restore_terminals.py — recover and relaunch AI coding sessions.
 
 Scans Claude Code and Codex session history on disk, figures out which
 sessions look like 'real terminals you were working in', and prints the
-exact `terminator` invocations that would be run to reopen each one as a
-separate window (one Terminator per session — i3 will place them).
+commands needed to reopen them as either Terminator windows or tmux/byobu
+panes.
 
 Deterministic core. Optional `--summarize` calls `claude -p` (CLI) to
 summarize the last hour of each candidate session.
 
-Nothing is launched. This is a dry-run by design.
+The default mode is a dry run. Add --execute to launch the selected sessions.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ CLAUDE_ROOT = HOME / ".claude" / "projects"
 CODEX_ROOT = HOME / ".codex" / "sessions"
 DEFAULT_CACHE = HOME / ".ai" / "sessions.jsonl"
 SNAPSHOTS_DIR = HOME / ".ai" / "snapshots"
+SLUG_MAX_LEN = 25
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -51,13 +52,20 @@ class Session:
     last_user_prompt: str | None = None
     last_role: str | None = None
     interrupted: bool = False       # last turn is assistant/tool — user wasn't replied to OR agent was mid-task
+    closed_with_clear: bool = False # last user action was /clear — session was abandoned, not paused
     last_hour_transcript: str = ""  # populated lazily for summarization
     topic: str | None = None        # short label from AI (used as window title)
+    slug: str | None = None         # short kebab-case slug from AI (used for tmux window/pane names)
     abstract: str | None = None     # 1-2 sentence summary from AI
     summary_error: str | None = None
     search_matches: list[dict] = field(default_factory=list)  # [{timestamp, role, snippet}]
     git_remote: str | None = None
     git_branch: str | None = None
+    pr_number: int | None = None
+    pr_title: str | None = None
+    pr_url: str | None = None
+    pr_state: str | None = None     # "open" | "merged" | "closed"
+    pr_fetched_at: datetime | None = None
     workspace: str | None = None    # i3 workspace name (e.g. " 1 ")
     window_title: str | None = None # terminal window title at snapshot time
 
@@ -169,6 +177,9 @@ def parse_claude(path: Path) -> Session | None:
     # interrupted: last meaningful turn is assistant (agent was mid-reply when killed)
     if last_assistant_ts and last_user_ts and last_assistant_ts > last_user_ts:
         s.interrupted = True
+    # closed_with_clear: user's last action was /clear — session was deliberately abandoned
+    if s.last_user_prompt and "<command-name>/clear</command-name>" in s.last_user_prompt:
+        s.closed_with_clear = True
     # last-hour transcript (for optional summarization)
     if s.last_ts:
         cutoff = s.last_ts - timedelta(hours=1)
@@ -246,7 +257,11 @@ def parse_codex(path: Path) -> Session | None:
 # ---------------------------------------------------------------------------
 
 
-def discover(tools: set[str]) -> list[Session]:
+def discover(tools: set[str], only_paths: set[Path] | None = None) -> list[Session]:
+    """Parse session JSONLs into Session objects.
+
+    If `only_paths` is given, skip files not in that set — used by `--find`
+    after rg has narrowed the candidate set."""
     out: list[Session] = []
     if "claude" in tools and CLAUDE_ROOT.exists():
         for proj in CLAUDE_ROOT.iterdir():
@@ -256,11 +271,15 @@ def discover(tools: set[str]) -> list[Session]:
                 # skip sub-agent transcripts under */subagents/*
                 if "subagents" in f.parts:
                     continue
+                if only_paths is not None and f not in only_paths:
+                    continue
                 parsed = parse_claude(f)
                 if parsed:
                     out.append(parsed)
     if "codex" in tools and CODEX_ROOT.exists():
         for f in CODEX_ROOT.rglob("rollout-*.jsonl"):
+            if only_paths is not None and f not in only_paths:
+                continue
             parsed = parse_codex(f)
             if parsed:
                 out.append(parsed)
@@ -274,6 +293,7 @@ def apply_filters(
     min_user_msgs: int,
     min_span_minutes: float,
     project_glob: str | None,
+    include_cleared: bool = False,
 ) -> list[Session]:
     import fnmatch
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -288,6 +308,8 @@ def apply_filters(
         if not s.cwd or not Path(s.cwd).exists():
             continue
         if project_glob and not fnmatch.fnmatch(s.cwd, project_glob):
+            continue
+        if s.closed_with_clear and not include_cleared:
             continue
         kept.append(s)
     return kept
@@ -369,19 +391,36 @@ def gather_project_context(cwd_str: str | None) -> str:
 
 
 SUMMARY_PROMPT = """\
-You classify a coding-agent session. Given:
+You classify a coding-agent session. Produce a concrete, scannable summary —
+the goal is for someone scanning a list of 30 sessions to immediately know
+which one this is.
+
+Given:
   1. PROJECT CONTEXT — identity docs from the working directory
-  2. LAST-HOUR TRANSCRIPT — the tail of the session right before it ended
+  2. GIT CONTEXT — branch and remote (often encodes a ticket ID or feature)
+  3. LAST-HOUR TRANSCRIPT — the tail of the session right before it ended
 
 Produce a STRICT JSON object, and nothing else:
 
-  {{"topic": "<3-8 word label, Title Case, no trailing punctuation>",
-    "abstract": "<1-2 sentences, <=40 words, describing what was being worked on and where it was left off>"}}
+  {{"topic": "<concrete short label, 3-8 words, Title Case, no trailing punctuation>",
+    "slug": "<short kebab-case identifier, max 25 chars, lowercase letters/digits/hyphens only>",
+    "abstract": "<2 sentences, <=50 words. Sentence 1: what was being worked on — name the concrete subject (component, file, feature, ticket ID). Sentence 2: the immediate next step or where the session was left off>"}}
+
+The topic MUST name the subject, not just the verb.
+  Bad: "Session Exit", "Bug Fix", "Code Review", "Documentation Pass"
+  Good: "Drop Cadence Iframe Config", "Fix S3 Multipart Retry", "ISO 25010 Doc Pass"
+If the branch encodes a ticket (e.g. PROJ-1234), include it. If the subject is
+genuinely unclear after reading both project context and transcript, prefer
+"Misc <repo-name> Cleanup" over a generic verb phrase.
 
 No preface. No markdown fences. No trailing text. Just the JSON object.
 
 ==== PROJECT CONTEXT (cwd: {cwd}) ====
 {project_ctx}
+
+==== GIT CONTEXT ====
+branch: {branch}
+remote: {remote}
 
 ==== LAST-HOUR TRANSCRIPT (tool: {tool}) ====
 {transcript}
@@ -412,6 +451,8 @@ def summarize(session: Session, timeout: int = 90) -> None:
     prompt = SUMMARY_PROMPT.format(
         cwd=session.cwd or "?",
         tool=session.tool,
+        branch=session.git_branch or "(none)",
+        remote=session.git_remote or "(none)",
         project_ctx=project_ctx[:PROJECT_CONTEXT_BUDGET],
         transcript=session.last_hour_transcript[:TRANSCRIPT_BUDGET],
     )
@@ -435,8 +476,11 @@ def summarize(session: Session, timeout: int = 90) -> None:
         session.abstract = result.stdout.strip()[:200] or None
         return
     topic = (obj.get("topic") or "").strip().rstrip(".!?") or None
+    raw_slug = (obj.get("slug") or "").strip() or None
+    slug = _slugify(raw_slug) or _slugify(topic)
     abstract = (obj.get("abstract") or "").strip() or None
     session.topic = topic
+    session.slug = slug
     session.abstract = abstract
 
 
@@ -472,6 +516,64 @@ def _git_info(cwd: str | None) -> dict:
         pass
     _git_cache[cwd] = info
     return info
+
+
+def hydrate_git_info(sessions: list[Session]) -> None:
+    """Populate git_branch and git_remote for each session, in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    def fill(s: Session) -> None:
+        if not s.cwd:
+            return
+        gi = _git_info(s.cwd)
+        s.git_branch = gi.get("branch") or s.git_branch
+        s.git_remote = gi.get("remote") or s.git_remote
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(fill, sessions))
+
+
+def fetch_pr_info(session: Session, timeout: int = 10) -> None:
+    """Populate session.pr_* via `gh pr list`. Mutates in place. Silent on
+    failure (no gh, no auth, no remote, no PR for this branch — all map to
+    'no PR info' which is fine)."""
+    if not session.git_branch:
+        return
+    if not session.cwd or not Path(session.cwd).is_dir():
+        return
+    if session.git_remote and "github" not in session.git_remote:
+        return
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "list",
+             "--head", session.git_branch,
+             "--state", "all",
+             "--json", "number,title,url,state",
+             "--limit", "1"],
+            cwd=session.cwd,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
+    if r.returncode != 0:
+        # don't mark fetched_at — let it retry next run (likely auth/remote issue)
+        return
+    session.pr_fetched_at = datetime.now(timezone.utc)
+    try:
+        prs = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(prs, list) or not prs:
+        # successful query, no PR for this branch — clear any stale cached data
+        session.pr_number = None
+        session.pr_title = None
+        session.pr_url = None
+        session.pr_state = None
+        return
+    pr = prs[0]
+    session.pr_number = pr.get("number")
+    session.pr_title = pr.get("title")
+    session.pr_url = pr.get("url")
+    state = pr.get("state")
+    session.pr_state = state.lower() if isinstance(state, str) else None
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +638,42 @@ def _extract_all_text_codex(d: dict) -> tuple[str, str, str]:
                     if isinstance(v, str):
                         text += v + "\n"
     return ts, role, text
+
+
+def _rg_candidate_paths(pattern_str: str, tools: set[str]) -> set[Path] | None:
+    """Pre-filter session files with ripgrep. Returns the set of JSONL paths
+    that contain at least one line matching `pattern_str`, or None if rg
+    isn't available or rejects the pattern (caller should fall back to a
+    full scan). Searches Claude and Codex roots as configured by `tools`."""
+    from shutil import which
+    if not which("rg"):
+        return None
+    paths: set[Path] = set()
+    targets: list[tuple[Path, list[str]]] = []
+    if "claude" in tools and CLAUDE_ROOT.exists():
+        targets.append((CLAUDE_ROOT,
+                        ["--glob", "*.jsonl", "--glob", "!**/subagents/**"]))
+    if "codex" in tools and CODEX_ROOT.exists():
+        targets.append((CODEX_ROOT, ["--glob", "rollout-*.jsonl"]))
+    for root, globs in targets:
+        try:
+            r = subprocess.run(
+                ["rg", "--files-with-matches", "--ignore-case",
+                 *globs, "-e", pattern_str, str(root)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        # rg exit codes: 0 = matches, 1 = no matches, 2 = error (bad regex etc.)
+        if r.returncode == 2:
+            return None
+        if r.returncode not in (0, 1):
+            return None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line:
+                paths.add(Path(line))
+    return paths
 
 
 def search_session(session: Session, pattern: re.Pattern,
@@ -676,6 +814,147 @@ def launch(sessions: list[Session]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Byobu / tmux backend
+# ---------------------------------------------------------------------------
+
+
+def _have(cmd: str) -> bool:
+    from shutil import which
+    return which(cmd) is not None
+
+
+def _pane_title(s: Session) -> str:
+    return s.slug or _slugify(s.topic) or s.session_id[:8]
+
+
+def _window_name(group: list[Session], idx: int) -> str:
+    first = group[0]
+    base = first.slug or _slugify(first.topic) or f"win-{idx + 1}"
+    if len(group) > 1:
+        return f"{base}+{len(group) - 1}"
+    return base
+
+
+def _byobu_groups(sessions: list[Session], layout: str, max_splits: int) -> list[list[Session]]:
+    if layout == "windows":
+        per = 1
+    elif layout == "splits":
+        per = max(1, len(sessions))
+    else:  # hybrid
+        per = max(1, max_splits)
+    return [sessions[i:i + per] for i in range(0, len(sessions), per)]
+
+
+def launch_byobu(
+    sessions: list[Session],
+    *,
+    layout: str,
+    max_splits: int,
+    split_direction: str,
+    session_name: str,
+) -> int:
+    """Build a tmux/byobu session with the picked sessions as panes/windows.
+
+    Returns the count of panes successfully placed. Does not attach — prints
+    the attach command at the end (or a switch-client hint if already in tmux).
+    """
+    if not _have("tmux"):
+        print("  ✗ tmux not found in PATH (install byobu / tmux first)", file=sys.stderr)
+        return 0
+    if not sessions:
+        return 0
+
+    groups = _byobu_groups(sessions, layout, max_splits)
+    split_flag = "-h" if split_direction == "h" else "-v"
+
+    has_session = subprocess.run(
+        ["tmux", "has-session", "-t", session_name],
+        capture_output=True,
+    ).returncode == 0
+
+    def inner(s: Session) -> str:
+        return f"{resume_cmd(s)}; exec $SHELL"
+
+    placed = 0
+    for gi, group in enumerate(groups):
+        wname = _window_name(group, gi)
+        first = group[0]
+        first_inner = inner(first)
+        if gi == 0 and not has_session:
+            argv = ["tmux", "new-session", "-d",
+                    "-s", session_name,
+                    "-n", wname,
+                    "-c", first.cwd or str(HOME),
+                    first_inner]
+        else:
+            argv = ["tmux", "new-window",
+                    "-t", f"{session_name}:",
+                    "-n", wname,
+                    "-c", first.cwd or str(HOME),
+                    first_inner]
+        rc = subprocess.run(argv, capture_output=True, text=True)
+        if rc.returncode != 0:
+            print(f"  ✗ tmux failed creating window {wname!r}: "
+                  f"{rc.stderr.strip()}", file=sys.stderr)
+            return placed
+        subprocess.run(
+            ["tmux", "select-pane", "-t", f"{session_name}:{wname}.0",
+             "-T", _pane_title(first)],
+            capture_output=True,
+        )
+        placed += 1
+        print(f"  ✓ {wname}.0  {short_cwd(first.cwd)}  —  {_pane_title(first)}")
+
+        for s in group[1:]:
+            argv = ["tmux", "split-window", split_flag,
+                    "-t", f"{session_name}:{wname}",
+                    "-c", s.cwd or str(HOME),
+                    inner(s)]
+            rc = subprocess.run(argv, capture_output=True, text=True)
+            if rc.returncode != 0:
+                print(f"  ✗ split failed in {wname!r}: {rc.stderr.strip()}",
+                      file=sys.stderr)
+                continue
+            subprocess.run(
+                ["tmux", "select-pane", "-t", f"{session_name}:{wname}",
+                 "-T", _pane_title(s)],
+                capture_output=True,
+            )
+            placed += 1
+            print(f"  ✓ {wname}.+  {short_cwd(s.cwd)}  —  {_pane_title(s)}")
+
+        if len(group) > 1:
+            if len(group) > 4:
+                tmux_layout = "tiled"
+            else:
+                tmux_layout = "even-horizontal" if split_direction == "h" else "even-vertical"
+            subprocess.run(
+                ["tmux", "select-layout", "-t", f"{session_name}:{wname}", tmux_layout],
+                capture_output=True,
+            )
+
+    # show pane titles in the border so slugs are visible
+    subprocess.run(
+        ["tmux", "set-option", "-t", session_name, "pane-border-status", "top"],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["tmux", "set-option", "-t", session_name, "pane-border-format", " #T "],
+        capture_output=True,
+    )
+
+    in_tmux = bool(os.environ.get("TMUX"))
+    print()
+    if in_tmux:
+        print(f"  built tmux session {session_name!r}. you're already in tmux — "
+              f"switch with:  tmux switch-client -t {session_name}")
+    else:
+        print(f"  built tmux session {session_name!r}. attach with:  "
+              f"byobu attach -t {session_name}   (or: tmux attach -t {session_name})")
+    return placed
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -695,13 +974,26 @@ def short_cwd(cwd: str | None) -> str:
     return cwd
 
 
-def print_plan(sessions: list[Session], use_summary: bool) -> None:
+def _slugify(text: str | None, max_len: int = SLUG_MAX_LEN) -> str | None:
+    if not text:
+        return None
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    if not s:
+        return None
+    return s[:max_len].rstrip("-") or None
+
+
+def print_plan(sessions: list[Session], use_summary: bool, target: str = "terminator") -> None:
     if not sessions:
         print("No sessions matched the filters. Try --days 30 or lower --min-messages.")
         return
 
-    print(f"\n  Would open {len(sessions)} Terminator window(s)  "
-          f"(--dry-run; i3 will tile them):\n")
+    if target == "byobu":
+        head = f"\n  Would place {len(sessions)} pane(s) into a byobu/tmux session  (--dry-run):\n"
+    else:
+        head = (f"\n  Would open {len(sessions)} Terminator window(s)  "
+                f"(--dry-run; i3 will tile them):\n")
+    print(head)
     for i, s in enumerate(sessions, 1):
         flag = " [INTERRUPTED]" if s.interrupted else ""
         title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
@@ -719,6 +1011,15 @@ def print_plan(sessions: list[Session], use_summary: bool) -> None:
             if s.git_branch:
                 git_parts.append(f"branch={s.git_branch}")
             print(f"    git     : {'  '.join(git_parts)}")
+        if s.pr_number:
+            pr_line = f"#{s.pr_number}"
+            if s.pr_state:
+                pr_line += f" ({s.pr_state})"
+            if s.pr_url:
+                pr_line += f"  {s.pr_url}"
+            print(f"    pr      : {pr_line}")
+            if s.pr_title:
+                print(f"              {_truncate(s.pr_title, 100)}")
         if use_summary:
             if s.topic:
                 print(f"    topic   : {s.topic}")
@@ -736,8 +1037,12 @@ def print_plan(sessions: list[Session], use_summary: bool) -> None:
                 print(f"      [{j+1}] {ts_short} [{m['role']}] "
                       f"{_truncate(m['snippet'], 140)}")
         print(f"    title   : {title}")
-        argv = terminator_argv(s, title)
-        print(f"    cmd     : {' '.join(shlex.quote(a) for a in argv)}")
+        if target == "byobu":
+            print(f"    slug    : {_pane_title(s)}")
+            print(f"    cmd     : {resume_cmd(s)}")
+        else:
+            argv = terminator_argv(s, title)
+            print(f"    cmd     : {' '.join(shlex.quote(a) for a in argv)}")
         print()
 
 
@@ -1041,7 +1346,11 @@ def save_cache(path: Path, records: dict[tuple[str, str], dict]) -> None:
 
 
 def hydrate_from_cache(sessions: list[Session], cache: dict[tuple[str, str], dict]) -> None:
-    """Attach cached topic/abstract to sessions whose last_ts matches the cache."""
+    """Attach cached topic/abstract/PR to sessions.
+
+    Topic/abstract are tied to last_ts (regenerated on new activity).
+    PR info is independent of session activity; we hydrate it regardless and
+    rely on `needs_pr_fetch` (TTL) to decide whether to refresh."""
     for s in sessions:
         rec = cache.get((s.tool, s.session_id))
         if not rec:
@@ -1049,7 +1358,14 @@ def hydrate_from_cache(sessions: list[Session], cache: dict[tuple[str, str], dic
         cached_last = rec.get("last_ts")
         if cached_last and cached_last == _ts_to_iso(s.last_ts):
             s.topic = rec.get("topic") or s.topic
+            s.slug = rec.get("slug") or s.slug or _slugify(s.topic)
             s.abstract = rec.get("abstract") or s.abstract
+        # PR info hydrates regardless of last_ts
+        s.pr_number = rec.get("pr_number") or s.pr_number
+        s.pr_title = rec.get("pr_title") or s.pr_title
+        s.pr_url = rec.get("pr_url") or s.pr_url
+        s.pr_state = rec.get("pr_state") or s.pr_state
+        s.pr_fetched_at = _parse_ts(rec.get("pr_fetched_at")) or s.pr_fetched_at
 
 
 def needs_summary(s: Session, cache: dict[tuple[str, str], dict], refresh: bool) -> bool:
@@ -1064,6 +1380,19 @@ def needs_summary(s: Session, cache: dict[tuple[str, str], dict], refresh: bool)
     return rec.get("last_ts") != _ts_to_iso(s.last_ts)
 
 
+def needs_pr_fetch(s: Session, refresh: bool, ttl_hours: float) -> bool:
+    """Re-fetch PR info if never fetched, refresh forced, or fetched > TTL ago.
+    Cache misses without git context are skipped (fetch_pr_info no-ops anyway)."""
+    if not s.git_branch:
+        return False
+    if refresh:
+        return True
+    if s.pr_fetched_at is None:
+        return True
+    age_hours = (datetime.now(timezone.utc) - s.pr_fetched_at).total_seconds() / 3600
+    return age_hours > ttl_hours
+
+
 def cache_record(s: Session) -> dict:
     return {
         "tool": s.tool,
@@ -1071,7 +1400,13 @@ def cache_record(s: Session) -> dict:
         "cwd": s.cwd,
         "last_ts": _ts_to_iso(s.last_ts),
         "topic": s.topic,
+        "slug": s.slug,
         "abstract": s.abstract,
+        "pr_number": s.pr_number,
+        "pr_title": s.pr_title,
+        "pr_url": s.pr_url,
+        "pr_state": s.pr_state,
+        "pr_fetched_at": _ts_to_iso(s.pr_fetched_at),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1086,9 +1421,16 @@ def _row_text(s: Session, width: int) -> str:
     age = f"{s.age_days:4.1f}d"
     tool = f"{s.tool:<6}"
     cwd = short_cwd(s.cwd) or "?"
+    branch = _truncate(s.git_branch, 25) if s.git_branch else ""
+    pr_marker = ""
+    if s.pr_number:
+        # short PR badge: #123 (o)pen / (m)erged / (c)losed — keeps row tight
+        st = (s.pr_state or "")[:1]
+        pr_marker = f" #{s.pr_number}{st}"
     label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
     hits = f" ({len(s.search_matches)} hits)" if s.search_matches else ""
-    left = f"{tag} {age} {tool} {cwd}{hits}"
+    branch_part = f"  {branch}{pr_marker}" if branch else pr_marker
+    left = f"{tag} {age} {tool} {cwd}{branch_part}{hits}"
     remaining = max(10, width - len(left) - 7)
     return f"{left}  {_truncate(label, remaining)}"
 
@@ -1114,7 +1456,8 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
-            body_h = max(1, h - 3)
+            # header (1) + 2-line footer (2) + 1 buffer = 4 lines reserved
+            body_h = max(1, h - 4)
             # scroll
             if idx < top:
                 top = idx
@@ -1139,15 +1482,30 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                     stdscr.addnstr(1 + (i - top), 0, text[:w], w, attr)
                 except curses.error:
                     pass
-            # footer: show match snippet (search mode) or abstract
+            # footer: line 1 = location (cwd + branch + PR), line 2 = abstract
             cur = sessions[idx]
+            loc_parts: list[str] = []
+            if cur.cwd:
+                loc_parts.append(short_cwd(cur.cwd))
+            if cur.git_branch:
+                loc_parts.append(f"branch: {cur.git_branch}")
+            if cur.pr_number:
+                pr_str = f"PR #{cur.pr_number}"
+                if cur.pr_state:
+                    pr_str += f" ({cur.pr_state})"
+                if cur.pr_title:
+                    pr_str += f" — {_truncate(cur.pr_title, 60)}"
+                loc_parts.append(pr_str)
+            loc_line = "  ·  ".join(loc_parts)
             if cur.search_matches:
-                footer = cur.search_matches[0]["snippet"]
+                desc_line = cur.search_matches[0]["snippet"]
             else:
-                footer = (cur.abstract or _truncate(cur.last_user_prompt, 200)
-                          or "(no preview)")
+                desc_line = (cur.abstract or _truncate(cur.last_user_prompt, 200)
+                             or "(no preview)")
             try:
-                stdscr.addnstr(h - 1, 0, _truncate(footer, w - 1)[:w], w,
+                stdscr.addnstr(h - 2, 0, _truncate(loc_line, w - 1)[:w], w,
+                               curses.A_DIM | curses.A_BOLD)
+                stdscr.addnstr(h - 1, 0, _truncate(desc_line, w - 1)[:w], w,
                                curses.A_DIM)
             except curses.error:
                 pass
@@ -1197,6 +1555,83 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
 # ---------------------------------------------------------------------------
 
 
+def enrich_sessions(
+    sessions: list[Session],
+    *,
+    cache: dict[tuple[str, str], dict],
+    cache_path: Path,
+    summarize_enabled: bool,
+    fetch_pr_enabled: bool,
+    refresh: bool,
+    pr_ttl_hours: float,
+    summary_workers: int,
+) -> None:
+    """Hydrate git info, run summarize/PR-fetch as needed, persist cache.
+    Mutates sessions and cache in place."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if not sessions:
+        return
+
+    # Git context first — summarize uses branch in its prompt, PR fetch uses it directly.
+    hydrate_git_info(sessions)
+
+    summary_targets: list[Session] = []
+    if summarize_enabled:
+        summary_targets = [s for s in sessions if needs_summary(s, cache, refresh)]
+        skipped = len(sessions) - len(summary_targets)
+        if skipped:
+            print(f"\n  cache hit: {skipped} session(s) reused from "
+                  f"{cache_path} (use --refresh to regenerate)")
+        if summary_targets:
+            print(f"  summarizing {len(summary_targets)} session(s) via `claude -p` "
+                  f"({summary_workers} in parallel)...")
+            with ThreadPoolExecutor(max_workers=summary_workers) as ex:
+                futs = {ex.submit(summarize, s): s for s in summary_targets}
+                done = 0
+                for fut in as_completed(futs):
+                    s = futs[fut]
+                    done += 1
+                    marker = "✓" if s.topic else "·"
+                    label = s.topic or s.summary_error or "(no topic)"
+                    print(f"    [{done}/{len(summary_targets)}] {marker} "
+                          f"{short_cwd(s.cwd)}  ({s.tool}) — "
+                          f"{_truncate(label, 70)}")
+
+    pr_targets: list[Session] = []
+    if fetch_pr_enabled:
+        pr_targets = [s for s in sessions if needs_pr_fetch(s, refresh, pr_ttl_hours)]
+        if pr_targets:
+            print(f"  fetching PR info for {len(pr_targets)} session(s) via `gh`...")
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(fetch_pr_info, pr_targets))
+            n_with_pr = sum(1 for s in pr_targets if s.pr_number)
+            print(f"    found {n_with_pr} PR(s)")
+
+    touched_ids = {id(s) for s in summary_targets} | {id(s) for s in pr_targets}
+    if touched_ids:
+        for s in sessions:
+            if id(s) in touched_ids:
+                cache[(s.tool, s.session_id)] = cache_record(s)
+        save_cache(cache_path, cache)
+        print(f"  cache updated: {cache_path}")
+
+
+def _launch_dispatch(args, sessions: list[Session]) -> int:
+    if args.target == "byobu":
+        return launch_byobu(
+            sessions,
+            layout=args.layout,
+            max_splits=args.max_splits,
+            split_direction=args.split_direction,
+            session_name=args.byobu_session,
+        )
+    return launch(sessions)
+
+
+def _backend_label(target: str) -> str:
+    return "byobu/tmux pane(s)" if target == "byobu" else "Terminator window(s)"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="restore",
@@ -1214,6 +1649,12 @@ def main() -> int:
             "Search for sessions by content:\n"
             "  restore --find feature/branch  # find by branch name, ticket, any text\n"
             "\n"
+            "Remote / SSH (byobu / tmux panes instead of GUI windows):\n"
+            "  restore --target=byobu --execute            # build a 'restore' tmux session\n"
+            "  restore --target=byobu --layout=splits      # all picked sessions as splits\n"
+            "  restore --target=byobu --layout=windows     # one window per session\n"
+            "  restore --target=byobu --max-splits=6       # 6 splits per window, then overflow\n"
+            "\n"
             "Other:\n"
             "  restore 14           # lookback 14 days\n"
             "  restore --refresh    # regenerate AI summaries\n"
@@ -1229,7 +1670,22 @@ def main() -> int:
     ap.add_argument("--no-pick", action="store_true",
                     help="don't launch the TUI picker, print everything")
     ap.add_argument("--execute", action="store_true",
-                    help="actually launch each Terminator window (default: dry-run only)")
+                    help="actually launch (default: dry-run only)")
+    ap.add_argument("--target", choices=["terminator", "byobu"], default="terminator",
+                    help="launch backend: 'terminator' (i3 windows) or 'byobu' "
+                         "(tmux panes/windows in one session). default: terminator")
+    ap.add_argument("--layout", choices=["splits", "windows", "hybrid"], default="hybrid",
+                    help="byobu only: 'splits' = all panes in one window, "
+                         "'windows' = one window per session, "
+                         "'hybrid' = split up to --max-splits per window, overflow to new windows. "
+                         "default: hybrid")
+    ap.add_argument("--max-splits", type=int, default=4,
+                    help="byobu hybrid layout: max panes per window before a new window starts (default: 4)")
+    ap.add_argument("--split-direction", choices=["h", "v"], default="h",
+                    help="byobu only: 'h' = side-by-side (default, good for wide screens), "
+                         "'v' = stacked top/bottom")
+    ap.add_argument("--byobu-session", default="restore",
+                    help="byobu only: tmux session name to build into (default: restore)")
     ap.add_argument("--save", action="store_true",
                     help="snapshot currently running sessions to ~/.ai/snapshots/")
     ap.add_argument("--load", nargs="?", const="latest", default=None, metavar="FILE",
@@ -1242,6 +1698,9 @@ def main() -> int:
                     help=argparse.SUPPRESS)
     ap.add_argument("--project", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--no-ai", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--no-gh", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--include-cleared", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--pr-ttl-hours", type=float, default=6.0, help=argparse.SUPPRESS)
     ap.add_argument("--summary-limit", type=int, default=20, help=argparse.SUPPRESS)
     ap.add_argument("--summary-workers", type=int, default=3, help=argparse.SUPPRESS)
     ap.add_argument("--cache", default=str(DEFAULT_CACHE), help=argparse.SUPPRESS)
@@ -1249,6 +1708,7 @@ def main() -> int:
 
     # Defaults: summarize unless --no-ai; pick via TUI if TTY and not --no-pick.
     args.summarize = not args.no_ai
+    args.fetch_pr = (not args.no_gh) and bool(_have("gh"))
     args.pick = (not args.no_pick) and sys.stdout.isatty() and sys.stdin.isatty()
 
     tools = {"claude", "codex"} if args.only == "all" else {args.only}
@@ -1296,22 +1756,16 @@ def main() -> int:
         cache_path = Path(args.cache).expanduser()
         cache = load_cache(cache_path)
         hydrate_from_cache(ranked, cache)
-        if args.summarize:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            targets = [s for s in ranked if needs_summary(s, cache, args.refresh)]
-            if targets:
-                print(f"  summarizing {len(targets)} session(s)...")
-                with ThreadPoolExecutor(max_workers=args.summary_workers) as ex:
-                    futs = {ex.submit(summarize, s): s for s in targets}
-                    for fut in as_completed(futs):
-                        s = futs[fut]
-                        marker = "✓" if s.topic else "·"
-                        print(f"    {marker} {short_cwd(s.cwd)} — "
-                              f"{s.topic or s.summary_error or '?'}")
-                for s in targets:
-                    if s.topic or s.abstract:
-                        cache[(s.tool, s.session_id)] = cache_record(s)
-                save_cache(cache_path, cache)
+        enrich_sessions(
+            ranked,
+            cache=cache,
+            cache_path=cache_path,
+            summarize_enabled=args.summarize,
+            fetch_pr_enabled=args.fetch_pr,
+            refresh=args.refresh,
+            pr_ttl_hours=args.pr_ttl_hours,
+            summary_workers=args.summary_workers,
+        )
         to_show = ranked
         if args.pick:
             picked = tui_pick(ranked)
@@ -1319,11 +1773,11 @@ def main() -> int:
                 print("  (cancelled)")
                 return 0
             to_show = picked
-        print_plan(to_show, use_summary=args.summarize)
+        print_plan(to_show, use_summary=args.summarize, target=args.target)
         if args.execute and to_show:
-            print(f"  launching {len(to_show)} Terminator window(s)...")
-            n = launch(to_show)
-            print(f"  done — {n}/{len(to_show)} launched\n")
+            print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
+            n = _launch_dispatch(args, to_show)
+            print(f"  done — {n}/{len(to_show)} placed\n")
         else:
             print("  (dry-run — add --execute to launch)\n")
         return 0
@@ -1335,13 +1789,21 @@ def main() -> int:
         except re.error as e:
             print(f"Invalid regex '{args.find}': {e}", file=sys.stderr)
             return 1
+        # Pre-filter with ripgrep when available: drops parsing cost from
+        # "every JSONL on disk" to "only files containing the pattern". The
+        # Python pass below remains authoritative (it matches on extracted
+        # text, not the raw JSON line) for snippets and cwd/branch matches.
+        rg_paths = _rg_candidate_paths(args.find, tools)
+        if rg_paths is not None:
+            print(f"  rg pre-filter: {len(rg_paths)} candidate file(s)")
         # In search mode, relax the activity filters (min msgs=1, min span=0)
         # so we don't miss sessions that briefly touched the topic.
-        all_found = discover(tools)
+        all_found = discover(tools, only_paths=rg_paths)
         filtered = apply_filters(
             all_found, days=args.days,
             min_user_msgs=1, min_span_minutes=0.0,
             project_glob=args.project,
+            include_cleared=args.include_cleared,
         )
         print(f"  searching {len(filtered)} sessions (last {args.days}d) "
               f"for /{args.find}/i ...")
@@ -1360,6 +1822,7 @@ def main() -> int:
             min_user_msgs=args.min_messages,
             min_span_minutes=args.min_span_minutes,
             project_glob=args.project,
+            include_cleared=args.include_cleared,
         )
         ranked = rank(filtered)
         print_stats(all_found, filtered, ranked)
@@ -1370,33 +1833,18 @@ def main() -> int:
     # Always hydrate from cache — cheap, keeps previews around even without --summarize.
     hydrate_from_cache(ranked, cache)
 
-    if args.summarize and ranked:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        targets = [s for s in ranked[: args.summary_limit]
-                   if needs_summary(s, cache, args.refresh)]
-        skipped = min(len(ranked), args.summary_limit) - len(targets)
-        if skipped:
-            print(f"\n  cache hit: {skipped} session(s) reused from "
-                  f"{cache_path} (use --refresh to regenerate)")
-        if targets:
-            print(f"  summarizing {len(targets)} session(s) via `claude -p` "
-                  f"({args.summary_workers} in parallel)...")
-            with ThreadPoolExecutor(max_workers=args.summary_workers) as ex:
-                futs = {ex.submit(summarize, s): s for s in targets}
-                done = 0
-                for fut in as_completed(futs):
-                    s = futs[fut]
-                    done += 1
-                    marker = "✓" if s.topic else "·"
-                    label = s.topic or s.summary_error or "(no topic)"
-                    print(f"    [{done}/{len(targets)}] {marker} {short_cwd(s.cwd)}  "
-                          f"({s.tool}) — {_truncate(label, 70)}")
-            # persist new/refreshed records
-            for s in targets:
-                if s.topic or s.abstract:
-                    cache[(s.tool, s.session_id)] = cache_record(s)
-            save_cache(cache_path, cache)
-            print(f"  cache updated: {cache_path}")
+    # Only enrich the top slice that the user is likely to see/pick. Sessions
+    # past the limit get cwd-only display (still better than nothing).
+    enrich_sessions(
+        ranked[: args.summary_limit],
+        cache=cache,
+        cache_path=cache_path,
+        summarize_enabled=args.summarize and bool(ranked),
+        fetch_pr_enabled=args.fetch_pr and bool(ranked),
+        refresh=args.refresh,
+        pr_ttl_hours=args.pr_ttl_hours,
+        summary_workers=args.summary_workers,
+    )
 
     # Optional: TUI pick
     to_show = ranked
@@ -1408,11 +1856,11 @@ def main() -> int:
         to_show = picked
         print(f"\n  selected {len(to_show)}/{len(ranked)} session(s)")
 
-    print_plan(to_show, use_summary=args.summarize)
+    print_plan(to_show, use_summary=args.summarize, target=args.target)
     if args.execute and to_show:
-        print(f"  launching {len(to_show)} Terminator window(s)...")
-        n = launch(to_show)
-        print(f"  done — {n}/{len(to_show)} launched\n")
+        print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
+        n = _launch_dispatch(args, to_show)
+        print(f"  done — {n}/{len(to_show)} placed\n")
     else:
         print("  (dry-run; nothing was launched — add --execute to launch)\n")
     return 0
