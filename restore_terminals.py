@@ -2076,7 +2076,7 @@ def enrich_sessions(
         skipped = len(sessions) - len(summary_targets)
         if skipped:
             print(f"\n  {paint('cache hit:', 'ok')} {paint(skipped, 'bold')} session(s) reused from "
-                  f"{cache_path} (use --refresh to regenerate)")
+                  f"{short_cwd(str(cache_path))} (use --refresh to regenerate)")
         if summary_targets:
             print(f"  {paint('summarizing', 'accent')} {paint(len(summary_targets), 'bold')} "
                   f"session(s) via `claude -p` ({summary_workers} in parallel)...")
@@ -2109,7 +2109,7 @@ def enrich_sessions(
             if id(s) in touched_ids:
                 cache[(s.tool, s.session_id)] = cache_record(s)
         save_cache(cache_path, cache)
-        print(f"  {paint('cache updated:', 'ok')} {cache_path}")
+        print(f"  {paint('cache updated:', 'ok')} {short_cwd(str(cache_path))}")
 
 
 def _launch_dispatch(args, sessions: list[Session]) -> int:
@@ -2240,7 +2240,7 @@ def main() -> int:
             print("  no running claude/codex sessions found.")
             return 0
         path = save_snapshot(active)
-        print(f"  saved {len(active)} session(s) to {path}")
+        print(f"  saved {len(active)} session(s) to {short_cwd(str(path))}")
         for entry in active:
             wt = entry.get('window_title') or '?'
             print(f"    {_placement_label(entry):<22}  {entry['tool']:<6}  "
@@ -2254,9 +2254,10 @@ def main() -> int:
                      else Path(args.load).expanduser())
         entries = load_snapshot(snap_path)
         if not entries:
-            print(f"  no snapshot found at {snap_path}")
+            print(f"  no snapshot found at {short_cwd(str(snap_path))}")
             return 1
-        print(f"  {paint('loaded', 'ok')} {paint(len(entries), 'bold')} session(s) from {snap_path}")
+        print(f"  {paint('loaded', 'ok')} {paint(len(entries), 'bold')} session(s) "
+              f"from {short_cwd(str(snap_path))}")
         # Skip sessions already running
         already_running = {r["session_id"] for r in snapshot_active(with_windows=False)}
         before = len(entries)
