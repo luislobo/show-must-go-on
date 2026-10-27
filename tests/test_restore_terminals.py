@@ -191,6 +191,33 @@ class GhosttyPlacements(unittest.TestCase):
         self.assertEqual([m for _, m in self.modes(ss, "saved")], ["window", "window"])
 
 
+class ShellLine(unittest.TestCase):
+    def test_paths_under_home_use_a_tilde(self):
+        with mock.patch.object(rt, "HOME", Path("/Users/u")):
+            self.assertEqual(rt._shell_quote_path("/Users/u"), "~")
+            self.assertEqual(rt._shell_quote_path("/Users/u/Dev/x"), "~/Dev/x")
+            self.assertEqual(rt._shell_quote_path("/Users/u/My Projects/x"), "~/'My Projects/x'")
+            self.assertEqual(rt._shell_quote_path("/Users/user2/x"), "/Users/user2/x")
+            self.assertEqual(rt._shell_quote_path("/opt/a b"), "'/opt/a b'")
+            s = session(sid="abc", cwd="/Users/u/Dev/x")
+            self.assertEqual(rt._shell_line(s), "cd -- ~/Dev/x && claude --resume abc")
+
+    def test_the_shell_expands_it(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(os.path.realpath(d))
+            (home / "My Projects").mkdir()
+            with mock.patch.object(rt, "HOME", home):
+                line = rt._shell_quote_path(str(home / "My Projects"))
+            for shell in ("/bin/sh", "/bin/bash", "/bin/zsh"):
+                if not Path(shell).exists():
+                    continue
+                out = subprocess.run([shell, "-c", f"cd -- {line} && pwd"], capture_output=True,
+                                     text=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin"})
+                self.assertEqual(out.stdout.strip(), str(home / "My Projects"), shell)
+
+
 class ResolveTarget(unittest.TestCase):
     def test_explicit_target_wins(self):
         self.assertEqual(rt._resolve_target("byobu", []), "byobu")

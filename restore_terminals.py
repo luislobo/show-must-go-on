@@ -988,9 +988,20 @@ def _resolve_target(target: str, sessions: list[Session]) -> str:
     return "terminal"
 
 
+def _shell_quote_path(path: str) -> str:
+    """Quote a path for the shell, writing a folder under HOME as ~/... ; the
+    tilde stays outside the quotes so the shell still expands it."""
+    home = str(HOME)
+    if path == home:
+        return "~"
+    if path.startswith(home + "/"):
+        return "~/" + shlex.quote(path[len(home) + 1:])
+    return shlex.quote(path)
+
+
 def _shell_line(s: Session) -> str:
     """What gets typed into a fresh interactive shell to resume a session."""
-    return f"cd -- {shlex.quote(s.cwd or str(HOME))} && {resume_cmd(s)}"
+    return f"cd -- {_shell_quote_path(s.cwd or str(HOME))} && {resume_cmd(s)}"
 
 
 def ghostty_placements(sessions: list[Session], layout: str,
