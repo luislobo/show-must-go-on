@@ -268,6 +268,8 @@ find-session DSBF-491 14
 
 The footer shows the AI abstract (or first match snippet in search mode) for the highlighted session.
 
+The current row has a `▶` in the gutter and bold text. Colours come from your terminal's own palette, so they follow its light or dark theme: cyan for the tool and the key hints, green for ticked rows, branches and open PRs, and yellow for interrupted sessions (`!`) and search hits. Only the normal ANSI colours are used, never the bright ones, which are hard to read on light backgrounds. Set `NO_COLOR=1` to turn colour off.
+
 ## How it works
 
 ### Normal mode (from history)

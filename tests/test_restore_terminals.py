@@ -208,6 +208,37 @@ class ResolveTarget(unittest.TestCase):
                 self.assertEqual(rt._resolve_target("auto", [session()]), "terminal")
 
 
+class PickerRows(unittest.TestCase):
+    def test_row_pieces_and_roles(self):
+        s = session(cwd=str(Path.home() / "Dev"), topic="Fix the loader", interrupted=True,
+                    git_branch="main", pr_number=7, pr_state="open")
+        s.search_matches = [{"snippet": "x"}]
+        segs = rt._row_segments(s, 120)
+        roles = dict((t.strip(), r) for t, r in segs)
+        self.assertEqual(roles["!"], "warn")
+        self.assertEqual(roles["claude"], "accent")
+        self.assertEqual(roles["main"], "ok")
+        self.assertEqual(roles["#7o"], "ok")
+        self.assertEqual(roles["(1 hits)"], "warn")
+        self.assertTrue(set(r for _, r in segs) <= set(rt._ROLE_COLORS) | {""})
+        self.assertRegex(rt._row_text(s, 120),
+                         r"^! +\d+\.\dd claude ~/Dev  main #7o \(1 hits\)  Fix the loader$")
+
+    def test_closed_pr_is_not_green(self):
+        s = session(pr_number=7, pr_state="closed")
+        self.assertIn(("#7c".rjust(4), ""), [(t, r) for t, r in rt._row_segments(s, 120)])
+
+    def test_label_is_clipped_to_width(self):
+        s = session(topic="x" * 200)
+        self.assertLessEqual(len(rt._row_text(s, 80)), 80)
+
+    def test_no_color(self):
+        self.assertTrue(rt._tui_colors_enabled({}, True))
+        self.assertFalse(rt._tui_colors_enabled({"NO_COLOR": "1"}, True))
+        self.assertTrue(rt._tui_colors_enabled({"NO_COLOR": ""}, True))
+        self.assertFalse(rt._tui_colors_enabled({}, False))
+
+
 class SnapshotCompat(unittest.TestCase):
     def test_linux_snapshot_without_new_fields_loads(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1885,8 +1885,20 @@ def cache_record(s: Session) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _row_text(s: Session, width: int) -> str:
-    tag = "!" if s.interrupted else " "
+# Text roles, drawn in the terminal's own palette so they follow its theme.
+# Only the normal (0-7) colours: their contrast holds on both light and dark
+# themes, where the bright ones fall below 4.5:1 on white. Colour is never
+# combined with bold, which some terminals render as the bright variant.
+_ROLE_COLORS = {"accent": "COLOR_CYAN", "ok": "COLOR_GREEN", "warn": "COLOR_YELLOW"}
+
+
+def _tui_colors_enabled(env, has_colors: bool) -> bool:
+    """https://no-color.org: any non-empty NO_COLOR turns colour off."""
+    return has_colors and not env.get("NO_COLOR")
+
+
+def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
+    """One picker row as (text, role) pieces; role is a key of _ROLE_COLORS or ''."""
     age = f"{s.age_days:4.1f}d"
     tool = f"{s.tool:<6}"
     cwd = short_cwd(s.cwd) or "?"
@@ -1898,10 +1910,26 @@ def _row_text(s: Session, width: int) -> str:
         pr_marker = f" #{s.pr_number}{st}"
     label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
     hits = f" ({len(s.search_matches)} hits)" if s.search_matches else ""
-    branch_part = f"  {branch}{pr_marker}" if branch else pr_marker
-    left = f"{tag} {age} {tool} {cwd}{branch_part}{hits}"
-    remaining = max(10, width - len(left) - 7)
-    return f"{left}  {_truncate(label, remaining)}"
+    segs = [
+        ("!" if s.interrupted else " ", "warn"),
+        (f" {age} ", ""),
+        (tool, "accent"),
+        (f" {cwd}", ""),
+    ]
+    if branch:
+        segs.append((f"  {branch}", "ok"))
+    if pr_marker:
+        segs.append((pr_marker, "ok" if s.pr_state == "open" else ""))
+    if hits:
+        segs.append((hits, "warn"))
+    used = sum(len(t) for t, _ in segs)
+    remaining = max(10, width - used - 7)
+    segs.append((f"  {_truncate(label, remaining)}", ""))
+    return segs
+
+
+def _row_text(s: Session, width: int) -> str:
+    return "".join(t for t, _ in _row_segments(s, width))
 
 
 def tui_pick(sessions: list[Session]) -> list[Session] | None:
@@ -1920,6 +1948,38 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
     def run(stdscr):
         curses.curs_set(0)
         stdscr.keypad(True)
+        role_attr = {role: curses.A_NORMAL for role in _ROLE_COLORS}
+        if curses.has_colors():
+            # curses.wrapper has already called start_color(); without
+            # use_default_colors() every cell is drawn white on black, which
+            # overrides a light theme. -1 keeps the terminal's own colours.
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            if _tui_colors_enabled(os.environ, True):
+                for n, (role, color) in enumerate(_ROLE_COLORS.items(), 1):
+                    curses.init_pair(n, getattr(curses, color), bg)
+                    role_attr[role] = curses.color_pair(n)
+
+        def put(y: int, segs: list[tuple[str, str]], bold: bool = False) -> None:
+            """Draw (text, role) pieces left to right, clipped to the screen width."""
+            x = 0
+            limit = w - 1  # the bottom-right cell cannot be written
+            for text, role in segs:
+                if x >= limit:
+                    break
+                if role:
+                    attr = role_attr[role]
+                else:
+                    attr = curses.A_BOLD if bold else curses.A_NORMAL
+                try:
+                    stdscr.addnstr(y, x, text, limit - x, attr)
+                except curses.error:
+                    pass
+                x += len(text)
+
         idx = 0
         top = 0
         while True:
@@ -1932,52 +1992,48 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                 top = idx
             elif idx >= top + body_h:
                 top = idx - body_h + 1
-            # header
+            # header: title, selection count, then each key in the accent colour
             count_sel = sum(selected)
-            header = (f" restore-terminals — {count_sel}/{len(sessions)} selected   "
-                      f"[space] toggle   [a] all   [n] none   [i] invert   "
-                      f"[enter] confirm   [q] quit ")
-            try:
-                stdscr.addnstr(0, 0, header.ljust(w)[:w], w, curses.A_REVERSE)
-            except curses.error:
-                pass
-            # rows
+            header = [(" restore-terminals — ", ""),
+                      (f"{count_sel}/{len(sessions)} selected", "ok" if count_sel else "")]
+            for key, what in (("space", "toggle"), ("a", "all"), ("n", "none"),
+                              ("i", "invert"), ("enter", "confirm"), ("q", "quit")):
+                header += [("   ", ""), (f"[{key}]", "accent"), (f" {what}", "")]
+            put(0, header, bold=True)
+            # rows: a marker in the gutter and bold text for the current row
             for i in range(top, min(len(sessions), top + body_h)):
                 s = sessions[i]
-                mark = "[x]" if selected[i] else "[ ]"
-                text = f"{mark} {_row_text(s, w - 5)}"
-                attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-                try:
-                    stdscr.addnstr(1 + (i - top), 0, text[:w], w, attr)
-                except curses.error:
-                    pass
+                cur_row = i == idx
+                segs = [("▶ " if cur_row else "  ", "accent"),
+                        ("[x]" if selected[i] else "[ ]", "ok" if selected[i] else ""),
+                        (" ", "")]
+                put(1 + (i - top), segs + _row_segments(s, w - 7), bold=cur_row)
             # footer: line 1 = location (cwd + branch + PR), line 2 = abstract
             cur = sessions[idx]
-            loc_parts: list[str] = []
+            loc: list[tuple[str, str]] = []
             if cur.cwd:
-                loc_parts.append(short_cwd(cur.cwd))
+                loc.append((short_cwd(cur.cwd), ""))
             if cur.git_branch:
-                loc_parts.append(f"branch: {cur.git_branch}")
+                loc.append((f"branch: {cur.git_branch}", "ok"))
             if cur.pr_number:
                 pr_str = f"PR #{cur.pr_number}"
                 if cur.pr_state:
                     pr_str += f" ({cur.pr_state})"
                 if cur.pr_title:
                     pr_str += f" — {_truncate(cur.pr_title, 60)}"
-                loc_parts.append(pr_str)
-            loc_line = "  ·  ".join(loc_parts)
+                loc.append((pr_str, "ok" if cur.pr_state == "open" else ""))
+            loc_segs: list[tuple[str, str]] = []
+            for n, part in enumerate(loc):
+                if n:
+                    loc_segs.append(("  ·  ", ""))
+                loc_segs.append(part)
             if cur.search_matches:
                 desc_line = cur.search_matches[0]["snippet"]
             else:
                 desc_line = (cur.abstract or _truncate(cur.last_user_prompt, 200)
                              or "(no preview)")
-            try:
-                stdscr.addnstr(h - 2, 0, _truncate(loc_line, w - 1)[:w], w,
-                               curses.A_DIM | curses.A_BOLD)
-                stdscr.addnstr(h - 1, 0, _truncate(desc_line, w - 1)[:w], w,
-                               curses.A_DIM)
-            except curses.error:
-                pass
+            put(h - 2, loc_segs, bold=True)
+            put(h - 1, [(_truncate(desc_line, w - 1), "")])
             stdscr.refresh()
             c = stdscr.getch()
             if c in (ord("q"), 27):  # q or ESC
