@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +21,16 @@ _spec = importlib.util.spec_from_file_location("restore_terminals", ROOT / "rest
 rt = importlib.util.module_from_spec(_spec)
 sys.modules["restore_terminals"] = rt  # dataclasses look the module up while building Session
 _spec.loader.exec_module(rt)
+
+
+def session(sid="s1", cwd="/w/a", **kw):
+    now = datetime.now(timezone.utc)
+    return rt.Session(tool="claude", session_id=sid, path=Path(f"/x/{sid}.jsonl"),
+                      cwd=cwd, first_ts=now, last_ts=now, **kw)
+
+
+def proc(pid, ppid, cmd, tty=None, uid=501):
+    return rt.Proc(pid, ppid, uid, tty, cmd.split(), cmd)
 
 
 class ParsePs(unittest.TestCase):
@@ -38,6 +49,38 @@ class ParsePs(unittest.TestCase):
         out = "p10\nfcwd\nn/Users/l/Dev\np11\nn/a b/c\nn/d.jsonl\n"
         self.assertEqual(rt._parse_lsof_names(out),
                          {10: ["/Users/l/Dev"], 11: ["/a b/c", "/d.jsonl"]})
+
+
+class HostTerminal(unittest.TestCase):
+    def chain(self, host_cmd):
+        return {
+            1: proc(1, 0, "/sbin/launchd"),
+            50: proc(50, 1, host_cmd),
+            60: proc(60, 50, "/usr/bin/login -flp luis"),
+            70: proc(70, 60, "-zsh"),
+            80: proc(80, 70, "claude"),
+        }
+
+    def test_ghostty(self):
+        procs = self.chain("/Users/l/Applications/Ghostty.app/Contents/MacOS/ghostty")
+        self.assertEqual(rt._host_terminal(80, procs), "ghostty")
+
+    def test_terminal_app(self):
+        procs = self.chain("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
+        self.assertEqual(rt._host_terminal(80, procs), "terminal")
+
+    def test_tmux_wins_over_outer_terminal(self):
+        procs = self.chain("/Users/l/Applications/Ghostty.app/Contents/MacOS/ghostty")
+        procs[60] = proc(60, 50, "tmux: server")
+        self.assertEqual(rt._host_terminal(80, procs), "tmux")
+
+    def test_terminator_is_a_python_script(self):
+        procs = self.chain("/usr/bin/python3 /usr/bin/terminator -u")
+        self.assertEqual(rt._host_terminal(80, procs), "terminator")
+
+    def test_unknown(self):
+        procs = self.chain("/usr/sbin/sshd")
+        self.assertIsNone(rt._host_terminal(80, procs))
 
 
 class ClaudeSessionLookup(unittest.TestCase):
@@ -76,6 +119,46 @@ class ClaudeSessionLookup(unittest.TestCase):
         self.assertEqual(rt._claude_jsonl_path("old", "/elsewhere"),
                          self.projects / "-w-a" / "old.jsonl")
         self.assertIsNone(rt._claude_jsonl_path("missing", "/w/a"))
+
+
+class MacWindowMatching(unittest.TestCase):
+    def test_terminal_by_tty_and_ghostty_by_cwd_in_pid_order(self):
+        procs = {10: proc(10, 1, "claude", tty="ttys004"),
+                 20: proc(20, 1, "claude", tty="ttys001"),
+                 30: proc(30, 1, "claude", tty="ttys002")}
+        entries = [
+            {"pid": 30, "terminal": "ghostty", "cwd": "/w/a"},
+            {"pid": 20, "terminal": "ghostty", "cwd": "/w/a/"},
+            {"pid": 10, "terminal": "terminal", "cwd": "/w/b"},
+        ]
+        ghostty = [{"window_id": "g1", "tab_index": 1, "cwd": "/w/a", "title": "first"},
+                   {"window_id": "g1", "tab_index": 2, "cwd": "/w/a", "title": "second"},
+                   {"window_id": "g2", "tab_index": 1, "cwd": "/w/c", "title": "other"}]
+        terminal = [{"window_id": "77", "tab_index": 1, "tty": "/dev/ttys004", "title": "t"}]
+        rt._match_macos_windows(entries, procs, ghostty, terminal)
+        by_pid = {e["pid"]: e for e in entries}
+        self.assertEqual((by_pid[10]["window_id"], by_pid[10]["tab_index"]), ("77", 1))
+        self.assertEqual((by_pid[20]["window_id"], by_pid[20]["tab_index"]), ("g1", 1))
+        self.assertEqual((by_pid[30]["window_id"], by_pid[30]["tab_index"]), ("g1", 2))
+        self.assertEqual(by_pid[30]["window_title"], "second")
+
+    def test_records_split_on_separators(self):
+        out = f"a{rt._US}1{rt._US}/p q{rt._US}title{rt._RS}b{rt._US}2{rt._US}{rt._US}t2{rt._RS}"
+        self.assertEqual(rt._split_records(out), [["a", "1", "/p q", "title"], ["b", "2", "", "t2"]])
+        self.assertEqual(rt._split_records(None), [])
+
+
+class SnapshotCompat(unittest.TestCase):
+    def test_linux_snapshot_without_new_fields_loads(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "s.jsonl"
+            p.write_text("")
+            with mock.patch.object(rt, "parse_claude", return_value=session("s1")):
+                [s] = rt.snapshot_to_sessions([{"tool": "claude", "jsonl_path": str(p),
+                                                "workspace": " 1 ", "window_title": "t"}])
+        self.assertEqual(s.workspace, " 1 ")
+        self.assertIsNone(s.terminal)
+        self.assertIsNone(s.window_id)
 
 
 class SnapshotLiveProcess(unittest.TestCase):

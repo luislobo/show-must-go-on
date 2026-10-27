@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HOME = Path.home()
+IS_MACOS = sys.platform == "darwin"
 CLAUDE_ROOT = HOME / ".claude" / "projects"
 CLAUDE_PID_DIR = HOME / ".claude" / "sessions"   # <pid>.json, written by Claude Code per running process
 CODEX_ROOT = HOME / ".codex" / "sessions"
@@ -69,6 +70,9 @@ class Session:
     pr_fetched_at: datetime | None = None
     workspace: str | None = None    # i3 workspace name (e.g. " 1 ")
     window_title: str | None = None # terminal window title at snapshot time
+    terminal: str | None = None     # host terminal at snapshot time: ghostty, terminal, terminator, tmux, ...
+    window_id: str | None = None    # macOS terminal window id at snapshot time
+    tab_index: int | None = None    # 1-based tab within window_id at snapshot time
 
     @property
     def span_minutes(self) -> float:
@@ -1261,6 +1265,31 @@ def _find_codex_session(pid: int) -> tuple[str, Path] | None:
     return None
 
 
+def _host_terminal(pid: int, procs: dict[int, Proc]) -> str | None:
+    """Walk up the parent chain to the terminal hosting a process."""
+    check = pid
+    for _ in range(12):
+        p = procs.get(check)
+        if not p or p.ppid in (0, check):
+            return None
+        p = procs.get(p.ppid)
+        if not p:
+            return None
+        exe = os.path.basename(p.argv[0]) if p.argv else ""
+        if "Ghostty.app/" in p.cmd or exe == "ghostty":
+            return "ghostty"
+        if "Terminal.app/" in p.cmd:
+            return "terminal"
+        if "iTerm.app/" in p.cmd or "iTerm2" in exe:
+            return "iterm"
+        if exe.startswith("tmux"):
+            return "tmux"
+        if exe == "terminator" or any(os.path.basename(a) == "terminator" for a in p.argv[1:2]):
+            return "terminator"
+        check = p.pid
+    return None
+
+
 def _get_i3_window_info() -> dict[int, tuple[str, str]]:
     """Return {pid: (workspace_name, window_title)} from i3 tree + wmctrl."""
     try:
@@ -1309,6 +1338,110 @@ def _find_window_for_pid(pid: int, pid_info: dict[int, tuple[str, str]],
             break
         check = p.ppid
     return ("?", "?")
+
+
+# AppleScript output is split on ASCII unit (31) and record (30) separators,
+# which cannot appear in a path or a terminal title.
+_US, _RS = "\x1f", "\x1e"
+
+
+def _osascript(script: str, *argv: str, timeout: int = 15) -> str | None:
+    sys.stdout.flush()  # keep progress lines ahead of any error below
+    try:
+        r = subprocess.run(["osascript", "-", *argv], input=script,
+                           capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        # usually macOS waiting on the one-time "allow to control" prompt
+        print(f"  [!] osascript: no answer after {timeout}s (is an Automation "
+              f"permission prompt waiting?)", file=sys.stderr)
+        return None
+    if r.returncode != 0:
+        print(f"  [!] osascript: {r.stderr.strip()}", file=sys.stderr)
+        return None
+    return r.stdout.rstrip("\n")
+
+
+def _split_records(out: str | None) -> list[list[str]]:
+    if not out:
+        return []
+    return [rec.split(_US) for rec in out.split(_RS) if rec]
+
+
+_GHOSTTY_LIST = f"""
+set us to character id {ord(_US)}
+set rs to character id {ord(_RS)}
+set out to ""
+tell application "Ghostty"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with x in terminals of t
+        set out to out & (id of w) & us & (index of t) & us & (working directory of x) & us & (name of x) & rs
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out
+"""
+
+_TERMINAL_LIST = f"""
+set us to character id {ord(_US)}
+set rs to character id {ord(_RS)}
+set out to ""
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      set out to out & (id of w) & us & (index of t) & us & (tty of t) & us & (name of w) & rs
+    end repeat
+  end repeat
+end tell
+return out
+"""
+
+
+def _ghostty_terminals() -> list[dict]:
+    """Every Ghostty terminal surface, in window/tab order (Ghostty 1.3+)."""
+    return [
+        {"window_id": r[0], "tab_index": int(r[1]), "cwd": r[2], "title": r[3]}
+        for r in _split_records(_osascript(_GHOSTTY_LIST)) if len(r) == 4 and r[1].isdigit()
+    ]
+
+
+def _terminal_app_tabs() -> list[dict]:
+    """Every Terminal.app tab with its tty, in window/tab order."""
+    return [
+        {"window_id": r[0], "tab_index": int(r[1]), "tty": r[2], "title": r[3]}
+        for r in _split_records(_osascript(_TERMINAL_LIST)) if len(r) == 4 and r[1].isdigit()
+    ]
+
+
+def _match_macos_windows(results: list[dict], procs: dict[int, Proc],
+                         ghostty: list[dict], terminal: list[dict]) -> None:
+    """Fill window_id/tab_index/window_title on snapshot entries in place.
+
+    Terminal.app tabs expose their tty, so that match is exact. Ghostty does
+    not, so a session is matched to a surface whose working directory is the
+    session's cwd; several sessions in one folder are paired in pid order.
+    """
+    by_tty = {t["tty"]: t for t in terminal}
+    unclaimed = list(ghostty)
+    for entry in sorted(results, key=lambda e: e["pid"]):
+        hit = None
+        if entry.get("terminal") == "terminal":
+            p = procs.get(entry["pid"])
+            if p and p.tty:
+                hit = by_tty.get(f"/dev/{p.tty}")
+        elif entry.get("terminal") == "ghostty":
+            for cand in unclaimed:
+                if cand["cwd"] and cand["cwd"].rstrip("/") == entry["cwd"].rstrip("/"):
+                    hit = cand
+                    unclaimed.remove(cand)
+                    break
+        if hit:
+            entry["window_id"] = hit["window_id"]
+            entry["tab_index"] = hit["tab_index"]
+            entry["window_title"] = hit["title"]
 
 
 def snapshot_active(with_windows: bool = True) -> list[dict]:
@@ -1367,6 +1500,7 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
                 "cwd": cwd,
                 "pid": p.pid,
                 "jsonl_path": jsonl_path,
+                "terminal": _host_terminal(p.pid, procs),
                 "workspace": "?",
                 "window_title": "?",
             }
@@ -1380,7 +1514,24 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
         for entry in entries:
             entry["workspace"], entry["window_title"] = _find_window_for_pid(
                 entry["pid"], pid_info, procs)
+    elif IS_MACOS:
+        hosts = {e["terminal"] for e in entries}
+        _match_macos_windows(
+            entries, procs,
+            ghostty=_ghostty_terminals() if "ghostty" in hosts else [],
+            terminal=_terminal_app_tabs() if "terminal" in hosts else [],
+        )
     return entries
+
+
+def _placement_label(entry: dict) -> str:
+    """Where a snapshot entry was running: i3 workspace on Linux, window/tab on macOS."""
+    if entry.get("window_id"):
+        return f"{entry.get('terminal')} {entry['window_id'][-6:]}/tab {entry.get('tab_index')}"
+    ws = entry.get("workspace")
+    if ws and ws != "?":
+        return f"ws={ws!r}"
+    return entry.get("terminal") or "?"
 
 
 def save_snapshot(entries: list[dict]) -> Path:
@@ -1429,6 +1580,9 @@ def snapshot_to_sessions(entries: list[dict]) -> list[Session]:
         if parsed:
             parsed.workspace = rec.get("workspace")
             parsed.window_title = rec.get("window_title")
+            parsed.terminal = rec.get("terminal")
+            parsed.window_id = rec.get("window_id")
+            parsed.tab_index = rec.get("tab_index")
             sessions.append(parsed)
     return sessions
 
@@ -1864,9 +2018,8 @@ def main() -> int:
         path = save_snapshot(active)
         print(f"  saved {len(active)} session(s) to {path}")
         for entry in active:
-            ws = entry.get('workspace', '?')
-            wt = entry.get('window_title', '?')
-            print(f"    ws={ws!r:<6}  {entry['tool']:<6}  "
+            wt = entry.get('window_title') or '?'
+            print(f"    {_placement_label(entry):<22}  {entry['tool']:<6}  "
                   f"{short_cwd(entry['cwd']):<50}  title={wt[:60]}")
         print(f"  restore with: restore --load")
         return 0
