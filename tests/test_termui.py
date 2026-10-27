@@ -70,5 +70,16 @@ class Tagline(unittest.TestCase):
         self.assertEqual(termui.ROLE_COLORS["heart"], "COLOR_RED")
 
 
+class ImportBesideScript(unittest.TestCase):
+    def test_restore_finds_termui_in_isolated_mode(self):
+        """-I leaves the script's folder off sys.path; restore must add it itself."""
+        import subprocess
+        script = Path(__file__).resolve().parent.parent / "restore_terminals.py"
+        r = subprocess.run([sys.executable, "-I", str(script), "--help"],
+                           capture_output=True, text=True, cwd="/")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("usage: restore", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

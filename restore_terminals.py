@@ -26,7 +26,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from termui import TAGLINE, paint, pick, wrap
+# termui.py sits beside the real file. Python adds that folder to sys.path on
+# its own, but not under -I, -P or PYTHONSAFEPATH, so add it explicitly;
+# resolve() follows the ~/.local/bin symlink.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from termui import TAGLINE, paint, pick, wrap  # noqa: E402
 
 HOME = Path.home()
 IS_MACOS = sys.platform == "darwin"
