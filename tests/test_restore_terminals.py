@@ -17,6 +17,8 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))  # restore_terminals imports termui from beside it
+import termui  # noqa: E402
 _spec = importlib.util.spec_from_file_location("restore_terminals", ROOT / "restore_terminals.py")
 rt = importlib.util.module_from_spec(_spec)
 sys.modules["restore_terminals"] = rt  # dataclasses look the module up while building Session
@@ -220,7 +222,7 @@ class PickerRows(unittest.TestCase):
         self.assertEqual(roles["main"], "ok")
         self.assertEqual(roles["#7o"], "ok")
         self.assertEqual(roles["(1 hits)"], "warn")
-        self.assertTrue(set(r for _, r in segs) <= set(rt._ROLE_COLORS) | {""})
+        self.assertTrue(set(r for _, r in segs) <= set(termui.ROLE_COLORS) | {""})
         self.assertRegex(rt._row_text(s, 120),
                          r"^! +\d+\.\dd claude ~/Dev  main #7o \(1 hits\)  Fix the loader$")
 
@@ -231,12 +233,6 @@ class PickerRows(unittest.TestCase):
     def test_label_is_clipped_to_width(self):
         s = session(topic="x" * 200)
         self.assertLessEqual(len(rt._row_text(s, 80)), 80)
-
-    def test_no_color(self):
-        self.assertTrue(rt._tui_colors_enabled({}, True))
-        self.assertFalse(rt._tui_colors_enabled({"NO_COLOR": "1"}, True))
-        self.assertTrue(rt._tui_colors_enabled({"NO_COLOR": ""}, True))
-        self.assertFalse(rt._tui_colors_enabled({}, False))
 
 
 class DetailsPage(unittest.TestCase):
@@ -288,42 +284,7 @@ class DetailsPage(unittest.TestCase):
         s.search_matches = [{"timestamp": "2026-10-27T10:00", "role": "user", "snippet": "hit"}]
         lines, _ = self.details(s)
         roles = {r for line in lines for _, r in line}
-        self.assertTrue(roles <= set(rt._ROLE_COLORS) | {"", "bold"}, roles)
-
-
-class Tagline(unittest.TestCase):
-    def test_heart_is_the_only_red(self):
-        self.assertEqual("".join(t for t, _ in rt.TAGLINE).strip(), "Proudly made in Dallas with ♥")
-        self.assertEqual([t for t, r in rt.TAGLINE if r == "heart"], ["♥"])
-        self.assertEqual(rt._ROLE_COLORS["heart"], "COLOR_RED")
-
-
-class ProgressColors(unittest.TestCase):
-    def test_paint_on_a_terminal(self):
-        with mock.patch.object(rt, "_stdout_colors", return_value=True):
-            self.assertEqual(rt._paint(3, "ok"), "\033[32m3\033[0m")
-            self.assertEqual(rt._paint("x", "bold"), "\033[1mx\033[0m")
-            self.assertEqual(rt._paint("x", ""), "x")
-
-    def test_plain_when_colour_is_off(self):
-        with mock.patch.object(rt, "_stdout_colors", return_value=False):
-            self.assertEqual(rt._paint("x", "warn"), "x")
-
-    def test_off_when_piped_no_color_or_dumb(self):
-        with mock.patch.object(sys.stdout, "isatty", return_value=False):
-            self.assertFalse(rt._stdout_colors())
-        with mock.patch.object(sys.stdout, "isatty", return_value=True):
-            with mock.patch.dict(os.environ, {"NO_COLOR": "1", "TERM": "xterm"}):
-                self.assertFalse(rt._stdout_colors())
-            with mock.patch.dict(os.environ, {"TERM": "dumb"}):
-                os.environ.pop("NO_COLOR", None)
-                self.assertFalse(rt._stdout_colors())
-            with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-                os.environ.pop("NO_COLOR", None)
-                self.assertTrue(rt._stdout_colors())
-
-    def test_only_normal_colours(self):
-        self.assertEqual(set(rt._ANSI.values()), {"32", "33", "36", "1"})
+        self.assertTrue(roles <= set(termui.ROLE_COLORS) | {"", "bold"}, roles)
 
 
 class SnapshotCompat(unittest.TestCase):

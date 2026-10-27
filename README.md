@@ -33,7 +33,9 @@ restore --execute        # recover from session history on disk
 - **Persistent cache** — summaries are saved to `~/.ai/sessions.jsonl`; subsequent runs reuse them unless the session has new activity
 - **Content search** — `--find` searches all session transcripts for a branch name, repo, Jira ticket, or any regex
 - **Relevance ranking** — search results ranked by match count, recency, user-message weight, and git branch match
-- **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q)
+- **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q), and a details page per session on `→`
+- **Colour that follows your theme** — the picker and the progress lines use the terminal's own palette, normal ANSI colours only, plain when piped; `NO_COLOR` turns it off
+- **Reusable terminal UI** — `termui.py` (colours, progress paint, wrapping, the picker) is one stdlib-only file another project can copy
 - **i3 workspace-aware** (Linux) — saves and restores the exact i3 workspace (including custom names like `" 1 "`) for each session
 - **One Terminator window per session** (Linux) — `terminator -u` (no-dbus) so i3 sees each as a separate window to tile
 - **Ghostty backend** (macOS) — `--target=ghostty` opens one Ghostty window per session through Ghostty's AppleScript support; splits, tabs, or the saved windows and tabs on request
@@ -123,14 +125,14 @@ ln -sfn "$(pwd)/restore_terminals.py" ~/bin/restore
 ln -sfn "$(pwd)/find_session.py" ~/bin/find-session
 ```
 
-That's it. No `pip install`, no virtualenv, no build step.
+That's it. No `pip install`, no virtualenv, no build step. Link the scripts rather than copying them: `restore` imports `termui.py` from beside its real file, and Python follows the symlink to find it.
 
 ### Verify installation
 
 ```bash
 restore --help
 find-session --help
-python3 -m py_compile restore_terminals.py find_session.py
+python3 -m py_compile restore_terminals.py find_session.py termui.py
 python3 -m unittest discover tests
 ```
 
@@ -361,18 +363,49 @@ With `--target=byobu`, restore builds a tmux session instead of GUI windows:
 ~/bin/find-session            # Symlink to find_session.py
 ```
 
+In the repo, `termui.py` sits beside the two scripts:
+
+```
+restore_terminals.py          # restore
+find_session.py               # find-session
+termui.py                     # colours, progress paint, wrapping, the picker
+tests/                        # stdlib unittest suites
+```
+
 ## Running the tests
 
 ```bash
 python3 -m unittest discover tests
 ```
 
-The tests use only the standard library. They cover process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts and target selection. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
+The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping and the tagline. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
 
 ```bash
 docker run --rm -v "$PWD":/repo:ro python:3.10-slim \
   bash -c 'cp -r /repo /tmp/r && cd /tmp/r && python3 -m unittest discover tests'
 ```
+
+## Reusing the terminal UI
+
+`termui.py` holds the parts of the interface that know nothing about AI sessions: the colour roles and their contrast rules, `NO_COLOR` and terminal detection, `paint()` for coloured progress lines, `wrap()` and `clip()`, the tagline, and `pick()`, the multi-select picker with its details page. It is one file, standard library only, Python 3.9+, so another project can copy it as is.
+
+```python
+from termui import TAGLINE, paint, pick
+
+print(f"  {paint('found', 'ok')} {paint(3, 'bold')} items")
+
+chosen = pick(
+    items,
+    title="my-tool",
+    noun="item",
+    row=lambda it, width: [(it.name, "accent"), (f"  {it.note}", "")],
+    footer=lambda it: ([(it.path, "bold")], it.description),
+    details=lambda it, width: [[(" Name", "bold")], [(f"   {it.name}", "")]],
+    tagline=TAGLINE,
+)
+```
+
+`row`, `footer` and `details` return `(text, role)` pieces; the roles are `accent`, `ok`, `warn`, `heart`, `bold` and `""`. `pick()` returns the ticked items, the highlighted one when none is ticked, or `None` when the user quits.
 
 ## License
 

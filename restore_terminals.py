@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from termui import TAGLINE, paint, pick, wrap
+
 HOME = Path.home()
 IS_MACOS = sys.platform == "darwin"
 CLAUDE_ROOT = HOME / ".claude" / "projects"
@@ -1226,10 +1228,10 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
 
 def print_stats(all_found: list[Session], after_filter: list[Session],
                 ranked: list[Session]) -> None:
-    arrow = _paint("→", "accent")
-    print(f"  {_paint('scanned:', 'accent')} {_paint(len(all_found), 'bold')} sessions on disk  "
-          f"{arrow} {_paint(len(after_filter), 'bold')} after filters  "
-          f"{arrow} {_paint(len(ranked), 'ok')} ranked by last activity")
+    arrow = paint("→", "accent")
+    print(f"  {paint('scanned:', 'accent')} {paint(len(all_found), 'bold')} sessions on disk  "
+          f"{arrow} {paint(len(after_filter), 'bold')} after filters  "
+          f"{arrow} {paint(len(ranked), 'ok')} ranked by last activity")
 
 
 # ---------------------------------------------------------------------------
@@ -1886,42 +1888,8 @@ def cache_record(s: Session) -> dict:
 # ---------------------------------------------------------------------------
 
 
-# Text roles, drawn in the terminal's own palette so they follow its theme.
-# Only the normal (0-7) colours: their contrast holds on both light and dark
-# themes, where the bright ones fall below 4.5:1 on white. Colour is never
-# combined with bold, which some terminals render as the bright variant.
-_ROLE_COLORS = {"accent": "COLOR_CYAN", "ok": "COLOR_GREEN", "warn": "COLOR_YELLOW",
-                # red only for the tagline's ♥: a symbol needs 3:1, which red
-                # clears on light, dark and Solarized themes; text in red does not
-                "heart": "COLOR_RED"}
-TAGLINE = [("Proudly made in Dallas with ", ""), ("♥", "heart"), (" ", "")]
-
-
-def _tui_colors_enabled(env, has_colors: bool) -> bool:
-    """https://no-color.org: any non-empty NO_COLOR turns colour off."""
-    return has_colors and not env.get("NO_COLOR")
-
-
-# The same roles as ANSI codes for the progress lines, plus bold (default
-# colour) for the numbers.
-_ANSI = {"accent": "36", "ok": "32", "warn": "33", "bold": "1"}
-
-
-def _stdout_colors() -> bool:
-    """Colour progress output only on a terminal, and not under NO_COLOR or TERM=dumb."""
-    return sys.stdout.isatty() and _tui_colors_enabled(os.environ, os.environ.get("TERM") != "dumb")
-
-
-def _paint(text, role: str) -> str:
-    """Wrap text in the ANSI code for a role; plain when colour is off."""
-    text = str(text)
-    if not role or not _stdout_colors():
-        return text
-    return f"\033[{_ANSI[role]}m{text}\033[0m"
-
-
 def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
-    """One picker row as (text, role) pieces; role is a key of _ROLE_COLORS or ''."""
+    """One picker row as (text, role) pieces; roles as in termui."""
     age = f"{s.age_days:4.1f}d"
     tool = f"{s.tool:<6}"
     cwd = short_cwd(s.cwd) or "?"
@@ -1955,16 +1923,6 @@ def _row_text(s: Session, width: int) -> str:
     return "".join(t for t, _ in _row_segments(s, width))
 
 
-def _wrap(text: str | None, width: int, max_lines: int = 0) -> list[str]:
-    """Word-wrap text with collapsed whitespace; past max_lines, end on an ellipsis."""
-    import textwrap
-    lines = textwrap.wrap(" ".join((text or "").split()), max(10, width)) or [""]
-    if max_lines and len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1][: max(0, width - 1)] + "…"
-    return lines
-
-
 def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
     """Every line of the details page, as (text, role) pieces like _row_segments."""
     label_w = 13
@@ -1979,14 +1937,14 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
               label_role: str = "accent") -> None:
         if value in (None, ""):
             return
-        for n, line in enumerate(_wrap(str(value), text_w, max_lines)):
+        for n, line in enumerate(wrap(str(value), text_w, max_lines)):
             out.append([(f"   {label if n == 0 else '':<{label_w}}", label_role), (line, role)])
 
     def para(text: str | None, role: str = "", max_lines: int = 0) -> None:
-        for line in _wrap(text, width - 4, max_lines):
+        for line in wrap(text, width - 4, max_lines):
             out.append([("   " + line, role)])
 
-    for line in _wrap(s.topic or s.first_user_prompt or "(no prompt)", width - 2, 2):
+    for line in wrap(s.topic or s.first_user_prompt or "(no prompt)", width - 2, 2):
         out.append([(f" {line}", "bold")])
 
     heading("Session")
@@ -2050,198 +2008,37 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
     return out
 
 
+def _picker_footer(cur: Session) -> tuple[list[tuple[str, str]], str]:
+    """Footer for the highlighted session: location pieces, then the abstract."""
+    loc: list[tuple[str, str]] = []
+    if cur.cwd:
+        loc.append((short_cwd(cur.cwd), "bold"))
+    if cur.git_branch:
+        loc.append((f"branch: {cur.git_branch}", "ok"))
+    if cur.pr_number:
+        pr_str = f"PR #{cur.pr_number}"
+        if cur.pr_state:
+            pr_str += f" ({cur.pr_state})"
+        if cur.pr_title:
+            pr_str += f" — {_truncate(cur.pr_title, 60)}"
+        loc.append((pr_str, "ok" if cur.pr_state == "open" else "bold"))
+    loc_segs: list[tuple[str, str]] = []
+    for n, part in enumerate(loc):
+        if n:
+            loc_segs.append(("  ·  ", ""))
+        loc_segs.append(part)
+    if cur.search_matches:
+        desc_line = cur.search_matches[0]["snippet"]
+    else:
+        desc_line = (cur.abstract or _truncate(cur.last_user_prompt, 200)
+                     or "(no preview)")
+    return loc_segs, desc_line
+
+
 def tui_pick(sessions: list[Session]) -> list[Session] | None:
     """Return user-selected subset, or None if user quit. Requires a real TTY."""
-    if not sessions:
-        return []
-    try:
-        import curses
-    except ImportError:
-        print("curses not available — skipping TUI, returning all sessions.",
-              file=sys.stderr)
-        return list(sessions)
-
-    selected = [False] * len(sessions)
-
-    def run(stdscr):
-        curses.curs_set(0)
-        stdscr.keypad(True)
-        role_attr = {role: curses.A_NORMAL for role in _ROLE_COLORS}
-        if curses.has_colors():
-            # curses.wrapper has already called start_color(); without
-            # use_default_colors() every cell is drawn white on black, which
-            # overrides a light theme. -1 keeps the terminal's own colours.
-            try:
-                curses.use_default_colors()
-                bg = -1
-            except curses.error:
-                bg = curses.COLOR_BLACK
-            if _tui_colors_enabled(os.environ, True):
-                for n, (role, color) in enumerate(_ROLE_COLORS.items(), 1):
-                    curses.init_pair(n, getattr(curses, color), bg)
-                    role_attr[role] = curses.color_pair(n)
-
-        def put(y: int, segs: list[tuple[str, str]], bold: bool = False) -> None:
-            """Draw (text, role) pieces left to right, clipped to the screen width."""
-            x = 0
-            limit = w - 1  # the bottom-right cell cannot be written
-            for text, role in segs:
-                if x >= limit:
-                    break
-                if role == "bold":
-                    attr = curses.A_BOLD
-                elif role:
-                    attr = role_attr[role]
-                else:
-                    attr = curses.A_BOLD if bold else curses.A_NORMAL
-                try:
-                    stdscr.addnstr(y, x, text, limit - x, attr)
-                except curses.error:
-                    pass
-                x += len(text)
-
-        def with_tagline(segs: list[tuple[str, str]]) -> list[tuple[str, str]]:
-            """The line's pieces, with the tagline right-aligned when there is room."""
-            used = sum(len(t) for t, _ in segs)
-            tag_w = sum(len(t) for t, _ in TAGLINE)
-            if used + tag_w + 2 < w:
-                return segs + [(" " * (w - 1 - used - tag_w), "")] + TAGLINE
-            return segs
-
-        def keys(*pairs: tuple[str, str]) -> list[tuple[str, str]]:
-            segs: list[tuple[str, str]] = []
-            for key, what in pairs:
-                segs += [("   ", ""), (f"[{key}]", "accent"), (f" {what}", "")]
-            return segs
-
-        idx = 0
-        top = 0
-        detail = False   # showing the details page for sessions[idx]
-        dtop = 0         # first visible line of the details page
-        while True:
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            if detail:
-                lines = _detail_lines(sessions[idx], w - 1)
-                body_h = max(1, h - 2)
-                dtop = max(0, min(dtop, len(lines) - body_h))
-                mark = [("[x] selected", "ok")] if selected[idx] else [("[ ] not selected", "")]
-                put(0, [(f" session {idx + 1}/{len(sessions)} — ", "")] + mark +
-                    keys(("←", "back"), ("space", "toggle"), ("j/k", "scroll")), bold=True)
-                for row, line in enumerate(lines[dtop:dtop + body_h], 1):
-                    put(row, line)
-                last = min(len(lines), dtop + body_h)
-                more = "  ↓ more" if last < len(lines) else ""
-                put(h - 1, with_tagline([(f" lines {dtop + 1}–{last} of {len(lines)}", ""),
-                                         (more, "accent")]))
-                stdscr.refresh()
-                c = stdscr.getch()
-                if c in (curses.KEY_LEFT, ord("h"), ord("q"), 27):  # back to the list
-                    detail = False
-                elif c in (curses.KEY_DOWN, ord("j")):
-                    dtop += 1
-                elif c in (curses.KEY_UP, ord("k")):
-                    dtop = max(0, dtop - 1)
-                elif c in (curses.KEY_NPAGE, ord("f")):
-                    dtop += body_h
-                elif c in (curses.KEY_PPAGE, ord("b")):
-                    dtop = max(0, dtop - body_h)
-                elif c in (curses.KEY_HOME, ord("g")):
-                    dtop = 0
-                elif c in (curses.KEY_END, ord("G")):
-                    dtop = len(lines)
-                elif c == ord(" "):
-                    selected[idx] = not selected[idx]
-                continue
-            # header (1) + 2-line footer (2) + 1 buffer = 4 lines reserved
-            body_h = max(1, h - 4)
-            # scroll
-            if idx < top:
-                top = idx
-            elif idx >= top + body_h:
-                top = idx - body_h + 1
-            # header: title, selection count, then each key in the accent colour
-            count_sel = sum(selected)
-            header = [(" restore-terminals — ", ""),
-                      (f"{count_sel}/{len(sessions)} selected", "ok" if count_sel else "")]
-            header += keys(("space", "toggle"), ("→", "details"), ("a", "all"), ("n", "none"),
-                           ("i", "invert"), ("enter", "confirm"), ("q", "quit"))
-            put(0, header, bold=True)
-            # rows: a marker in the gutter and bold text for the current row
-            for i in range(top, min(len(sessions), top + body_h)):
-                s = sessions[i]
-                cur_row = i == idx
-                segs = [("▶ " if cur_row else "  ", "accent"),
-                        ("[x]" if selected[i] else "[ ]", "ok" if selected[i] else ""),
-                        (" ", "")]
-                put(1 + (i - top), segs + _row_segments(s, w - 7), bold=cur_row)
-            # footer: line 1 = location (cwd + branch + PR), line 2 = abstract
-            cur = sessions[idx]
-            loc: list[tuple[str, str]] = []
-            if cur.cwd:
-                loc.append((short_cwd(cur.cwd), "bold"))
-            if cur.git_branch:
-                loc.append((f"branch: {cur.git_branch}", "ok"))
-            if cur.pr_number:
-                pr_str = f"PR #{cur.pr_number}"
-                if cur.pr_state:
-                    pr_str += f" ({cur.pr_state})"
-                if cur.pr_title:
-                    pr_str += f" — {_truncate(cur.pr_title, 60)}"
-                loc.append((pr_str, "ok" if cur.pr_state == "open" else "bold"))
-            loc_segs: list[tuple[str, str]] = []
-            for n, part in enumerate(loc):
-                if n:
-                    loc_segs.append(("  ·  ", ""))
-                loc_segs.append(part)
-            if cur.search_matches:
-                desc_line = cur.search_matches[0]["snippet"]
-            else:
-                desc_line = (cur.abstract or _truncate(cur.last_user_prompt, 200)
-                             or "(no preview)")
-            put(h - 2, with_tagline(loc_segs))
-            put(h - 1, [(_truncate(desc_line, w - 1), "")])
-            stdscr.refresh()
-            c = stdscr.getch()
-            if c in (ord("q"), 27):  # q or ESC
-                return None
-            if c in (curses.KEY_RIGHT, ord("l")):
-                detail, dtop = True, 0
-            elif c in (curses.KEY_DOWN, ord("j")):
-                idx = min(len(sessions) - 1, idx + 1)
-            elif c in (curses.KEY_UP, ord("k")):
-                idx = max(0, idx - 1)
-            elif c == curses.KEY_NPAGE:
-                idx = min(len(sessions) - 1, idx + body_h)
-            elif c == curses.KEY_PPAGE:
-                idx = max(0, idx - body_h)
-            elif c in (curses.KEY_HOME, ord("g")):
-                idx = 0
-            elif c in (curses.KEY_END, ord("G")):
-                idx = len(sessions) - 1
-            elif c == ord(" "):
-                selected[idx] = not selected[idx]
-            elif c == ord("a"):
-                for i in range(len(selected)):
-                    selected[i] = True
-            elif c == ord("n"):
-                for i in range(len(selected)):
-                    selected[i] = False
-            elif c == ord("i"):
-                for i in range(len(selected)):
-                    selected[i] = not selected[i]
-            elif c in (10, 13, curses.KEY_ENTER):
-                picked = [s for s, keep in zip(sessions, selected) if keep]
-                if not picked:
-                    picked = [sessions[idx]]
-                return picked
-
-    try:
-        import curses
-        return curses.wrapper(run)
-    except Exception as e:
-        print(f"TUI error: {e}", file=sys.stderr)
-        return list(sessions)
+    return pick(sessions, title="restore-terminals", noun="session", row=_row_segments,
+                footer=_picker_footer, details=_detail_lines, tagline=TAGLINE)
 
 
 # ---------------------------------------------------------------------------
@@ -2274,10 +2071,10 @@ def enrich_sessions(
         summary_targets = [s for s in sessions if needs_summary(s, cache, refresh)]
         skipped = len(sessions) - len(summary_targets)
         if skipped:
-            print(f"\n  {_paint('cache hit:', 'ok')} {_paint(skipped, 'bold')} session(s) reused from "
+            print(f"\n  {paint('cache hit:', 'ok')} {paint(skipped, 'bold')} session(s) reused from "
                   f"{cache_path} (use --refresh to regenerate)")
         if summary_targets:
-            print(f"  {_paint('summarizing', 'accent')} {_paint(len(summary_targets), 'bold')} "
+            print(f"  {paint('summarizing', 'accent')} {paint(len(summary_targets), 'bold')} "
                   f"session(s) via `claude -p` ({summary_workers} in parallel)...")
             with ThreadPoolExecutor(max_workers=summary_workers) as ex:
                 futs = {ex.submit(summarize, s): s for s in summary_targets}
@@ -2285,22 +2082,22 @@ def enrich_sessions(
                 for fut in as_completed(futs):
                     s = futs[fut]
                     done += 1
-                    marker = _paint("✓", "ok") if s.topic else _paint("·", "warn")
+                    marker = paint("✓", "ok") if s.topic else paint("·", "warn")
                     label = s.topic or s.summary_error or "(no topic)"
-                    print(f"    {_paint(f'[{done}/{len(summary_targets)}]', 'accent')} {marker} "
+                    print(f"    {paint(f'[{done}/{len(summary_targets)}]', 'accent')} {marker} "
                           f"{short_cwd(s.cwd)}  ({s.tool}) — "
-                          f"{_paint(_truncate(label, 70), '' if s.topic else 'warn')}")
+                          f"{paint(_truncate(label, 70), '' if s.topic else 'warn')}")
 
     pr_targets: list[Session] = []
     if fetch_pr_enabled:
         pr_targets = [s for s in sessions if needs_pr_fetch(s, refresh, pr_ttl_hours)]
         if pr_targets:
-            print(f"  {_paint('fetching PR info', 'accent')} for {_paint(len(pr_targets), 'bold')} "
+            print(f"  {paint('fetching PR info', 'accent')} for {paint(len(pr_targets), 'bold')} "
                   f"session(s) via `gh`...")
             with ThreadPoolExecutor(max_workers=6) as ex:
                 list(ex.map(fetch_pr_info, pr_targets))
             n_with_pr = sum(1 for s in pr_targets if s.pr_number)
-            print(f"    found {_paint(n_with_pr, 'ok' if n_with_pr else 'bold')} PR(s)")
+            print(f"    found {paint(n_with_pr, 'ok' if n_with_pr else 'bold')} PR(s)")
 
     touched_ids = {id(s) for s in summary_targets} | {id(s) for s in pr_targets}
     if touched_ids:
@@ -2308,7 +2105,7 @@ def enrich_sessions(
             if id(s) in touched_ids:
                 cache[(s.tool, s.session_id)] = cache_record(s)
         save_cache(cache_path, cache)
-        print(f"  {_paint('cache updated:', 'ok')} {cache_path}")
+        print(f"  {paint('cache updated:', 'ok')} {cache_path}")
 
 
 def _launch_dispatch(args, sessions: list[Session]) -> int:
@@ -2455,20 +2252,20 @@ def main() -> int:
         if not entries:
             print(f"  no snapshot found at {snap_path}")
             return 1
-        print(f"  {_paint('loaded', 'ok')} {_paint(len(entries), 'bold')} session(s) from {snap_path}")
+        print(f"  {paint('loaded', 'ok')} {paint(len(entries), 'bold')} session(s) from {snap_path}")
         # Skip sessions already running
         already_running = {r["session_id"] for r in snapshot_active(with_windows=False)}
         before = len(entries)
         entries = [e for e in entries if e["session_id"] not in already_running]
         skipped = before - len(entries)
         if skipped:
-            print(f"  {_paint('skipped', 'accent')} {_paint(skipped, 'bold')} already-running session(s)")
+            print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
         if not entries:
-            print(f"  {_paint('all sessions are already running', 'ok')} — nothing to restore.")
+            print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
             return 0
         ranked = snapshot_to_sessions(entries)
         if not ranked:
-            print(f"  {_paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
+            print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
         cache_path = Path(args.cache).expanduser()
@@ -2518,7 +2315,7 @@ def main() -> int:
         # text, not the raw JSON line) for snippets and cwd/branch matches.
         rg_paths = _rg_candidate_paths(args.find, tools)
         if rg_paths is not None:
-            print(f"  {_paint('rg pre-filter:', 'accent')} {_paint(len(rg_paths), 'bold')} candidate file(s)")
+            print(f"  {paint('rg pre-filter:', 'accent')} {paint(len(rg_paths), 'bold')} candidate file(s)")
         # In search mode, relax the activity filters (min msgs=1, min span=0)
         # so we don't miss sessions that briefly touched the topic.
         all_found = discover(tools, only_paths=rg_paths)
@@ -2528,14 +2325,14 @@ def main() -> int:
             project_glob=args.project,
             include_cleared=args.include_cleared,
         )
-        print(f"  {_paint('searching', 'accent')} {_paint(len(filtered), 'bold')} sessions (last {args.days}d) "
+        print(f"  {paint('searching', 'accent')} {paint(len(filtered), 'bold')} sessions (last {args.days}d) "
               f"for /{args.find}/i ...")
         hits = [s for s in filtered if search_session(s, pat)]
         hits.sort(key=search_relevance, reverse=True)
         if not hits:
-            print(f"\n  {_paint(f'No sessions match {args.find!r}.', 'warn')}\n")
+            print(f"\n  {paint(f'No sessions match {args.find!r}.', 'warn')}\n")
             return 0
-        print(f"  {_paint(len(hits), 'ok')} session(s) match, ranked by relevance\n")
+        print(f"  {paint(len(hits), 'ok')} session(s) match, ranked by relevance\n")
         ranked = hits
     else:
         # Normal mode: activity-based
@@ -2577,7 +2374,7 @@ def main() -> int:
             print("  (cancelled)")
             return 0
         to_show = picked
-        print(f"\n  {_paint('selected', 'ok')} {_paint(f'{len(to_show)}/{len(ranked)}', 'bold')} session(s)")
+        print(f"\n  {paint('selected', 'ok')} {paint(f'{len(to_show)}/{len(ranked)}', 'bold')} session(s)")
 
     args.target = _resolve_target(args.target, to_show)
     args.layout = args.layout or ("windows" if args.target == "ghostty" else "hybrid")
