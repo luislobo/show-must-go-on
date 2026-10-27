@@ -372,6 +372,12 @@ termui.py                     # colours, progress paint, wrapping, the picker
 tests/                        # stdlib unittest suites
 ```
 
+## Demo video
+
+`demo/render.sh <out-dir>` records a 45-second walkthrough and renders it as an MP4 in GitHub Dark and GitHub Light colours, plus a GIF. It needs `agg` (`brew install agg`) and `ffmpeg`.
+
+Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; and `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast. Re-run it after changing the interface so the video stays current.
+
 ## Running the tests
 
 ```bash
