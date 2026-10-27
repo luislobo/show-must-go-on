@@ -1054,7 +1054,7 @@ def print_stats(all_found: list[Session], after_filter: list[Session],
 
 
 # ---------------------------------------------------------------------------
-# Live snapshot: detect running sessions from /proc
+# Live snapshot: detect running sessions
 # ---------------------------------------------------------------------------
 
 
@@ -1098,19 +1098,132 @@ def _find_claude_session(pid: int, argv: list[str], cwd: str) -> str | None:
     return None
 
 
-def _find_codex_session(pid: int) -> tuple[str, Path] | None:
-    """Find session_id for a running Codex process via its open fds."""
-    fd_dir = Path(f"/proc/{pid}/fd")
+# ---------------------------------------------------------------------------
+# Process table: /proc on Linux, ps + lsof elsewhere (macOS)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    uid: int
+    tty: str | None     # "ttys003" on macOS; None when there is no controlling tty
+    argv: list[str]
+    cmd: str            # the raw command line, for matching app bundle paths
+
+
+def _list_procs() -> dict[int, Proc]:
+    if Path("/proc").is_dir():
+        return _list_procs_linux()
     try:
-        fds = list(fd_dir.iterdir())
-    except OSError:
-        return None
-    codex_root = str(CODEX_ROOT)
-    for fd in fds:
-        try:
-            target = os.readlink(fd)
-        except OSError:
+        out = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,ppid=,uid=,tty=,args="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    return _parse_ps(out)
+
+
+def _parse_ps(out: str) -> dict[int, Proc]:
+    """Parse `ps -o pid=,ppid=,uid=,tty=,args=`. argv is split on whitespace,
+    which is lossy for arguments with spaces but enough to spot the tool and
+    a --resume id."""
+    procs: dict[int, Proc] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 5:
             continue
+        try:
+            pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        tty = None if parts[3] in ("??", "-", "?") else parts[3]
+        procs[pid] = Proc(pid, ppid, uid, tty, parts[4].split(), parts[4])
+    return procs
+
+
+def _list_procs_linux() -> dict[int, Proc]:
+    procs: dict[int, Proc] = {}
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            uid = pid_dir.stat().st_uid
+            raw = (pid_dir / "cmdline").read_bytes()
+            # comm is in parens and may contain spaces; ppid is the 2nd field after it
+            ppid = int((pid_dir / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        argv = [a for a in raw.decode("utf-8", errors="replace").split("\0") if a]
+        procs[int(pid_dir.name)] = Proc(int(pid_dir.name), ppid, uid, None, argv, " ".join(argv))
+    return procs
+
+
+def _parse_lsof_names(out: str) -> dict[int, list[str]]:
+    """Parse `lsof -F pn` output into {pid: [file names]}."""
+    names: dict[int, list[str]] = {}
+    pid = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                pid = None
+            else:
+                names.setdefault(pid, [])
+        elif line.startswith("n") and pid is not None:
+            names[pid].append(line[1:])
+    return names
+
+
+def _proc_cwds(pids: list[int]) -> dict[int, str]:
+    if not pids:
+        return {}
+    if Path("/proc").is_dir():
+        cwds = {}
+        for pid in pids:
+            try:
+                cwds[pid] = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                pass
+        return cwds
+    try:
+        out = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-p", ",".join(map(str, pids)), "-F", "pn"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout  # exits 1 when any pid is gone; the rest is still printed
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    return {pid: names[0] for pid, names in _parse_lsof_names(out).items() if names}
+
+
+def _proc_open_files(pid: int) -> list[str]:
+    if Path("/proc").is_dir():
+        paths = []
+        try:
+            fds = list(Path(f"/proc/{pid}/fd").iterdir())
+        except OSError:
+            return []
+        for fd in fds:
+            try:
+                paths.append(os.readlink(fd))
+            except OSError:
+                continue
+        return paths
+    try:
+        out = subprocess.run(["lsof", "-p", str(pid), "-F", "pn"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return _parse_lsof_names(out).get(pid, [])
+
+
+def _find_codex_session(pid: int) -> tuple[str, Path] | None:
+    """Find session_id for a running Codex process via its open files."""
+    codex_root = str(CODEX_ROOT)
+    for target in _proc_open_files(pid):
         if target.startswith(codex_root) and target.endswith(".jsonl"):
             p = Path(target)
             # session_id is in the filename: rollout-<timestamp>-<uuid>.jsonl
@@ -1127,7 +1240,7 @@ def _get_i3_window_info() -> dict[int, tuple[str, str]]:
         wmout = subprocess.run(
             ["wmctrl", "-lp"], capture_output=True, text=True, timeout=5
         ).stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         return {}
     # wid → workspace name from i3 tree
     wid_to_ws: dict[int, str] = {}
@@ -1154,91 +1267,89 @@ def _get_i3_window_info() -> dict[int, tuple[str, str]]:
     return pid_info
 
 
-def _find_window_for_pid(pid: int, pid_info: dict[int, tuple[str, str]]) -> tuple[str, str]:
+def _find_window_for_pid(pid: int, pid_info: dict[int, tuple[str, str]],
+                         procs: dict[int, Proc]) -> tuple[str, str]:
     """Walk up parent chain to find the terminal window hosting a process."""
     check = pid
     for _ in range(5):
         if check in pid_info:
             return pid_info[check]
-        try:
-            ppid = int(Path(f"/proc/{check}/stat").read_text().split()[3])
-            check = ppid
-        except (OSError, ValueError, IndexError):
+        p = procs.get(check)
+        if not p:
             break
+        check = p.ppid
     return ("?", "?")
 
 
-def snapshot_active() -> list[dict]:
-    """Scan /proc for running claude/codex processes and return their session info."""
+def snapshot_active(with_windows: bool = True) -> list[dict]:
+    """Find running claude/codex processes and return their session info.
+
+    with_windows=False skips the window manager / AppleScript queries; the
+    duplicate check in --load only needs session ids.
+    """
     my_uid = os.getuid()
     results: dict[str, dict] = {}  # keyed by session_id to dedupe
-    pid_info = _get_i3_window_info()
+    procs = _list_procs()
 
-    proc = Path("/proc")
-    for pid_dir in proc.iterdir():
-        if not pid_dir.name.isdigit():
+    candidates: list[tuple[Proc, str]] = []
+    for p in procs.values():
+        if p.uid != my_uid or not p.argv:
             continue
-        pid = int(pid_dir.name)
-        try:
-            if pid_dir.stat().st_uid != my_uid:
-                continue
-        except OSError:
-            continue
-        # read cmdline
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-            argv = [a for a in raw.decode("utf-8", errors="replace").split("\0") if a]
-        except OSError:
-            continue
-        if not argv:
-            continue
-        exe = os.path.basename(argv[0])
+        exe = os.path.basename(p.argv[0])
         # identify tool
-        tool: str | None = None
         if exe == "claude":
             tool = "claude"
         elif exe == "codex":
             tool = "codex"
-        elif exe in ("node", "bash") and any("codex" in a for a in argv[1:3]):
+        elif exe in ("node", "bash") and any("codex" in a for a in p.argv[1:3]):
             tool = "codex"
         else:
             continue
-        # get cwd
-        try:
-            cwd = os.readlink(pid_dir / "cwd")
-        except OSError:
+        candidates.append((p, tool))
+
+    cwds = _proc_cwds([p.pid for p, _ in candidates])
+    for p, tool in sorted(candidates, key=lambda c: c[0].pid):
+        cwd = cwds.get(p.pid)
+        if not cwd:
             continue
         # find session_id
         session_id: str | None = None
         jsonl_path: str | None = None
         if tool == "claude":
-            session_id = _find_claude_session(pid, argv, cwd)
+            session_id = _find_claude_session(p.pid, p.argv, cwd)
             if session_id:
-                encoded = _encode_cwd_to_project(cwd)
-                p = CLAUDE_ROOT / encoded / f"{session_id}.jsonl"
-                if p.exists():
-                    jsonl_path = str(p)
+                jp = CLAUDE_ROOT / _encode_cwd_to_project(cwd) / f"{session_id}.jsonl"
+                if jp.exists():
+                    jsonl_path = str(jp)
         elif tool == "codex":
-            found = _find_codex_session(pid)
+            found = _find_codex_session(p.pid)
             if found:
                 session_id, jp = found
                 jsonl_path = str(jp)
         if not session_id:
             continue
-        # workspace + window title from i3
-        ws, win_title = _find_window_for_pid(pid, pid_info)
         # dedupe: keep first seen (lowest PID tends to be the "real" one)
         if session_id not in results:
             results[session_id] = {
                 "tool": tool,
                 "session_id": session_id,
                 "cwd": cwd,
-                "pid": pid,
+                "pid": p.pid,
                 "jsonl_path": jsonl_path,
-                "workspace": ws,
-                "window_title": win_title,
+                "workspace": "?",
+                "window_title": "?",
             }
-    return list(results.values())
+
+    entries = list(results.values())
+    if not with_windows or not entries:
+        return entries
+    if Path("/proc").is_dir():
+        # workspace + window title from i3
+        pid_info = _get_i3_window_info()
+        for entry in entries:
+            entry["workspace"], entry["window_title"] = _find_window_for_pid(
+                entry["pid"], pid_info, procs)
+    return entries
 
 
 def save_snapshot(entries: list[dict]) -> Path:
@@ -1739,7 +1850,7 @@ def main() -> int:
             return 1
         print(f"  loaded {len(entries)} session(s) from {snap_path}")
         # Skip sessions already running
-        already_running = {r["session_id"] for r in snapshot_active()}
+        already_running = {r["session_id"] for r in snapshot_active(with_windows=False)}
         before = len(entries)
         entries = [e for e in entries if e["session_id"] not in already_running]
         skipped = before - len(entries)
