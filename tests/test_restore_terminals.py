@@ -148,6 +148,66 @@ class MacWindowMatching(unittest.TestCase):
         self.assertEqual(rt._split_records(None), [])
 
 
+class GhosttyPlacements(unittest.TestCase):
+    def modes(self, sessions, layout, max_splits=4):
+        return [(s.session_id, m) for s, m in rt.ghostty_placements(sessions, layout, max_splits)]
+
+    def test_default_layouts_make_no_tabs(self):
+        ss = [session(f"s{i}") for i in range(5)]
+        self.assertEqual([m for _, m in self.modes(ss, "windows")], ["window"] * 5)
+        self.assertEqual([m for _, m in self.modes(ss, "splits")],
+                         ["window", "split", "split", "split", "split"])
+        self.assertEqual([m for _, m in self.modes(ss, "hybrid", 2)],
+                         ["window", "split", "window", "split", "window"])
+
+    def test_windows_ignores_saved_tabs(self):
+        ss = [session("a", terminal="ghostty", window_id="A", tab_index=1),
+              session("b", terminal="ghostty", window_id="A", tab_index=2)]
+        self.assertEqual([m for _, m in self.modes(ss, "windows")], ["window", "window"])
+
+    def test_tabs_layout(self):
+        ss = [session(f"s{i}") for i in range(3)]
+        self.assertEqual([m for _, m in self.modes(ss, "tabs")], ["window", "tab", "tab"])
+
+    def test_saved_keeps_windows_tabs_and_splits(self):
+        ss = [
+            session("b2", terminal="ghostty", window_id="B", tab_index=2),
+            session("a1", terminal="ghostty", window_id="A", tab_index=1),
+            session("b1", terminal="ghostty", window_id="B", tab_index=1),
+            session("a1split", terminal="ghostty", window_id="A", tab_index=1),
+            session("loose"),
+            session("loose2"),
+        ]
+        self.assertEqual(self.modes(ss, "saved"), [
+            ("b1", "window"), ("b2", "tab"),
+            ("a1", "window"), ("a1split", "split"),
+            ("loose", "window"), ("loose2", "window"),
+        ])
+
+    def test_saved_ignores_terminal_app_snapshot(self):
+        ss = [session("t", terminal="terminal", window_id="9", tab_index=1), session("u")]
+        self.assertEqual([m for _, m in self.modes(ss, "saved")], ["window", "window"])
+
+
+class ResolveTarget(unittest.TestCase):
+    def test_explicit_target_wins(self):
+        self.assertEqual(rt._resolve_target("byobu", []), "byobu")
+
+    def test_linux_defaults_to_terminator(self):
+        with mock.patch.object(rt, "IS_MACOS", False):
+            self.assertEqual(rt._resolve_target("auto", [session(terminal="ghostty")]), "terminator")
+
+    def test_macos_prefers_snapshot_terminal_then_current(self):
+        with mock.patch.object(rt, "IS_MACOS", True):
+            with mock.patch.dict(os.environ, {"TERM_PROGRAM": "ghostty"}):
+                self.assertEqual(rt._resolve_target("auto", [session(terminal="terminal")]), "terminal")
+                self.assertEqual(rt._resolve_target("auto", [session()]), "ghostty")
+                mixed = [session(terminal="terminal"), session(terminal="ghostty")]
+                self.assertEqual(rt._resolve_target("auto", mixed), "ghostty")
+            with mock.patch.dict(os.environ, {"TERM_PROGRAM": "Apple_Terminal"}):
+                self.assertEqual(rt._resolve_target("auto", [session()]), "terminal")
+
+
 class SnapshotCompat(unittest.TestCase):
     def test_linux_snapshot_without_new_fields_loads(self):
         with tempfile.TemporaryDirectory() as d:

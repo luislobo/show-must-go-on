@@ -4,8 +4,8 @@ restore_terminals.py — recover and relaunch AI coding sessions.
 
 Scans Claude Code and Codex session history on disk, figures out which
 sessions look like 'real terminals you were working in', and prints the
-commands needed to reopen them as either Terminator windows or tmux/byobu
-panes.
+commands needed to reopen them as Terminator windows (Linux/i3), Ghostty or
+Terminal.app windows (macOS), or tmux/byobu panes (either).
 
 Deterministic core. Optional `--summarize` calls `claude -p` (CLI) to
 summarize the last hour of each candidate session.
@@ -960,6 +960,163 @@ def launch_byobu(
 
 
 # ---------------------------------------------------------------------------
+# macOS backends: Ghostty and Terminal.app, driven through AppleScript
+# ---------------------------------------------------------------------------
+
+
+def _resolve_target(target: str, sessions: list[Session]) -> str:
+    """Pick a backend for --target=auto.
+
+    Linux keeps Terminator. On macOS, sessions from a snapshot go back to the
+    terminal they were saved from; otherwise the terminal running restore.
+    """
+    if target != "auto":
+        return target
+    if not IS_MACOS:
+        return "terminator"
+    saved = {s.terminal for s in sessions} & {"ghostty", "terminal"}
+    if len(saved) == 1:
+        return saved.pop()
+    if os.environ.get("TERM_PROGRAM") == "ghostty":
+        return "ghostty"
+    return "terminal"
+
+
+def _shell_line(s: Session) -> str:
+    """What gets typed into a fresh interactive shell to resume a session."""
+    return f"cd -- {shlex.quote(s.cwd or str(HOME))} && {resume_cmd(s)}"
+
+
+def ghostty_placements(sessions: list[Session], layout: str,
+                       max_splits: int) -> list[tuple[Session, str]]:
+    """Order sessions and give each a Ghostty placement: window, tab or split.
+
+    windows, splits and hybrid group sessions the way the tmux backend does,
+    with a Ghostty window in place of a tmux window, so no tabs are made.
+    tabs puts every session in one window. saved sends sessions saved from
+    Ghostty back to their saved window and tab (sessions that shared a tab
+    become splits) and gives the rest a window each.
+    """
+    if layout == "tabs":
+        return [(s, "tab" if i else "window") for i, s in enumerate(sessions)]
+    if layout != "saved":
+        return [(s, "split" if si else "window")
+                for group in _byobu_groups(sessions, layout, max_splits)
+                for si, s in enumerate(group)]
+
+    saved = [s for s in sessions if s.terminal == "ghostty" and s.window_id]
+    rest = [s for s in sessions if not (s.terminal == "ghostty" and s.window_id)]
+
+    window_order: dict[str, int] = {}
+    for s in saved:
+        window_order.setdefault(s.window_id, len(window_order))
+    saved.sort(key=lambda s: (window_order[s.window_id], s.tab_index or 0))
+
+    out: list[tuple[Session, str]] = []
+    prev: tuple[str, int | None] | None = None
+    for s in saved:
+        if prev is None or prev[0] != s.window_id:
+            mode = "window"
+        elif prev[1] != s.tab_index:
+            mode = "tab"
+        else:
+            mode = "split"
+        out.append((s, mode))
+        prev = (s.window_id, s.tab_index)
+    return out + [(s, "window") for s in rest]
+
+
+_GHOSTTY_LAUNCH = """
+on run argv
+  tell application "Ghostty"
+    activate
+    set w to missing value
+    set t to missing value
+    set n to 0
+    repeat with i from 1 to (count of argv) by 3
+      set mode to item i of argv
+      set cfg to new surface configuration
+      set initial working directory of cfg to item (i + 1) of argv
+      set initial input of cfg to (item (i + 2) of argv) & linefeed
+      if mode is "window" or w is missing value then
+        set w to new window with configuration cfg
+        set t to selected tab of w
+      else if mode is "tab" then
+        set t to new tab in w with configuration cfg
+      else
+        split (focused terminal of t) direction right with configuration cfg
+      end if
+      set n to n + 1
+    end repeat
+    return n
+  end tell
+end run
+"""
+
+_TERMINAL_LAUNCH = """
+on run argv
+  set wasRunning to application "Terminal" is running
+  tell application "Terminal"
+    set n to 0
+    repeat with i from 1 to (count of argv) by 2
+      if n is 0 and not wasRunning then
+        -- a cold start opens a default window; use it instead of leaving it empty
+        delay 1
+        if (count of windows) > 0 then
+          set t to do script (item i of argv) in window 1
+        else
+          set t to do script (item i of argv)
+        end if
+      else
+        set t to do script (item i of argv)
+      end if
+      set custom title of t to item (i + 1) of argv
+      set n to n + 1
+    end repeat
+    activate
+    return n
+  end tell
+end run
+"""
+
+
+def _osascript_count(script: str, argv: list[str]) -> int:
+    out = _osascript(script, *argv, timeout=60)
+    try:
+        return int(out or 0)
+    except ValueError:
+        return 0
+
+
+def launch_ghostty(sessions: list[Session], *, layout: str, max_splits: int) -> int:
+    """Open the sessions in Ghostty windows, tabs and splits. Needs Ghostty 1.3+."""
+    argv: list[str] = []
+    for s, mode in ghostty_placements(sessions, layout, max_splits):
+        argv += [mode, s.cwd or str(HOME), _shell_line(s)]
+        print(f"  ✓ {mode:<6} {short_cwd(s.cwd)}  —  {_pane_title(s)}")
+    n = _osascript_count(_GHOSTTY_LAUNCH, argv)
+    if n < len(sessions):
+        print(f"  ✗ Ghostty opened {n}/{len(sessions)}. It needs Ghostty 1.3+ "
+              f"and Automation permission for this terminal "
+              f"(System Settings → Privacy & Security → Automation).", file=sys.stderr)
+    return n
+
+
+def launch_terminal_app(sessions: list[Session]) -> int:
+    """Open one Terminal.app window per session."""
+    argv: list[str] = []
+    for s in sessions:
+        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        argv += [_shell_line(s), title]
+        print(f"  ✓ window {short_cwd(s.cwd)}  —  {title}")
+    n = _osascript_count(_TERMINAL_LAUNCH, argv)
+    if n < len(sessions):
+        print(f"  ✗ Terminal opened {n}/{len(sessions)}. Check Automation permission "
+              f"(System Settings → Privacy & Security → Automation).", file=sys.stderr)
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -988,13 +1145,22 @@ def _slugify(text: str | None, max_len: int = SLUG_MAX_LEN) -> str | None:
     return s[:max_len].rstrip("-") or None
 
 
-def print_plan(sessions: list[Session], use_summary: bool, target: str = "terminator") -> None:
+def print_plan(sessions: list[Session], use_summary: bool, target: str = "terminator",
+               layout: str = "hybrid", max_splits: int = 4) -> None:
     if not sessions:
         print("No sessions matched the filters. Try --days 30 or lower --min-messages.")
         return
 
+    placement: dict[int, str] = {}
     if target == "byobu":
         head = f"\n  Would place {len(sessions)} pane(s) into a byobu/tmux session  (--dry-run):\n"
+    elif target == "ghostty":
+        placed = ghostty_placements(sessions, layout, max_splits)
+        sessions = [s for s, _ in placed]
+        placement = {id(s): mode for s, mode in placed}
+        head = f"\n  Would open {len(sessions)} Ghostty terminal(s)  (--dry-run):\n"
+    elif target == "terminal":
+        head = f"\n  Would open {len(sessions)} Terminal.app window(s)  (--dry-run):\n"
     else:
         head = (f"\n  Would open {len(sessions)} Terminator window(s)  "
                 f"(--dry-run; i3 will tile them):\n")
@@ -1041,10 +1207,17 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
                 ts_short = m["timestamp"][:16] if m["timestamp"] else ""
                 print(f"      [{j+1}] {ts_short} [{m['role']}] "
                       f"{_truncate(m['snippet'], 140)}")
+        if s.window_id:
+            print(f"    saved in: {s.terminal} window {s.window_id}, tab {s.tab_index}")
         print(f"    title   : {title}")
         if target == "byobu":
             print(f"    slug    : {_pane_title(s)}")
             print(f"    cmd     : {resume_cmd(s)}")
+        elif target == "ghostty":
+            print(f"    opens as: {placement[id(s)]}")
+            print(f"    cmd     : {_shell_line(s)}")
+        elif target == "terminal":
+            print(f"    cmd     : {_shell_line(s)}")
         else:
             argv = terminator_argv(s, title)
             print(f"    cmd     : {' '.join(shlex.quote(a) for a in argv)}")
@@ -1921,21 +2094,31 @@ def _launch_dispatch(args, sessions: list[Session]) -> int:
             split_direction=args.split_direction,
             session_name=args.byobu_session,
         )
+    if args.target == "ghostty":
+        return launch_ghostty(sessions, layout=args.layout, max_splits=args.max_splits)
+    if args.target == "terminal":
+        return launch_terminal_app(sessions)
     return launch(sessions)
 
 
 def _backend_label(target: str) -> str:
-    return "byobu/tmux pane(s)" if target == "byobu" else "Terminator window(s)"
+    return {
+        "byobu": "byobu/tmux pane(s)",
+        "ghostty": "Ghostty terminal(s)",
+        "terminal": "Terminal.app window(s)",
+    }.get(target, "Terminator window(s)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="restore",
-        description="Show which Claude/Codex sessions to reopen as Terminator windows.",
+        description="Show which Claude/Codex sessions to reopen, and reopen them in "
+                    "Terminator, Ghostty, Terminal.app or tmux.",
         epilog=(
             "Typical flow:\n"
             "  restore              # preview — last 7 days, TUI-pick, cached summaries\n"
-            "  restore --execute    # same, but open each Terminator window\n"
+            "  restore --execute    # same, but open them (Terminator on Linux,\n"
+            "                       #   the terminal you are in on macOS)\n"
             "\n"
             "Save + restore running sessions:\n"
             "  restore --save                 # snapshot all running sessions now\n"
@@ -1950,6 +2133,12 @@ def main() -> int:
             "  restore --target=byobu --layout=splits      # all picked sessions as splits\n"
             "  restore --target=byobu --layout=windows     # one window per session\n"
             "  restore --target=byobu --max-splits=6       # 6 splits per window, then overflow\n"
+            "\n"
+            "macOS:\n"
+            "  restore --target=ghostty --execute          # one Ghostty window per session\n"
+            "  restore --target=ghostty --layout=tabs      # one Ghostty window, a tab per session\n"
+            "  restore --load --layout=saved --execute     # back into the saved windows and tabs\n"
+            "  restore --target=terminal --execute         # one Terminal.app window per session\n"
             "\n"
             "Other:\n"
             "  restore 14           # lookback 14 days\n"
@@ -1967,16 +2156,22 @@ def main() -> int:
                     help="don't launch the TUI picker, print everything")
     ap.add_argument("--execute", action="store_true",
                     help="actually launch (default: dry-run only)")
-    ap.add_argument("--target", choices=["terminator", "byobu"], default="terminator",
-                    help="launch backend: 'terminator' (i3 windows) or 'byobu' "
-                         "(tmux panes/windows in one session). default: terminator")
-    ap.add_argument("--layout", choices=["splits", "windows", "hybrid"], default="hybrid",
-                    help="byobu only: 'splits' = all panes in one window, "
+    ap.add_argument("--target", choices=["auto", "terminator", "byobu", "ghostty", "terminal"],
+                    default="auto",
+                    help="launch backend: 'terminator' (i3 windows), 'byobu' (tmux panes/windows "
+                         "in one session), 'ghostty' (Ghostty 1.3+ windows, splits or tabs, macOS) or "
+                         "'terminal' (Terminal.app windows). default: auto = terminator on Linux; "
+                         "on macOS the terminal a snapshot was saved from, else the one you are in")
+    ap.add_argument("--layout", choices=["splits", "windows", "hybrid", "tabs", "saved"],
+                    default=None,
+                    help="byobu and ghostty: 'splits' = all panes in one window, "
                          "'windows' = one window per session, "
                          "'hybrid' = split up to --max-splits per window, overflow to new windows. "
-                         "default: hybrid")
+                         "ghostty only: 'tabs' = one window, a tab per session; "
+                         "'saved' = snapshot sessions back in their saved window and tab. "
+                         "default: hybrid for byobu, windows for ghostty")
     ap.add_argument("--max-splits", type=int, default=4,
-                    help="byobu hybrid layout: max panes per window before a new window starts (default: 4)")
+                    help="hybrid layout: max panes per window before a new one starts (default: 4)")
     ap.add_argument("--split-direction", choices=["h", "v"], default="h",
                     help="byobu only: 'h' = side-by-side (default, good for wide screens), "
                          "'v' = stacked top/bottom")
@@ -2001,6 +2196,8 @@ def main() -> int:
     ap.add_argument("--summary-workers", type=int, default=3, help=argparse.SUPPRESS)
     ap.add_argument("--cache", default=str(DEFAULT_CACHE), help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.layout in ("tabs", "saved") and args.target not in ("auto", "ghostty"):
+        ap.error(f"--layout={args.layout} needs --target=ghostty")
 
     # Defaults: summarize unless --no-ai; pick via TUI if TTY and not --no-pick.
     args.summarize = not args.no_ai
@@ -2068,7 +2265,12 @@ def main() -> int:
                 print("  (cancelled)")
                 return 0
             to_show = picked
-        print_plan(to_show, use_summary=args.summarize, target=args.target)
+        args.target = _resolve_target(args.target, to_show)
+        args.layout = args.layout or ("windows" if args.target == "ghostty" else "hybrid")
+        if args.layout in ("tabs", "saved") and args.target != "ghostty":
+            ap.error(f"--layout={args.layout} needs --target=ghostty")
+        print_plan(to_show, use_summary=args.summarize, target=args.target,
+                   layout=args.layout, max_splits=args.max_splits)
         if args.execute and to_show:
             print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
             n = _launch_dispatch(args, to_show)
@@ -2151,7 +2353,12 @@ def main() -> int:
         to_show = picked
         print(f"\n  selected {len(to_show)}/{len(ranked)} session(s)")
 
-    print_plan(to_show, use_summary=args.summarize, target=args.target)
+    args.target = _resolve_target(args.target, to_show)
+    args.layout = args.layout or ("windows" if args.target == "ghostty" else "hybrid")
+    if args.layout in ("tabs", "saved") and args.target != "ghostty":
+        ap.error(f"--layout={args.layout} needs --target=ghostty")
+    print_plan(to_show, use_summary=args.summarize, target=args.target,
+               layout=args.layout, max_splits=args.max_splits)
     if args.execute and to_show:
         print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
         n = _launch_dispatch(args, to_show)
