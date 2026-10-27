@@ -1890,7 +1890,11 @@ def cache_record(s: Session) -> dict:
 # Only the normal (0-7) colours: their contrast holds on both light and dark
 # themes, where the bright ones fall below 4.5:1 on white. Colour is never
 # combined with bold, which some terminals render as the bright variant.
-_ROLE_COLORS = {"accent": "COLOR_CYAN", "ok": "COLOR_GREEN", "warn": "COLOR_YELLOW"}
+_ROLE_COLORS = {"accent": "COLOR_CYAN", "ok": "COLOR_GREEN", "warn": "COLOR_YELLOW",
+                # red only for the tagline's ♥: a symbol needs 3:1, which red
+                # clears on light, dark and Solarized themes; text in red does not
+                "heart": "COLOR_RED"}
+TAGLINE = [("Proudly made in Dallas with ", ""), ("♥", "heart"), (" ", "")]
 
 
 def _tui_colors_enabled(env, has_colors: bool) -> bool:
@@ -2096,6 +2100,14 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                     pass
                 x += len(text)
 
+        def with_tagline(segs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+            """The line's pieces, with the tagline right-aligned when there is room."""
+            used = sum(len(t) for t, _ in segs)
+            tag_w = sum(len(t) for t, _ in TAGLINE)
+            if used + tag_w + 2 < w:
+                return segs + [(" " * (w - 1 - used - tag_w), "")] + TAGLINE
+            return segs
+
         def keys(*pairs: tuple[str, str]) -> list[tuple[str, str]]:
             segs: list[tuple[str, str]] = []
             for key, what in pairs:
@@ -2120,7 +2132,8 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                     put(row, line)
                 last = min(len(lines), dtop + body_h)
                 more = "  ↓ more" if last < len(lines) else ""
-                put(h - 1, [(f" lines {dtop + 1}–{last} of {len(lines)}", ""), (more, "accent")])
+                put(h - 1, with_tagline([(f" lines {dtop + 1}–{last} of {len(lines)}", ""),
+                                         (more, "accent")]))
                 stdscr.refresh()
                 c = stdscr.getch()
                 if c in (curses.KEY_LEFT, ord("h"), ord("q"), 27):  # back to the list
@@ -2166,7 +2179,7 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
             cur = sessions[idx]
             loc: list[tuple[str, str]] = []
             if cur.cwd:
-                loc.append((short_cwd(cur.cwd), ""))
+                loc.append((short_cwd(cur.cwd), "bold"))
             if cur.git_branch:
                 loc.append((f"branch: {cur.git_branch}", "ok"))
             if cur.pr_number:
@@ -2175,7 +2188,7 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                     pr_str += f" ({cur.pr_state})"
                 if cur.pr_title:
                     pr_str += f" — {_truncate(cur.pr_title, 60)}"
-                loc.append((pr_str, "ok" if cur.pr_state == "open" else ""))
+                loc.append((pr_str, "ok" if cur.pr_state == "open" else "bold"))
             loc_segs: list[tuple[str, str]] = []
             for n, part in enumerate(loc):
                 if n:
@@ -2186,7 +2199,7 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
             else:
                 desc_line = (cur.abstract or _truncate(cur.last_user_prompt, 200)
                              or "(no preview)")
-            put(h - 2, loc_segs, bold=True)
+            put(h - 2, with_tagline(loc_segs))
             put(h - 1, [(_truncate(desc_line, w - 1), "")])
             stdscr.refresh()
             c = stdscr.getch()

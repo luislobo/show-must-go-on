@@ -291,6 +291,13 @@ class DetailsPage(unittest.TestCase):
         self.assertTrue(roles <= set(rt._ROLE_COLORS) | {"", "bold"}, roles)
 
 
+class Tagline(unittest.TestCase):
+    def test_heart_is_the_only_red(self):
+        self.assertEqual("".join(t for t, _ in rt.TAGLINE).strip(), "Proudly made in Dallas with ♥")
+        self.assertEqual([t for t, r in rt.TAGLINE if r == "heart"], ["♥"])
+        self.assertEqual(rt._ROLE_COLORS["heart"], "COLOR_RED")
+
+
 class ProgressColors(unittest.TestCase):
     def test_paint_on_a_terminal(self):
         with mock.patch.object(rt, "_stdout_colors", return_value=True):
