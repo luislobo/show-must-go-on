@@ -239,6 +239,58 @@ class PickerRows(unittest.TestCase):
         self.assertFalse(rt._tui_colors_enabled({}, False))
 
 
+class DetailsPage(unittest.TestCase):
+    def details(self, s, width=100):
+        lines = rt._detail_lines(s, width)
+        return lines, ["".join(t for t, _ in line) for line in lines]
+
+    def test_sections_and_fields(self):
+        s = session(cwd=str(Path.home() / "Dev"), topic="Fix the loader", interrupted=True,
+                    abstract="A summary. " * 30, first_user_prompt="start here",
+                    last_user_prompt="and finish", git_branch="main", pr_number=7,
+                    pr_state="open", pr_title="Loader", pr_url="https://x/7",
+                    terminal="ghostty", window_id="tab-group-1", tab_index=2)
+        s.last_hour_transcript = "[user] please do it\n\n[assistant] done it"
+        lines, text = self.details(s)
+        self.assertEqual(text[0], " Fix the loader")
+        for heading in ("Session", "Where", "Summary", "Prompts", "Resume"):
+            self.assertIn(f" {heading}", text)
+        joined = "\n".join(text)
+        self.assertIn("interrupted: the agent had the last turn", joined)
+        self.assertIn("ghostty window tab-group-1, tab 2", joined)
+        self.assertIn(f"claude --resume {s.session_id}", joined)
+        self.assertIn("Last hour of conversation (last 2 of 2 turns)", joined)
+        roles = {line[0][0].strip(): line[0][1] for line in lines if line}
+        self.assertEqual(roles["user"], "ok")
+        self.assertEqual(roles["assistant"], "accent")
+        status = [line for line in lines if line and line[0][0].strip() == "status"][0]
+        self.assertEqual(status[1][1], "warn")
+
+    def test_lines_fit_and_long_text_is_capped(self):
+        s = session(first_user_prompt="word " * 400, last_user_prompt="x")
+        lines, text = self.details(s, 80)
+        self.assertTrue(all(len(t) <= 80 for t in text), max(text, key=len))
+        start = next(i for i, t in enumerate(text) if t.startswith("   first"))
+        first = [text[start]] + [t for t in text[start + 1:start + 10]
+                                 if t.startswith(" " * 16)][:9]
+        self.assertEqual(len(first), 6)  # capped at six lines
+        self.assertTrue(first[-1].endswith("…"))
+
+    def test_empty_fields_are_left_out(self):
+        _, text = self.details(session())
+        joined = "\n".join(text)
+        self.assertNotIn("git remote", joined)
+        self.assertNotIn(" Summary", text)
+        self.assertNotIn("Search hits", joined)
+
+    def test_roles_are_known(self):
+        s = session(topic="t", summary_error="boom")
+        s.search_matches = [{"timestamp": "2026-10-27T10:00", "role": "user", "snippet": "hit"}]
+        lines, _ = self.details(s)
+        roles = {r for line in lines for _, r in line}
+        self.assertTrue(roles <= set(rt._ROLE_COLORS) | {"", "bold"}, roles)
+
+
 class ProgressColors(unittest.TestCase):
     def test_paint_on_a_terminal(self):
         with mock.patch.object(rt, "_stdout_colors", return_value=True):

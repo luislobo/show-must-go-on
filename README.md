@@ -258,6 +258,7 @@ find-session DSBF-491 14
 |-----|--------|
 | `j` / `k` / arrows | Move up/down |
 | `space` | Toggle checkbox |
+| `→` / `l` | Open the details page for the highlighted session |
 | `enter` | Confirm selection (if nothing checked, picks current item) |
 | `a` | Select all |
 | `n` | Select none |
@@ -267,6 +268,16 @@ find-session DSBF-491 14
 | `q` / `ESC` | Cancel |
 
 The footer shows the AI abstract (or first match snippet in search mode) for the highlighted session.
+
+The details page shows everything restore knows about the session: its id, status, start and last activity, message counts, folder, git remote, branch and PR, where it was running when the snapshot was saved, the full AI summary, the first and last prompts, every search hit, the last hour of conversation and the resume command. On that page:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / arrows | Scroll |
+| `f` / `b` / `PgDn` / `PgUp` | Scroll a page |
+| `g` / `G` | Jump to top/bottom |
+| `space` | Toggle this session's checkbox |
+| `←` / `h` / `q` / `ESC` | Back to the list |
 
 The current row has a `▶` in the gutter and bold text. Colours come from your terminal's own palette, so they follow its light or dark theme: cyan for the tool and the key hints, green for ticked rows, branches and open PRs, and yellow for interrupted sessions (`!`) and search hits. Only the normal ANSI colours are used, never the bright ones, which are hard to read on light backgrounds. The progress lines printed while restore scans, summarizes and searches use the same colours, with the numbers in bold; they stay plain when the output is piped or redirected. Set `NO_COLOR=1` to turn colour off.
 

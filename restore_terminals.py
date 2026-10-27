@@ -1951,6 +1951,101 @@ def _row_text(s: Session, width: int) -> str:
     return "".join(t for t, _ in _row_segments(s, width))
 
 
+def _wrap(text: str | None, width: int, max_lines: int = 0) -> list[str]:
+    """Word-wrap text with collapsed whitespace; past max_lines, end on an ellipsis."""
+    import textwrap
+    lines = textwrap.wrap(" ".join((text or "").split()), max(10, width)) or [""]
+    if max_lines and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][: max(0, width - 1)] + "…"
+    return lines
+
+
+def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
+    """Every line of the details page, as (text, role) pieces like _row_segments."""
+    label_w = 13
+    text_w = max(20, width - label_w - 4)
+    out: list[list[tuple[str, str]]] = []
+
+    def heading(title: str) -> None:
+        out.append([])
+        out.append([(f" {title}", "bold")])
+
+    def field(label: str, value, role: str = "", max_lines: int = 0,
+              label_role: str = "accent") -> None:
+        if value in (None, ""):
+            return
+        for n, line in enumerate(_wrap(str(value), text_w, max_lines)):
+            out.append([(f"   {label if n == 0 else '':<{label_w}}", label_role), (line, role)])
+
+    def para(text: str | None, role: str = "", max_lines: int = 0) -> None:
+        for line in _wrap(text, width - 4, max_lines):
+            out.append([("   " + line, role)])
+
+    for line in _wrap(s.topic or s.first_user_prompt or "(no prompt)", width - 2, 2):
+        out.append([(f" {line}", "bold")])
+
+    heading("Session")
+    field("tool", s.tool)
+    field("id", s.session_id)
+    if s.interrupted:
+        field("status", "interrupted: the agent had the last turn", "warn")
+    elif s.closed_with_clear:
+        field("status", "closed with /clear")
+    else:
+        field("status", "you had the last turn")
+    field("started", fmt_dt(s.first_ts))
+    field("last active", f"{fmt_dt(s.last_ts)}  ({s.age_days:.1f}d ago)")
+    field("span", f"{s.span_minutes:.0f} min")
+    field("messages", f"{s.message_count} total · {s.user_message_count} yours")
+
+    heading("Where")
+    field("folder", short_cwd(s.cwd))
+    field("git remote", s.git_remote)
+    field("branch", s.git_branch, "ok")
+    if s.pr_number:
+        field("PR", f"#{s.pr_number} ({s.pr_state or '?'})  {s.pr_title or ''}",
+              "ok" if s.pr_state == "open" else "")
+        field("", s.pr_url)
+    if s.window_id:
+        field("saved in", f"{s.terminal} window {s.window_id}, tab {s.tab_index}")
+    elif s.workspace and s.workspace != "?":
+        field("saved in", f"i3 workspace {s.workspace!r}")
+    if s.window_title and s.window_title != "?":
+        field("window", s.window_title)
+
+    if s.abstract or s.summary_error:
+        heading("Summary")
+        para(s.abstract)
+        if s.summary_error:
+            para(f"summary unavailable: {s.summary_error}", "warn")
+
+    heading("Prompts")
+    field("first", s.first_user_prompt, max_lines=6)
+    if s.last_user_prompt != s.first_user_prompt:
+        field("last", s.last_user_prompt, max_lines=6)
+
+    if s.search_matches:
+        heading(f"Search hits ({len(s.search_matches)})")
+        for n, m in enumerate(s.search_matches, 1):
+            ts = (m.get("timestamp") or "")[:16]
+            field(f"[{n}] {m.get('role', '')}", f"{ts}  {m.get('snippet', '')}", max_lines=4)
+
+    turns = [t for t in (s.last_hour_transcript or "").split("\n\n") if t.strip()]
+    if turns:
+        heading(f"Last hour of conversation (last {min(len(turns), 12)} of {len(turns)} turns)")
+        for turn in turns[-12:]:
+            m = re.match(r"\[(\w+)\] (.*)", turn, re.S)
+            role, text = (m.group(1), m.group(2)) if m else ("", turn)
+            # your turns in green, the agent's in the accent colour
+            field(role, text, max_lines=4, label_role="ok" if role == "user" else "accent")
+
+    heading("Resume")
+    field("command", resume_cmd(s))
+    field("transcript", short_cwd(str(s.path)))
+    return out
+
+
 def tui_pick(sessions: list[Session]) -> list[Session] | None:
     """Return user-selected subset, or None if user quit. Requires a real TTY."""
     if not sessions:
@@ -1989,7 +2084,9 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
             for text, role in segs:
                 if x >= limit:
                     break
-                if role:
+                if role == "bold":
+                    attr = curses.A_BOLD
+                elif role:
                     attr = role_attr[role]
                 else:
                     attr = curses.A_BOLD if bold else curses.A_NORMAL
@@ -1999,11 +2096,50 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
                     pass
                 x += len(text)
 
+        def keys(*pairs: tuple[str, str]) -> list[tuple[str, str]]:
+            segs: list[tuple[str, str]] = []
+            for key, what in pairs:
+                segs += [("   ", ""), (f"[{key}]", "accent"), (f" {what}", "")]
+            return segs
+
         idx = 0
         top = 0
+        detail = False   # showing the details page for sessions[idx]
+        dtop = 0         # first visible line of the details page
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
+            if detail:
+                lines = _detail_lines(sessions[idx], w - 1)
+                body_h = max(1, h - 2)
+                dtop = max(0, min(dtop, len(lines) - body_h))
+                mark = [("[x] selected", "ok")] if selected[idx] else [("[ ] not selected", "")]
+                put(0, [(f" session {idx + 1}/{len(sessions)} — ", "")] + mark +
+                    keys(("←", "back"), ("space", "toggle"), ("j/k", "scroll")), bold=True)
+                for row, line in enumerate(lines[dtop:dtop + body_h], 1):
+                    put(row, line)
+                last = min(len(lines), dtop + body_h)
+                more = "  ↓ more" if last < len(lines) else ""
+                put(h - 1, [(f" lines {dtop + 1}–{last} of {len(lines)}", ""), (more, "accent")])
+                stdscr.refresh()
+                c = stdscr.getch()
+                if c in (curses.KEY_LEFT, ord("h"), ord("q"), 27):  # back to the list
+                    detail = False
+                elif c in (curses.KEY_DOWN, ord("j")):
+                    dtop += 1
+                elif c in (curses.KEY_UP, ord("k")):
+                    dtop = max(0, dtop - 1)
+                elif c in (curses.KEY_NPAGE, ord("f")):
+                    dtop += body_h
+                elif c in (curses.KEY_PPAGE, ord("b")):
+                    dtop = max(0, dtop - body_h)
+                elif c in (curses.KEY_HOME, ord("g")):
+                    dtop = 0
+                elif c in (curses.KEY_END, ord("G")):
+                    dtop = len(lines)
+                elif c == ord(" "):
+                    selected[idx] = not selected[idx]
+                continue
             # header (1) + 2-line footer (2) + 1 buffer = 4 lines reserved
             body_h = max(1, h - 4)
             # scroll
@@ -2015,9 +2151,8 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
             count_sel = sum(selected)
             header = [(" restore-terminals — ", ""),
                       (f"{count_sel}/{len(sessions)} selected", "ok" if count_sel else "")]
-            for key, what in (("space", "toggle"), ("a", "all"), ("n", "none"),
-                              ("i", "invert"), ("enter", "confirm"), ("q", "quit")):
-                header += [("   ", ""), (f"[{key}]", "accent"), (f" {what}", "")]
+            header += keys(("space", "toggle"), ("→", "details"), ("a", "all"), ("n", "none"),
+                           ("i", "invert"), ("enter", "confirm"), ("q", "quit"))
             put(0, header, bold=True)
             # rows: a marker in the gutter and bold text for the current row
             for i in range(top, min(len(sessions), top + body_h)):
@@ -2057,7 +2192,9 @@ def tui_pick(sessions: list[Session]) -> list[Session] | None:
             c = stdscr.getch()
             if c in (ord("q"), 27):  # q or ESC
                 return None
-            if c in (curses.KEY_DOWN, ord("j")):
+            if c in (curses.KEY_RIGHT, ord("l")):
+                detail, dtop = True, 0
+            elif c in (curses.KEY_DOWN, ord("j")):
                 idx = min(len(sessions) - 1, idx + 1)
             elif c in (curses.KEY_UP, ord("k")):
                 idx = max(0, idx - 1)
