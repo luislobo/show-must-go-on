@@ -1915,7 +1915,8 @@ def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
         st = (s.pr_state or "")[:1]
         pr_marker = f" #{s.pr_number}{st}"
     label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
-    hits = f" ({len(s.search_matches)} hits)" if s.search_matches else ""
+    n_hits = len(s.search_matches)
+    hits = f" ({n_hits} hit{'' if n_hits == 1 else 's'})" if n_hits else ""
     segs = [
         ("!" if s.interrupted else " ", "warn"),
         (f" {age} ", ""),

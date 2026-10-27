@@ -248,10 +248,15 @@ class PickerRows(unittest.TestCase):
         self.assertEqual(roles["claude"], "accent")
         self.assertEqual(roles["main"], "ok")
         self.assertEqual(roles["#7o"], "ok")
-        self.assertEqual(roles["(1 hits)"], "warn")
+        self.assertEqual(roles["(1 hit)"], "warn")
         self.assertTrue(set(r for _, r in segs) <= set(termui.ROLE_COLORS) | {""})
         self.assertRegex(rt._row_text(s, 120),
-                         r"^! +\d+\.\dd claude ~/Dev  main #7o \(1 hits\)  Fix the loader$")
+                         r"^! +\d+\.\dd claude ~/Dev  main #7o \(1 hit\)  Fix the loader$")
+
+    def test_hit_count_is_pluralised(self):
+        s = session()
+        s.search_matches = [{"snippet": "a"}, {"snippet": "b"}]
+        self.assertIn(" (2 hits)", rt._row_text(s, 120))
 
     def test_closed_pr_is_not_green(self):
         s = session(pr_number=7, pr_state="closed")
