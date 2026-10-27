@@ -1226,9 +1226,10 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
 
 def print_stats(all_found: list[Session], after_filter: list[Session],
                 ranked: list[Session]) -> None:
-    print(f"  scanned: {len(all_found)} sessions on disk  "
-          f"→ {len(after_filter)} after filters  "
-          f"→ {len(ranked)} ranked by last activity")
+    arrow = _paint("→", "accent")
+    print(f"  {_paint('scanned:', 'accent')} {_paint(len(all_found), 'bold')} sessions on disk  "
+          f"{arrow} {_paint(len(after_filter), 'bold')} after filters  "
+          f"{arrow} {_paint(len(ranked), 'ok')} ranked by last activity")
 
 
 # ---------------------------------------------------------------------------
@@ -1897,6 +1898,24 @@ def _tui_colors_enabled(env, has_colors: bool) -> bool:
     return has_colors and not env.get("NO_COLOR")
 
 
+# The same roles as ANSI codes for the progress lines, plus bold (default
+# colour) for the numbers.
+_ANSI = {"accent": "36", "ok": "32", "warn": "33", "bold": "1"}
+
+
+def _stdout_colors() -> bool:
+    """Colour progress output only on a terminal, and not under NO_COLOR or TERM=dumb."""
+    return sys.stdout.isatty() and _tui_colors_enabled(os.environ, os.environ.get("TERM") != "dumb")
+
+
+def _paint(text, role: str) -> str:
+    """Wrap text in the ANSI code for a role; plain when colour is off."""
+    text = str(text)
+    if not role or not _stdout_colors():
+        return text
+    return f"\033[{_ANSI[role]}m{text}\033[0m"
+
+
 def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
     """One picker row as (text, role) pieces; role is a key of _ROLE_COLORS or ''."""
     age = f"{s.age_days:4.1f}d"
@@ -2105,32 +2124,33 @@ def enrich_sessions(
         summary_targets = [s for s in sessions if needs_summary(s, cache, refresh)]
         skipped = len(sessions) - len(summary_targets)
         if skipped:
-            print(f"\n  cache hit: {skipped} session(s) reused from "
+            print(f"\n  {_paint('cache hit:', 'ok')} {_paint(skipped, 'bold')} session(s) reused from "
                   f"{cache_path} (use --refresh to regenerate)")
         if summary_targets:
-            print(f"  summarizing {len(summary_targets)} session(s) via `claude -p` "
-                  f"({summary_workers} in parallel)...")
+            print(f"  {_paint('summarizing', 'accent')} {_paint(len(summary_targets), 'bold')} "
+                  f"session(s) via `claude -p` ({summary_workers} in parallel)...")
             with ThreadPoolExecutor(max_workers=summary_workers) as ex:
                 futs = {ex.submit(summarize, s): s for s in summary_targets}
                 done = 0
                 for fut in as_completed(futs):
                     s = futs[fut]
                     done += 1
-                    marker = "✓" if s.topic else "·"
+                    marker = _paint("✓", "ok") if s.topic else _paint("·", "warn")
                     label = s.topic or s.summary_error or "(no topic)"
-                    print(f"    [{done}/{len(summary_targets)}] {marker} "
+                    print(f"    {_paint(f'[{done}/{len(summary_targets)}]', 'accent')} {marker} "
                           f"{short_cwd(s.cwd)}  ({s.tool}) — "
-                          f"{_truncate(label, 70)}")
+                          f"{_paint(_truncate(label, 70), '' if s.topic else 'warn')}")
 
     pr_targets: list[Session] = []
     if fetch_pr_enabled:
         pr_targets = [s for s in sessions if needs_pr_fetch(s, refresh, pr_ttl_hours)]
         if pr_targets:
-            print(f"  fetching PR info for {len(pr_targets)} session(s) via `gh`...")
+            print(f"  {_paint('fetching PR info', 'accent')} for {_paint(len(pr_targets), 'bold')} "
+                  f"session(s) via `gh`...")
             with ThreadPoolExecutor(max_workers=6) as ex:
                 list(ex.map(fetch_pr_info, pr_targets))
             n_with_pr = sum(1 for s in pr_targets if s.pr_number)
-            print(f"    found {n_with_pr} PR(s)")
+            print(f"    found {_paint(n_with_pr, 'ok' if n_with_pr else 'bold')} PR(s)")
 
     touched_ids = {id(s) for s in summary_targets} | {id(s) for s in pr_targets}
     if touched_ids:
@@ -2138,7 +2158,7 @@ def enrich_sessions(
             if id(s) in touched_ids:
                 cache[(s.tool, s.session_id)] = cache_record(s)
         save_cache(cache_path, cache)
-        print(f"  cache updated: {cache_path}")
+        print(f"  {_paint('cache updated:', 'ok')} {cache_path}")
 
 
 def _launch_dispatch(args, sessions: list[Session]) -> int:
@@ -2285,20 +2305,20 @@ def main() -> int:
         if not entries:
             print(f"  no snapshot found at {snap_path}")
             return 1
-        print(f"  loaded {len(entries)} session(s) from {snap_path}")
+        print(f"  {_paint('loaded', 'ok')} {_paint(len(entries), 'bold')} session(s) from {snap_path}")
         # Skip sessions already running
         already_running = {r["session_id"] for r in snapshot_active(with_windows=False)}
         before = len(entries)
         entries = [e for e in entries if e["session_id"] not in already_running]
         skipped = before - len(entries)
         if skipped:
-            print(f"  skipped {skipped} already-running session(s)")
+            print(f"  {_paint('skipped', 'accent')} {_paint(skipped, 'bold')} already-running session(s)")
         if not entries:
-            print("  all sessions are already running — nothing to restore.")
+            print(f"  {_paint('all sessions are already running', 'ok')} — nothing to restore.")
             return 0
         ranked = snapshot_to_sessions(entries)
         if not ranked:
-            print("  none of the saved sessions could be parsed (files gone?)")
+            print(f"  {_paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
         cache_path = Path(args.cache).expanduser()
@@ -2348,7 +2368,7 @@ def main() -> int:
         # text, not the raw JSON line) for snippets and cwd/branch matches.
         rg_paths = _rg_candidate_paths(args.find, tools)
         if rg_paths is not None:
-            print(f"  rg pre-filter: {len(rg_paths)} candidate file(s)")
+            print(f"  {_paint('rg pre-filter:', 'accent')} {_paint(len(rg_paths), 'bold')} candidate file(s)")
         # In search mode, relax the activity filters (min msgs=1, min span=0)
         # so we don't miss sessions that briefly touched the topic.
         all_found = discover(tools, only_paths=rg_paths)
@@ -2358,14 +2378,14 @@ def main() -> int:
             project_glob=args.project,
             include_cleared=args.include_cleared,
         )
-        print(f"  searching {len(filtered)} sessions (last {args.days}d) "
+        print(f"  {_paint('searching', 'accent')} {_paint(len(filtered), 'bold')} sessions (last {args.days}d) "
               f"for /{args.find}/i ...")
         hits = [s for s in filtered if search_session(s, pat)]
         hits.sort(key=search_relevance, reverse=True)
         if not hits:
-            print(f"\n  No sessions match '{args.find}'.\n")
+            print(f"\n  {_paint(f'No sessions match {args.find!r}.', 'warn')}\n")
             return 0
-        print(f"  {len(hits)} session(s) match, ranked by relevance\n")
+        print(f"  {_paint(len(hits), 'ok')} session(s) match, ranked by relevance\n")
         ranked = hits
     else:
         # Normal mode: activity-based
@@ -2407,7 +2427,7 @@ def main() -> int:
             print("  (cancelled)")
             return 0
         to_show = picked
-        print(f"\n  selected {len(to_show)}/{len(ranked)} session(s)")
+        print(f"\n  {_paint('selected', 'ok')} {_paint(f'{len(to_show)}/{len(ranked)}', 'bold')} session(s)")
 
     args.target = _resolve_target(args.target, to_show)
     args.layout = args.layout or ("windows" if args.target == "ghostty" else "hybrid")

@@ -239,6 +239,34 @@ class PickerRows(unittest.TestCase):
         self.assertFalse(rt._tui_colors_enabled({}, False))
 
 
+class ProgressColors(unittest.TestCase):
+    def test_paint_on_a_terminal(self):
+        with mock.patch.object(rt, "_stdout_colors", return_value=True):
+            self.assertEqual(rt._paint(3, "ok"), "\033[32m3\033[0m")
+            self.assertEqual(rt._paint("x", "bold"), "\033[1mx\033[0m")
+            self.assertEqual(rt._paint("x", ""), "x")
+
+    def test_plain_when_colour_is_off(self):
+        with mock.patch.object(rt, "_stdout_colors", return_value=False):
+            self.assertEqual(rt._paint("x", "warn"), "x")
+
+    def test_off_when_piped_no_color_or_dumb(self):
+        with mock.patch.object(sys.stdout, "isatty", return_value=False):
+            self.assertFalse(rt._stdout_colors())
+        with mock.patch.object(sys.stdout, "isatty", return_value=True):
+            with mock.patch.dict(os.environ, {"NO_COLOR": "1", "TERM": "xterm"}):
+                self.assertFalse(rt._stdout_colors())
+            with mock.patch.dict(os.environ, {"TERM": "dumb"}):
+                os.environ.pop("NO_COLOR", None)
+                self.assertFalse(rt._stdout_colors())
+            with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+                os.environ.pop("NO_COLOR", None)
+                self.assertTrue(rt._stdout_colors())
+
+    def test_only_normal_colours(self):
+        self.assertEqual(set(rt._ANSI.values()), {"32", "33", "36", "1"})
+
+
 class SnapshotCompat(unittest.TestCase):
     def test_linux_snapshot_without_new_fields_loads(self):
         with tempfile.TemporaryDirectory() as d:
