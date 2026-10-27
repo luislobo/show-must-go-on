@@ -28,6 +28,7 @@ from pathlib import Path
 
 HOME = Path.home()
 CLAUDE_ROOT = HOME / ".claude" / "projects"
+CLAUDE_PID_DIR = HOME / ".claude" / "sessions"   # <pid>.json, written by Claude Code per running process
 CODEX_ROOT = HOME / ".codex" / "sessions"
 DEFAULT_CACHE = HOME / ".ai" / "sessions.jsonl"
 SNAPSHOTS_DIR = HOME / ".ai" / "snapshots"
@@ -1079,16 +1080,45 @@ def _most_recent_jsonl(project_dir: Path) -> tuple[str, Path] | None:
     return (best[1], best[2]) if best else None
 
 
+def _claude_pid_record(pid: int) -> dict | None:
+    """Claude Code's own record for a running process: ~/.claude/sessions/<pid>.json.
+
+    It holds the live sessionId (which changes on /clear) and the launch cwd,
+    so it beats guessing from argv or the newest JSONL in the project dir.
+    """
+    try:
+        rec = json.loads((CLAUDE_PID_DIR / f"{pid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("pid") != pid or not rec.get("sessionId"):
+        return None
+    return rec
+
+
+def _claude_jsonl_path(session_id: str, cwd: str | None) -> Path | None:
+    if cwd:
+        p = CLAUDE_ROOT / _encode_cwd_to_project(cwd) / f"{session_id}.jsonl"
+        if p.exists():
+            return p
+    for p in CLAUDE_ROOT.glob(f"*/{session_id}.jsonl"):
+        return p
+    return None
+
+
 def _find_claude_session(pid: int, argv: list[str], cwd: str) -> str | None:
     """Find session_id for a running Claude process."""
-    # 1. If --resume <id> is in argv, take it directly
+    # 1. Claude Code's per-pid record, when this version writes one
+    rec = _claude_pid_record(pid)
+    if rec:
+        return rec["sessionId"]
+    # 2. If --resume <id> is in argv, take it directly
     for i, arg in enumerate(argv):
         if arg == "--resume" and i + 1 < len(argv):
             return argv[i + 1]
         if arg.startswith("--resume="):
             return arg.split("=", 1)[1]
-    # 2. If --continue, it's the most recent session in project dir
-    # 3. Fallback: map cwd → project dir → most recent JSONL
+    # 3. If --continue, it's the most recent session in project dir
+    # 4. Fallback: map cwd → project dir → most recent JSONL
     encoded = _encode_cwd_to_project(cwd)
     project_dir = CLAUDE_ROOT / encoded
     if project_dir.is_dir():
@@ -1318,9 +1348,10 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
         if tool == "claude":
             session_id = _find_claude_session(p.pid, p.argv, cwd)
             if session_id:
-                jp = CLAUDE_ROOT / _encode_cwd_to_project(cwd) / f"{session_id}.jsonl"
-                if jp.exists():
-                    jsonl_path = str(jp)
+                rec = _claude_pid_record(p.pid)
+                found = _claude_jsonl_path(session_id, (rec or {}).get("cwd") or cwd)
+                if found:
+                    jsonl_path = str(found)
         elif tool == "codex":
             found = _find_codex_session(p.pid)
             if found:

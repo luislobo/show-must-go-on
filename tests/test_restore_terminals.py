@@ -5,6 +5,7 @@ Stdlib only. Run from the repo root:  python3 -m unittest discover tests
 """
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -39,6 +40,44 @@ class ParsePs(unittest.TestCase):
                          {10: ["/Users/l/Dev"], 11: ["/a b/c", "/d.jsonl"]})
 
 
+class ClaudeSessionLookup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.pid_dir = base / "sessions"
+        self.projects = base / "projects"
+        self.pid_dir.mkdir()
+        (self.projects / "-w-a").mkdir(parents=True)
+        for name, mtime in (("old", 1000), ("newest", 2000)):
+            p = self.projects / "-w-a" / f"{name}.jsonl"
+            p.write_text("{}\n")
+            os.utime(p, (mtime, mtime))
+        self.patch = mock.patch.multiple(rt, CLAUDE_PID_DIR=self.pid_dir, CLAUDE_ROOT=self.projects)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def test_pid_record_beats_argv_and_newest_file(self):
+        (self.pid_dir / "42.json").write_text(json.dumps({"pid": 42, "sessionId": "old", "cwd": "/w/a"}))
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a"), "old")
+
+    def test_pid_record_for_another_pid_is_ignored(self):
+        (self.pid_dir / "42.json").write_text(json.dumps({"pid": 7, "sessionId": "old"}))
+        self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a"), "newest")
+
+    def test_argv_resume_then_newest_file(self):
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a"), "x")
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume=y"], "/w/a"), "y")
+        self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a"), "newest")
+
+    def test_jsonl_path_found_outside_cwd_project(self):
+        self.assertEqual(rt._claude_jsonl_path("old", "/elsewhere"),
+                         self.projects / "-w-a" / "old.jsonl")
+        self.assertIsNone(rt._claude_jsonl_path("missing", "/w/a"))
+
+
 class SnapshotLiveProcess(unittest.TestCase):
     """Starts a real process named `claude` and finds it, through /proc on
     Linux and ps/lsof on macOS."""
@@ -50,10 +89,14 @@ class SnapshotLiveProcess(unittest.TestCase):
             work.mkdir()
             child = subprocess.Popen(["bash", "-c", "exec -a claude sleep 30"], cwd=work)
             try:
+                pid_dir = base / "sessions"
+                pid_dir.mkdir()
+                (pid_dir / f"{child.pid}.json").write_text(
+                    json.dumps({"pid": child.pid, "sessionId": "fake-sid", "cwd": str(work)}))
                 projects = base / "projects" / rt._encode_cwd_to_project(str(work))
                 projects.mkdir(parents=True)
                 (projects / "fake-sid.jsonl").write_text("{}\n")
-                with mock.patch.object(rt, "CLAUDE_ROOT", base / "projects"):
+                with mock.patch.multiple(rt, CLAUDE_PID_DIR=pid_dir, CLAUDE_ROOT=base / "projects"):
                     entry = None
                     for _ in range(20):  # exec -a takes effect a moment after spawn
                         found = [e for e in rt.snapshot_active(with_windows=False)
