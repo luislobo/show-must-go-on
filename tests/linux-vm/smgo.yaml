@@ -1,0 +1,44 @@
+# Lima VM for testing restore on a real Linux desktop stack:
+# Xvfb, i3, Terminator, wmctrl, tmux. See tests/linux-vm/README.md.
+#
+#   limactl start --name=smgo --param REPO="$PWD" tests/linux-vm/smgo.yaml
+#
+# Only this repository is shared with the VM, read-only, at /repo; the
+# rest of your home folder (including ~/.claude) stays out of it.
+
+# The image only: template:ubuntu-24.04 also pulls in Lima's default
+# mounts, which share your whole home folder.
+base: template:_images/ubuntu-24.04
+vmType: vz
+cpus: 4
+memory: 4GiB
+disk: 20GiB
+
+param:
+  REPO: ""                         # the repository root, passed with --param REPO=...
+
+mounts:
+  - location: "{{.Param.REPO}}"
+    mountPoint: /repo
+    writable: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        xvfb i3-wm terminator x11-utils wmctrl xdotool x11vnc dbus-x11 \
+        tmux byobu ripgrep git python3 fonts-dejavu-core
+
+probes:
+  - description: desktop packages installed
+    script: |
+      #!/bin/bash
+      set -eux
+      if ! timeout 600s bash -c 'until command -v terminator i3 Xvfb wmctrl tmux >/dev/null; do sleep 3; done'; then
+        echo >&2 "packages are not installed yet"
+        exit 1
+      fi

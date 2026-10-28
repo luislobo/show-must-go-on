@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shlex
 import subprocess
@@ -28,6 +27,11 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# termui.py sits beside the real file; resolve() follows the ~/.local/bin
+# symlink, and the explicit path also covers -I, -P and PYTHONSAFEPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from termui import paint  # noqa: E402
 
 HOME = Path.home()
 CLAUDE_ROOT = HOME / ".claude" / "projects"
@@ -323,30 +327,42 @@ def resume_cmd(hit: SessionHit) -> str:
     return f"codex resume {shlex.quote(str(hit.path))}"
 
 
-def print_hits(hits: list[SessionHit], pattern_str: str, context: int) -> None:
+def _highlight(text: str, pattern: re.Pattern | None) -> str:
+    """Paint every match of the search pattern in the snippet."""
+    if pattern is None:
+        return text
+    return pattern.sub(lambda m: paint(m.group(0), "warn") if m.group(0) else "", text)
+
+
+def print_hits(hits: list[SessionHit], pattern_str: str, context: int,
+               pattern: re.Pattern | None = None) -> None:
+    """Print the hits; colours as in restore (termui), plain when piped."""
     if not hits:
-        print(f"\n  No sessions match '{pattern_str}'.\n")
+        print(f"\n  {paint(f'No sessions match {pattern_str!r}.', 'warn')}\n")
         return
-    print(f"\n  {len(hits)} session(s) match '{pattern_str}':\n")
+    print(f"\n  {paint(len(hits), 'ok')} session(s) match {pattern_str!r}:\n")
+    label = lambda name: paint(f"{name:<8}:", "accent")
     for i, h in enumerate(hits, 1):
         git_line = ""
         if h.git.get("remote"):
             git_line += f"  remote={h.git['remote']}"
         if h.git.get("branch"):
-            git_line += f"  branch={h.git['branch']}"
-        print(f"  ── {i}/{len(hits)} ──")
-        print(f"    tool    : {h.tool}")
-        print(f"    cwd     : {short_cwd(h.cwd)}")
+            git_line += f"  branch={paint(h.git['branch'], 'ok')}"
+        print(f"  {paint(f'── {i}/{len(hits)} ──', 'bold')}")
+        print(f"    {label('tool')} {h.tool}")
+        print(f"    {label('cwd')} {short_cwd(h.cwd)}")
         if git_line:
-            print(f"    git     :{git_line}")
-        print(f"    session : {h.session_id}")
-        print(f"    active  : {fmt_dt(h.first_ts)} → {fmt_dt(h.last_ts)}  "
+            print(f"    {label('git')}{git_line}")
+        print(f"    {label('session')} {h.session_id}")
+        print(f"    {label('active')} {fmt_dt(h.first_ts)} → {fmt_dt(h.last_ts)}  "
               f"({h.age_days:.1f}d ago)")
-        print(f"    matches : {len(h.matches)}")
-        print(f"    resume  : {resume_cmd(h)}")
+        print(f"    {label('matches')} {paint(len(h.matches), 'bold')}")
+        print(f"    {label('resume')} {paint(resume_cmd(h), 'bold')}")
         for j, m in enumerate(h.matches[:context]):
             ts_short = m.timestamp[:16] if m.timestamp else ""
-            print(f"      [{j + 1}] {ts_short} [{m.role}] {_truncate(m.snippet, 160)}")
+            role = paint(f"[{m.role}]", "ok" if m.role == "user" else "accent")
+            snippet = _highlight(_truncate(m.snippet, 160), pattern)
+            print(f"      {paint(f'[{j + 1}]', 'accent')} {ts_short} {role} {snippet}")
         if len(h.matches) > context:
             print(f"      ... and {len(h.matches) - context} more")
         print()
@@ -388,9 +404,10 @@ def main() -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
     tools = {"claude", "codex"} if args.only == "all" else {args.only}
 
-    print(f"  searching {args.days} days of sessions for /{args.pattern}/i ...")
+    print(f"  {paint('searching', 'accent')} {paint(args.days, 'bold')} days of sessions "
+          f"for /{args.pattern}/i ...")
     hits = discover_and_search(pat, cutoff, tools)
-    print_hits(hits, args.pattern, args.context)
+    print_hits(hits, args.pattern, args.context, pat)
     return 0
 
 

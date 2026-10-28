@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stand-in for the agent CLI in the Linux VM test. It writes the record the
+# real CLI writes for each running process (~/.claude/sessions/<pid>.json),
+# naming the session it was asked to resume, then becomes a long-running
+# process named `claude`, as the real one is.
+set -eu
+sid=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --resume) sid="$2"; shift 2 ;;
+    --resume=*) sid="${1#*=}"; shift ;;
+    *) shift ;;
+  esac
+done
+sid="${sid:-$(cat /proc/sys/kernel/random/uuid)}"
+mkdir -p "$HOME/.claude/sessions"
+printf '{"pid": %d, "sessionId": "%s", "cwd": "%s", "startedAt": %s}\n' \
+  $$ "$sid" "$PWD" "$(date +%s%3N)" > "$HOME/.claude/sessions/$$.json"
+exec -a claude sleep infinity

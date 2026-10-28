@@ -1,9 +1,13 @@
-# No Python package dependencies — stdlib only (Python 3.10+)
+# No Python package dependencies — stdlib only (Python 3.9+)
 #
-# System requirements (install via package manager):
+# System requirements, Linux GUI backend (install via package manager):
 #   - i3         (window manager — i3-msg for workspace detection/placement)
 #   - wmctrl     (X11 window list + PID mapping)
 #   - terminator (terminal emulator — default --execute backend)
+#
+# System requirements, macOS GUI backends:
+#   - Ghostty 1.3+  (--target=ghostty; AppleScript support)
+#   - Terminal.app  (--target=terminal; built in)
 #
 # Optional:
 #   - tmux/byobu (remote/headless --target=byobu backend)

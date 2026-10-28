@@ -2,7 +2,9 @@
 
 Recover and relaunch your AI coding sessions after a reboot.
 
-If you run multiple terminals with AI coding agents (Claude Code, Codex) and lose them to a restart, crash, or reboot, this tool scans their session history on disk, figures out what you were working on, and reopens everything as Terminator windows on the correct i3 workspaces. For remote or headless work, it can also rebuild the selected sessions as tmux/byobu panes.
+![restore in a terminal: scanning and summarising sessions, the session picker, a session's details page, the dry-run plan, and a search](docs/show-must-go-on-demo.gif)
+
+If you run multiple terminals with AI coding agents (Claude Code, Codex) and lose them to a restart, crash, or reboot, this tool scans their session history on disk, figures out what you were working on, and reopens everything: as Terminator windows on the correct i3 workspaces on Linux, or as Ghostty or Terminal.app windows on macOS. For remote or headless work, it can also rebuild the selected sessions as tmux/byobu panes.
 
 ## The problem
 
@@ -25,37 +27,50 @@ restore --execute        # recover from session history on disk
 ## Features
 
 - **Session discovery** — scans `~/.claude/projects/` and `~/.codex/sessions/` for all session history
-- **Live snapshot** (`--save`) — detects running claude/codex sessions via `/proc`, captures their session IDs, cwds, **i3 workspace names**, and **window titles**
-- **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace
+- **Live snapshot** (`--save`) — detects running claude/codex sessions (via `/proc` on Linux, `ps` and `lsof` on macOS), captures their session IDs, cwds, **i3 workspace names** or **Ghostty/Terminal.app window and tab**, and **window titles**
+- **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused
+- **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
 - **Smart filtering** — configurable lookback window, minimum activity thresholds, dead-cwd detection
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
 - **Persistent cache** — summaries are saved to `~/.ai/sessions.jsonl`; subsequent runs reuse them unless the session has new activity
 - **Content search** — `--find` searches all session transcripts for a branch name, repo, Jira ticket, or any regex
 - **Relevance ranking** — search results ranked by match count, recency, user-message weight, and git branch match
-- **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q)
-- **i3 workspace-aware** — saves and restores the exact i3 workspace (including custom names like `" 1 "`) for each session
-- **One Terminator window per session** — `terminator -u` (no-dbus) so i3 sees each as a separate window to tile
+- **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q), and a details page per session on `→`
+- **Colour that follows your theme** — the picker and the progress lines use the terminal's own palette, normal ANSI colours only, plain when piped; `NO_COLOR` turns it off
+- **Reusable terminal UI** — `termui.py` (colours, progress paint, wrapping, the picker) is one stdlib-only file another project can copy
+- **i3 workspace-aware** (Linux) — saves and restores the exact i3 workspace (including custom names like `" 1 "`) for each session
+- **One Terminator window per session** (Linux) — `terminator -u` (no-dbus) so i3 sees each as a separate window to tile
+- **Ghostty backend** (macOS) — `--target=ghostty` opens one Ghostty window per session through Ghostty's AppleScript support; splits, tabs, or the saved windows and tabs on request
+- **Terminal.app backend** (macOS) — `--target=terminal` opens one Terminal.app window per session
 - **Byobu/tmux backend** — `--target=byobu` rebuilds sessions into panes/windows for SSH or non-GUI machines
-- **Duplicate detection** — `--load` checks `/proc` for already-running sessions and skips them
+- **Duplicate detection** — `--load` checks running processes for already-running sessions and skips them
 - **Git metadata** — resolves each session's working directory to its git remote and current branch
 - **GitHub PR metadata** — when `gh` is installed and authenticated, shows PR number, state, title, and URL for matching branches
 - **Fast search prefilter** — when `rg` is installed, `--find` narrows candidate JSONL files before Python parsing
-- **Zero non-stdlib dependencies** — Python 3.10+ stdlib only; no pip install needed
+- **Zero non-stdlib dependencies** — Python 3.9+ stdlib only (macOS's `/usr/bin/python3` is enough); no pip install needed
 
 ## Requirements
 
-- **Python 3.10+** — no pip packages required
+- **Python 3.9+** — no pip packages required
 - **Claude Code** and/or **Codex** CLI — the tools whose sessions you want to recover
-- **Linux** — session discovery and duplicate detection read `/proc`
+- **Linux or macOS** — running sessions are found through `/proc` on Linux and `ps`/`lsof` on macOS
 
-For the default GUI backend:
+`--target` defaults to `auto`: Terminator on Linux. On macOS, each session from a snapshot goes back to the terminal it was saved from, so a snapshot with both Ghostty and Terminal.app sessions opens in both; anything else opens in the terminal you run `restore` in, found from its parent processes, which also works inside tmux. In a terminal restore cannot drive, such as iTerm, it says so and uses Terminal.app.
+
+For the Linux GUI backend (`--target=terminator`):
 
 - **i3 window manager** — required for workspace detection and window placement (`i3-msg`)
 - **wmctrl** — required for mapping process PIDs to X11 windows and workspaces
 - **Terminator** — required for `restore --execute` with the default `--target=terminator`
 - **X11 session** — required for i3/wmctrl window placement
 
-For remote/headless use:
+For the macOS GUI backends:
+
+- **Ghostty 1.3+** — for `--target=ghostty`; earlier versions have no AppleScript support
+- **Terminal.app** — for `--target=terminal`; nothing to install
+- **Automation permission** — the first launch asks to let your terminal control Ghostty or Terminal (System Settings → Privacy & Security → Automation). `--save` asks the same to read window and tab positions
+
+For remote/headless use (either OS):
 
 - **tmux** or **byobu** — required for `restore --target=byobu --execute`
 
@@ -76,6 +91,14 @@ sudo apt install python3 git i3 terminator wmctrl ripgrep gh byobu tmux
 sudo apt install python3 git ripgrep gh byobu tmux
 ```
 
+### Install requirements (macOS, Homebrew)
+
+```bash
+# Optional tools; Python 3.9 ships with the Xcode command line tools
+brew install ripgrep gh tmux
+brew install --cask ghostty     # only for --target=ghostty
+```
+
 ## Installation
 
 ```bash
@@ -90,6 +113,12 @@ cd show-must-go-on
 export PATH="$HOME/bin:$PATH"
 ```
 
+`install.sh` takes the target directory as its only argument, so you can link into a directory that is already on `PATH`, such as `~/.local/bin`:
+
+```bash
+./install.sh ~/.local/bin
+```
+
 Manual install is just two symlinks:
 
 ```bash
@@ -98,14 +127,15 @@ ln -sfn "$(pwd)/restore_terminals.py" ~/bin/restore
 ln -sfn "$(pwd)/find_session.py" ~/bin/find-session
 ```
 
-That's it. No `pip install`, no virtualenv, no build step.
+That's it. No `pip install`, no virtualenv, no build step. Link the scripts rather than copying them: `restore` imports `termui.py` from beside its real file, and Python follows the symlink to find it.
 
 ### Verify installation
 
 ```bash
 restore --help
 find-session --help
-python3 -m py_compile restore_terminals.py find_session.py
+python3 -m py_compile restore_terminals.py find_session.py termui.py
+python3 -m unittest discover tests
 ```
 
 ### Moving to another computer
@@ -130,7 +160,7 @@ rsync -a ~/.ai/snapshots/ user@new-host:~/.ai/snapshots/
 # Save a snapshot of all running sessions (run before reboot, or cron it)
 restore --save
 
-# After reboot: restore everything to the right workspaces
+# After reboot: reopen everything (i3 workspaces on Linux, one window per session on macOS)
 restore --load --execute
 
 # If all sessions are already running, --load does nothing
@@ -144,7 +174,8 @@ restore --load --execute
 # Preview what would be restored (last 7 days, TUI picker, AI summaries)
 restore
 
-# Actually launch the Terminator windows
+# Actually launch them: Terminator on Linux; on macOS the terminal you are in
+# (Ghostty or Terminal.app)
 restore --execute
 
 # Look back further
@@ -155,6 +186,32 @@ restore --refresh
 
 # Skip TUI, print everything to stdout
 restore --no-pick
+```
+
+### macOS: Ghostty and Terminal.app
+
+```bash
+# Snapshot running sessions, with their Ghostty or Terminal.app window and tab
+restore --save
+
+# Reopen them, one window per session
+restore --load --execute
+
+# Reopen Ghostty sessions in their saved windows and tabs
+# (sessions that shared a tab become splits)
+restore --load --layout=saved --execute
+
+# From history: one Ghostty window per session (the default, no tabs)
+restore --target=ghostty --execute
+
+# One Ghostty window with a tab per session
+restore --target=ghostty --layout=tabs --execute
+
+# Up to three splits per window, then a new window
+restore --target=ghostty --layout=hybrid --max-splits=3 --execute
+
+# One Terminal.app window per session
+restore --target=terminal --execute
 ```
 
 ### Remote/headless restore with byobu/tmux
@@ -205,6 +262,7 @@ find-session DSBF-491 14
 |-----|--------|
 | `j` / `k` / arrows | Move up/down |
 | `space` | Toggle checkbox |
+| `→` / `l` | Open the details page for the highlighted session |
 | `enter` | Confirm selection (if nothing checked, picks current item) |
 | `a` | Select all |
 | `n` | Select none |
@@ -214,6 +272,18 @@ find-session DSBF-491 14
 | `q` / `ESC` | Cancel |
 
 The footer shows the AI abstract (or first match snippet in search mode) for the highlighted session.
+
+The details page shows everything restore knows about the session: its id, status, start and last activity, message counts, folder, git remote, branch and PR, where it was running when the snapshot was saved, the full AI summary, the first and last prompts, every search hit, the last hour of conversation and the resume command. On that page:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / arrows | Scroll |
+| `f` / `b` / `PgDn` / `PgUp` | Scroll a page |
+| `g` / `G` | Jump to top/bottom |
+| `space` | Toggle this session's checkbox |
+| `←` / `h` / `q` / `ESC` | Back to the list |
+
+The current row has a `▶` in the gutter and bold text. Colours come from your terminal's own palette, so they follow its light or dark theme: cyan for the tool and the key hints, green for ticked rows, branches and open PRs, and yellow for interrupted sessions (`!`) and search hits. Only the normal ANSI colours are used, never the bright ones, which are hard to read on light backgrounds. The progress lines printed while restore scans, summarizes and searches use the same colours, with the numbers in bold; they stay plain when the output is piped or redirected. `find-session` uses them too, and highlights the search term in yellow inside each snippet. Set `NO_COLOR=1` to turn colour off.
 
 ## How it works
 
@@ -225,15 +295,21 @@ The footer shows the AI abstract (or first match snippet in search mode) for the
 4. **Rank** — by last activity (normal mode) or by relevance score (search mode)
 5. **Summarize** — feeds project context (README.md, CLAUDE.md, etc.) + last-hour transcript to `claude -p`, caches the result
 6. **Pick** — curses TUI for interactive selection
-7. **Launch** — spawns `terminator -u --working-directory <cwd> --title <topic> -x bash -lc '<tool> --resume <id>; exec $SHELL'` per session
+7. **Launch** — opens each session with the chosen `--target`:
+   - `terminator`: spawns `terminator -u --working-directory <cwd> --title <topic> -x bash -lc '<tool> --resume <id>; exec $SHELL'`
+   - `ghostty`: creates Ghostty windows (or splits, or tabs) through AppleScript, each starting in `<cwd>` and typing `cd -- <cwd> && <tool> --resume <id>` into your shell
+   - `terminal`: runs `cd -- <cwd> && <tool> --resume <id>` with Terminal.app's `do script`, one window per session
+   - `byobu`: builds a tmux session (see below)
 
 ### Snapshot mode (--save / --load)
 
-1. **Save** — scans `/proc` for running `claude`/`codex` processes, resolves each to its session ID (via `--resume` args, `/proc/PID/fd`, or cwd-to-project mapping), captures the i3 workspace name and window title via `i3-msg -t get_tree` + `wmctrl -lp`
+1. **Save** — lists running `claude`/`codex` processes (`/proc` on Linux, `ps` + `lsof` on macOS), resolves each to its session ID (via `~/.claude/sessions/<pid>.json`, `--resume` args, the process's open files, or cwd-to-project mapping), and records where it runs: the i3 workspace and window title via `i3-msg -t get_tree` + `wmctrl -lp` on Linux, or the Ghostty / Terminal.app window and tab via AppleScript on macOS
 2. **Load** — reads the snapshot, checks which sessions are already running (skips those), parses the JSONL files for metadata, runs through the same summarize/pick/launch pipeline
-3. **Launch** — spawns each Terminator window, then uses `i3-msg '[id=<wid>] move to workspace <name>'` to place it on the saved workspace
+3. **Launch** — on Linux, spawns each Terminator window, then uses `i3-msg '[id=<wid>] move to workspace <name>'` to place it on the saved workspace. On macOS, opens the sessions in Ghostty or Terminal.app; `--layout=saved` puts Ghostty sessions back in their saved window and tab
 
-### Window placement
+Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`, `pid`, `jsonl_path`, `workspace` and `window_title`, plus `terminal` (the host terminal: ghostty, terminal, terminator, tmux or iterm) and, on macOS, `window_id` and `tab_index`. Snapshots saved before the macOS fields existed still load.
+
+### Terminator placement (Linux)
 
 Each Terminator window:
 - Starts in the session's working directory
@@ -241,6 +317,30 @@ Each Terminator window:
 - Gets moved to its saved i3 workspace (exact name match, including spaces)
 - Resumes the AI agent session
 - Falls back to a shell when the agent exits
+
+### Ghostty placement (macOS)
+
+With `--target=ghostty`, each session:
+
+- Starts in the session's working directory, in your normal interactive shell
+- Resumes the AI agent session by typing the resume command into that shell
+- Leaves you at the shell prompt when the agent exits
+
+Layouts:
+
+- `--layout=windows` (default): one window per session, no tabs
+- `--layout=splits`: all selected sessions as splits in one window, evened out as they are made
+- `--layout=hybrid`: up to `--max-splits` splits per window, then a new window
+- `--layout=tabs`: one window with a tab per session
+- `--layout=saved`: sessions from a snapshot go back to their saved window and tab, and sessions that shared a tab become splits; any others get a window each
+
+Ghostty does not report which tty a terminal is attached to. Claude Code titles its terminal with the session's title, which the transcript records, so `--save` matches each session to the Ghostty terminal with that title. When there is no title to go on (Codex, or a session without one yet), it falls back to a terminal in the session's folder, preferring one whose title starts with an agent status symbol such as ✳ over a plain shell. Folders are compared after resolving symlinks, and background sessions, which have no terminal, are not placed in a window.
+
+Ghostty windows opened while the screen was locked did not start their shells in testing, so run `--execute` from an unlocked session.
+
+### Terminal.app placement (macOS)
+
+With `--target=terminal`, each session gets its own Terminal.app window, starts in its working directory and resumes in your interactive shell. Terminal.app reports each tab's tty, so `--save` records the exact window and tab. Terminal.app has no scripting command for new tabs, so restore always opens windows.
 
 ### Byobu/tmux placement
 
@@ -256,13 +356,83 @@ With `--target=byobu`, restore builds a tmux session instead of GUI windows:
 
 ```
 ~/.claude/projects/           # Claude Code session storage (read-only)
+~/.claude/sessions/<pid>.json # Claude Code's record of each running process (read-only)
 ~/.codex/sessions/            # Codex session storage (read-only)
 ~/.ai/sessions.jsonl          # Summary cache (written by restore)
 ~/.ai/snapshots/              # Saved snapshots from --save
 ~/.ai/snapshots/latest.json   # Symlink to most recent snapshot
-~/bin/restore                 # Symlink to restore_terminals.py
+~/bin/restore                 # Symlink to restore_terminals.py (or the directory given to install.sh)
 ~/bin/find-session            # Symlink to find_session.py
 ```
+
+In the repo, `termui.py` sits beside the two scripts:
+
+```
+restore_terminals.py          # restore
+find_session.py               # find-session
+termui.py                     # colours, progress paint, wrapping, the picker
+tests/                        # stdlib unittest suites
+```
+
+## Demo video
+
+`demo/render.sh <out-dir>` records a 45-second walkthrough and renders it as an MP4 in GitHub Dark and GitHub Light colours, plus a GIF. It needs `agg` (`brew install agg`) and `ffmpeg`.
+
+Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; and `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast. Re-run it after changing the interface so the video stays current, and copy the GIF over the one at the top of this README:
+
+```bash
+demo/render.sh demo/out && cp demo/out/show-must-go-on-demo.gif docs/
+```
+
+## Running the tests
+
+```bash
+python3 -m unittest discover tests
+```
+
+The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping and the tagline. `tests/test_find_session.py` covers `find-session`'s output, in colour and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
+
+```bash
+docker run --rm -v "$PWD":/repo:ro python:3.10-slim \
+  bash -c 'cp -r /repo /tmp/r && cd /tmp/r && python3 -m unittest discover tests'
+```
+
+`tests/test_live_macos.py` drives the real Terminal.app and Ghostty: it launches sessions and checks that each shell ran in its own folder, that four Ghostty splits share the width evenly, and that `--save` records the window of a session running in each app. It opens and closes windows, so it runs only when asked, and needs an unlocked screen for Ghostty:
+
+```bash
+SMGO_LIVE=1 python3 -m unittest tests.test_live_macos
+```
+
+The live tests close only the windows they opened, and quit Terminal.app again if it was not running before.
+
+`tests/linux-vm/` runs restore end to end on a real Linux desktop stack (Xvfb, i3, Terminator and tmux) in a Lima VM on the Mac: sessions on named workspaces are saved, killed as in a crash, and restored to the same workspaces. See `tests/linux-vm/README.md`:
+
+```bash
+limactl start --name=smgo --param REPO="$PWD" tests/linux-vm/smgo.yaml
+limactl shell --workdir / smgo bash /repo/tests/linux-vm/e2e.sh
+```
+
+## Reusing the terminal UI
+
+`termui.py` holds the parts of the interface that know nothing about AI sessions: the colour roles and their contrast rules, `NO_COLOR` and terminal detection, `paint()` for coloured progress lines, `wrap()` and `clip()`, the tagline, and `pick()`, the multi-select picker with its details page. It is one file, standard library only, Python 3.9+, so another project can copy it as is.
+
+```python
+from termui import TAGLINE, paint, pick
+
+print(f"  {paint('found', 'ok')} {paint(3, 'bold')} items")
+
+chosen = pick(
+    items,
+    title="my-tool",
+    noun="item",
+    row=lambda it, width: [(it.name, "accent"), (f"  {it.note}", "")],
+    footer=lambda it: ([(it.path, "bold")], it.description),
+    details=lambda it, width: [[(" Name", "bold")], [(f"   {it.name}", "")]],
+    tagline=TAGLINE,
+)
+```
+
+`row`, `footer` and `details` return `(text, role)` pieces; the roles are `accent`, `ok`, `warn`, `heart`, `bold` and `""`. `pick()` returns the ticked items, the highlighted one when none is ticked, or `None` when the user quits.
 
 ## License
 

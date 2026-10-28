@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Stand-in for `claude -p` in demo recordings: answers the summary prompt
+from the demo home's .demo-answers.json, after a short pause."""
+import json, os, random, re, sys, time
+from pathlib import Path
+
+prompt = sys.argv[-1]
+cwd = re.search(r"\(cwd: (.*?)\) ====", prompt)
+branch = re.search(r"^branch: (.*)$", prompt, re.M)
+key = f"{Path(cwd.group(1)).name if cwd else ''}@{branch.group(1) if branch else ''}"
+answers = json.loads((Path(os.environ["HOME"]) / ".demo-answers.json").read_text())["summaries"]
+ans = answers.get(key, {"topic": "Demo session", "abstract": "A demo session."})
+time.sleep(random.uniform(0.6, 1.6))
+print(json.dumps({"topic": ans["topic"], "slug": None, "abstract": ans["abstract"]}))

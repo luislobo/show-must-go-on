@@ -4,8 +4,8 @@ restore_terminals.py — recover and relaunch AI coding sessions.
 
 Scans Claude Code and Codex session history on disk, figures out which
 sessions look like 'real terminals you were working in', and prints the
-commands needed to reopen them as either Terminator windows or tmux/byobu
-panes.
+commands needed to reopen them as Terminator windows (Linux/i3), Ghostty or
+Terminal.app windows (macOS), or tmux/byobu panes (either).
 
 Deterministic core. Optional `--summarize` calls `claude -p` (CLI) to
 summarize the last hour of each candidate session.
@@ -26,8 +26,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# termui.py sits beside the real file. Python adds that folder to sys.path on
+# its own, but not under -I, -P or PYTHONSAFEPATH, so add it explicitly;
+# resolve() follows the ~/.local/bin symlink.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from termui import TAGLINE, clip, paint, pick, wrap  # noqa: E402
+
 HOME = Path.home()
+IS_MACOS = sys.platform == "darwin"
 CLAUDE_ROOT = HOME / ".claude" / "projects"
+CLAUDE_PID_DIR = HOME / ".claude" / "sessions"   # <pid>.json, written by Claude Code per running process
 CODEX_ROOT = HOME / ".codex" / "sessions"
 DEFAULT_CACHE = HOME / ".ai" / "sessions.jsonl"
 SNAPSHOTS_DIR = HOME / ".ai" / "snapshots"
@@ -68,6 +76,9 @@ class Session:
     pr_fetched_at: datetime | None = None
     workspace: str | None = None    # i3 workspace name (e.g. " 1 ")
     window_title: str | None = None # terminal window title at snapshot time
+    terminal: str | None = None     # host terminal at snapshot time: ghostty, terminal, terminator, tmux, ...
+    window_id: str | None = None    # macOS terminal window id at snapshot time
+    tab_index: int | None = None    # 1-based tab within window_id at snapshot time
 
     @property
     def span_minutes(self) -> float:
@@ -98,10 +109,7 @@ def _parse_ts(s: str | None) -> datetime | None:
 
 
 def _truncate(s: str | None, n: int = 120) -> str:
-    if not s:
-        return ""
-    s = " ".join(s.split())
-    return s if len(s) <= n else s[: n - 1] + "…"
+    return clip(s, n)
 
 
 def _claude_user_text(msg: dict) -> str | None:
@@ -120,10 +128,44 @@ def _claude_user_text(msg: dict) -> str | None:
     return None
 
 
+# Text the agent itself puts in the user's turn: command echoes and their
+# output, shell (!) input and output, task and hook notices, interruptions.
+# Newer transcripts also flag these entries (see _prompt_text); older ones
+# only show the opening tag.
+_INSERTED_PREFIXES = (
+    "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+    "<bash-input>", "<bash-stdout>", "<bash-stderr>", "<task-notification>",
+    "<system-reminder>", "[Request interrupted by user",
+)
+_COMMAND_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+_COMMAND_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
+
+
+def _prompt_text(d: dict, text: str) -> str | None:
+    """What the person typed in this user entry, for display; None when the
+    agent inserted it (a summary, a notice, command output). A slash command
+    shows as typed, "/name args", instead of its <command-name> markup."""
+    if d.get("isMeta") or d.get("isCompactSummary") or d.get("isVisibleInTranscriptOnly"):
+        return None
+    origin = d.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None
+    m = _COMMAND_RE.search(text)
+    if m:
+        args = _COMMAND_ARGS_RE.search(text)
+        name = m.group(1) if m.group(1).startswith("/") else "/" + m.group(1)
+        return f"{name} {args.group(1)}".strip() if args else name
+    if text.lstrip().startswith(_INSERTED_PREFIXES):
+        return None
+    return text
+
+
 def parse_claude(path: Path) -> Session | None:
     """Parse a Claude Code .jsonl into a Session summary."""
     s = Session(tool="claude", session_id=path.stem, path=path, cwd=None,
                 first_ts=None, last_ts=None)
+    last_user_text = ""   # the last user entry as written, prompt or not
+    first_command: str | None = None
     last_user_ts: datetime | None = None
     last_assistant_ts: datetime | None = None
     recent_lines: list[tuple[datetime, str, str]] = []  # (ts, role, text)
@@ -154,12 +196,19 @@ def parse_claude(path: Path) -> Session | None:
                     # skip pure tool_result payloads (Claude also uses role=user for those)
                     if text.strip():
                         s.user_message_count += 1
-                        if s.first_user_prompt is None:
-                            s.first_user_prompt = text
-                        s.last_user_prompt = text
+                        last_user_text = text
+                        prompt = _prompt_text(d, text)
+                        if prompt:
+                            # the first prompt is the first thing written, not a /command
+                            if prompt.startswith("/"):
+                                first_command = first_command or prompt
+                            elif s.first_user_prompt is None:
+                                s.first_user_prompt = prompt
+                            s.last_user_prompt = prompt
                         if ts:
                             last_user_ts = ts
-                            recent_lines.append((ts, "user", text))
+                            if prompt:
+                                recent_lines.append((ts, "user", prompt))
                     s.message_count += 1
                     s.last_role = "user" if text.strip() else s.last_role
                 elif t == "assistant" and role == "assistant":
@@ -174,11 +223,12 @@ def parse_claude(path: Path) -> Session | None:
         return None
     if not s.last_ts or not s.cwd:
         return None
+    s.first_user_prompt = s.first_user_prompt or first_command
     # interrupted: last meaningful turn is assistant (agent was mid-reply when killed)
     if last_assistant_ts and last_user_ts and last_assistant_ts > last_user_ts:
         s.interrupted = True
     # closed_with_clear: user's last action was /clear — session was deliberately abandoned
-    if s.last_user_prompt and "<command-name>/clear</command-name>" in s.last_user_prompt:
+    if "<command-name>/clear</command-name>" in last_user_text:
         s.closed_with_clear = True
     # last-hour transcript (for optional summarization)
     if s.last_ts:
@@ -761,6 +811,14 @@ def terminator_argv(s: Session, title: str) -> list[str]:
     ]
 
 
+def _i3_move_command(wid: str, workspace: str) -> str:
+    """The i3 command that moves a window to a workspace by its exact name.
+    Unquoted, i3 drops a leading space (" 3 " became "3 "), so the name is
+    quoted, with backslashes and double quotes escaped."""
+    name = workspace.replace("\\", "\\\\").replace('"', '\\"')
+    return f'[id={wid}] move to workspace "{name}"'
+
+
 def launch(sessions: list[Session]) -> int:
     """Spawn one detached Terminator window per session. Returns count launched."""
     import time
@@ -781,7 +839,7 @@ def launch(sessions: list[Session]) -> int:
             launched += 1
             print(f"  ✓ spawned pid={p.pid}: {short_cwd(s.cwd)}  —  {title}{ws_label}")
         except FileNotFoundError:
-            print(f"  ✗ terminator not found in PATH — aborting", file=sys.stderr)
+            print("  ✗ terminator not found in PATH — aborting", file=sys.stderr)
             return launched
         except OSError as e:
             print(f"  ✗ failed for {short_cwd(s.cwd)}: {e}", file=sys.stderr)
@@ -803,7 +861,7 @@ def launch(sessions: list[Session]) -> int:
                     if len(parts) >= 3 and int(parts[2]) == p.pid:
                         wid = parts[0]
                         subprocess.run(
-                            ["i3-msg", f'[id={wid}] move to workspace {s.workspace}'],
+                            ["i3-msg", _i3_move_command(wid, s.workspace)],
                             capture_output=True, timeout=3,
                         )
                         print(f"    → moved to workspace {s.workspace!r}")
@@ -955,6 +1013,229 @@ def launch_byobu(
 
 
 # ---------------------------------------------------------------------------
+# macOS backends: Ghostty and Terminal.app, driven through AppleScript
+# ---------------------------------------------------------------------------
+
+
+def _resolve_target(target: str, sessions: list[Session]) -> str:
+    """Pick a backend for --target=auto.
+
+    Linux keeps Terminator. On macOS, sessions from a snapshot go back to the
+    terminal they were saved from; otherwise the terminal running restore.
+    """
+    if target != "auto":
+        return target
+    if not IS_MACOS:
+        return "terminator"
+    saved = {s.terminal for s in sessions} & {"ghostty", "terminal"}
+    if len(saved) == 1:
+        return saved.pop()
+    current = _current_terminal()
+    if current in ("ghostty", "terminal"):
+        return current
+    if current is None:
+        # no terminal among the parents (e.g. restore run from a script): trust the environment
+        if os.environ.get("TERM_PROGRAM") == "ghostty":
+            return "ghostty"
+    elif current not in _NOTICES:
+        _NOTICES.add(current)
+        print(f"  restore cannot open windows in {current}; using Terminal.app "
+              f"(choose with --target)", file=sys.stderr)
+    return "terminal"
+
+
+_NOTICES: set[str] = set()   # terminals already reported as unsupported
+
+
+def _current_terminal() -> str | None:
+    """The terminal restore runs in, from its parent processes. TERM_PROGRAM
+    is not enough: tmux overwrites it. Inside tmux, the walk starts from the
+    tmux client attached to this session, which runs in the real terminal."""
+    procs = _list_procs()
+    host = _host_terminal(os.getpid(), procs)
+    if host == "tmux" and os.environ.get("TMUX"):
+        try:
+            out = subprocess.run(["tmux", "display-message", "-p", "#{client_pid}"],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            out = ""
+        if out.isdigit():
+            host = _host_terminal(int(out), procs) or host
+    return host
+
+
+def _shell_quote_path(path: str) -> str:
+    """Quote a path for the shell, writing a folder under HOME as ~/... ; the
+    tilde stays outside the quotes so the shell still expands it."""
+    home = str(HOME)
+    if path == home:
+        return "~"
+    if path.startswith(home + "/"):
+        return "~/" + shlex.quote(path[len(home) + 1:])
+    return shlex.quote(path)
+
+
+def _shell_line(s: Session) -> str:
+    """What gets typed into a fresh interactive shell to resume a session."""
+    return f"cd -- {_shell_quote_path(s.cwd or str(HOME))} && {resume_cmd(s)}"
+
+
+def ghostty_placements(sessions: list[Session], layout: str,
+                       max_splits: int) -> list[tuple[Session, str]]:
+    """Order sessions and give each a Ghostty placement: window, tab or split.
+
+    windows, splits and hybrid group sessions the way the tmux backend does,
+    with a Ghostty window in place of a tmux window, so no tabs are made.
+    tabs puts every session in one window. saved sends sessions saved from
+    Ghostty back to their saved window and tab (sessions that shared a tab
+    become splits) and gives the rest a window each.
+    """
+    if layout == "tabs":
+        return [(s, "tab" if i else "window") for i, s in enumerate(sessions)]
+    if layout != "saved":
+        return [(s, "split" if si else "window")
+                for group in _byobu_groups(sessions, layout, max_splits)
+                for si, s in enumerate(group)]
+
+    saved = [s for s in sessions if s.terminal == "ghostty" and s.window_id]
+    rest = [s for s in sessions if not (s.terminal == "ghostty" and s.window_id)]
+
+    window_order: dict[str, int] = {}
+    for s in saved:
+        window_order.setdefault(s.window_id, len(window_order))
+    saved.sort(key=lambda s: (window_order[s.window_id], s.tab_index or 0))
+
+    out: list[tuple[Session, str]] = []
+    prev: tuple[str, int | None] | None = None
+    for s in saved:
+        if prev is None or prev[0] != s.window_id:
+            mode = "window"
+        elif prev[1] != s.tab_index:
+            mode = "tab"
+        else:
+            mode = "split"
+        out.append((s, mode))
+        prev = (s.window_id, s.tab_index)
+    return out + [(s, "window") for s in rest]
+
+
+_GHOSTTY_LAUNCH = """
+on run argv
+  tell application "Ghostty"
+    activate
+    set w to missing value
+    set t to missing value
+    set n to 0
+    try
+      repeat with i from 1 to (count of argv) by 3
+        set mode to item i of argv
+        set cfg to new surface configuration
+        set initial working directory of cfg to item (i + 1) of argv
+        set initial input of cfg to (item (i + 2) of argv) & linefeed
+        if mode is "window" or w is missing value then
+          set w to new window with configuration cfg
+          set t to selected tab of w
+        else if mode is "tab" then
+          set t to new tab in w with configuration cfg
+        else
+          -- a split halves the focused terminal; even them out each time
+          split (focused terminal of t) direction right with configuration cfg
+          perform action "equalize_splits" on (focused terminal of t)
+        end if
+        set n to n + 1
+      end repeat
+    on error errMsg
+      return (n as text) & "|" & errMsg
+    end try
+    return n as text
+  end tell
+end run
+"""
+
+_TERMINAL_LAUNCH = """
+on run argv
+  set wasRunning to application "Terminal" is running
+  tell application "Terminal"
+    set n to 0
+    try
+      repeat with i from 1 to (count of argv) by 2
+        if n is 0 and not wasRunning then
+          -- a cold start opens a default window; use it instead of leaving it empty
+          delay 1
+          if (count of windows) > 0 then
+            set t to do script (item i of argv) in window 1
+          else
+            set t to do script (item i of argv)
+          end if
+        else
+          set t to do script (item i of argv)
+        end if
+        set custom title of t to item (i + 1) of argv
+        set n to n + 1
+      end repeat
+    on error errMsg
+      activate
+      return (n as text) & "|" & errMsg
+    end try
+    activate
+    return n as text
+  end tell
+end run
+"""
+
+
+def _osascript_progress(script: str, argv: list[str]) -> tuple[int, str | None]:
+    """Run a launch script. It returns how many items it opened, plus "|" and
+    the error when one stopped it part-way."""
+    out = _osascript(script, *argv, timeout=60)
+    if out is None:
+        return 0, "osascript failed"
+    count, _, err = out.partition("|")
+    try:
+        return int(count or 0), err or None
+    except ValueError:
+        return 0, out
+
+
+def _report_launch(app: str, lines: list[str], opened: int, err: str | None, hint: str) -> None:
+    """One line per session, after the fact: ✓ for what opened, ✗ for the rest."""
+    for i, line in enumerate(lines):
+        print(f"  {'✓' if i < opened else '✗'} {line}")
+    if opened < len(lines):
+        why = f": {err}" if err else ""
+        print(f"  ✗ {app} opened {opened}/{len(lines)}{why}. {hint}", file=sys.stderr)
+
+
+def launch_ghostty(sessions: list[Session], *, layout: str, max_splits: int) -> int:
+    """Open the sessions in Ghostty windows, tabs and splits. Needs Ghostty 1.3+."""
+    argv: list[str] = []
+    lines: list[str] = []
+    for s, mode in ghostty_placements(sessions, layout, max_splits):
+        argv += [mode, s.cwd or str(HOME), _shell_line(s)]
+        lines.append(f"{mode:<6} {short_cwd(s.cwd)}  —  {_pane_title(s)}")
+    n, err = _osascript_progress(_GHOSTTY_LAUNCH, argv)
+    _report_launch("Ghostty", lines, n, err,
+                   "It needs Ghostty 1.3+ and Automation permission for this terminal "
+                   "(System Settings → Privacy & Security → Automation).")
+    return n
+
+
+def launch_terminal_app(sessions: list[Session]) -> int:
+    """Open one Terminal.app window per session."""
+    argv: list[str] = []
+    lines: list[str] = []
+    for s in sessions:
+        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        argv += [_shell_line(s), title]
+        lines.append(f"window {short_cwd(s.cwd)}  —  {title}")
+    n, err = _osascript_progress(_TERMINAL_LAUNCH, argv)
+    _report_launch("Terminal", lines, n, err,
+                   "Check Automation permission "
+                   "(System Settings → Privacy & Security → Automation).")
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -983,13 +1264,22 @@ def _slugify(text: str | None, max_len: int = SLUG_MAX_LEN) -> str | None:
     return s[:max_len].rstrip("-") or None
 
 
-def print_plan(sessions: list[Session], use_summary: bool, target: str = "terminator") -> None:
+def print_plan(sessions: list[Session], use_summary: bool, target: str = "terminator",
+               layout: str = "hybrid", max_splits: int = 4) -> None:
     if not sessions:
         print("No sessions matched the filters. Try --days 30 or lower --min-messages.")
         return
 
+    placement: dict[int, str] = {}
     if target == "byobu":
         head = f"\n  Would place {len(sessions)} pane(s) into a byobu/tmux session  (--dry-run):\n"
+    elif target == "ghostty":
+        placed = ghostty_placements(sessions, layout, max_splits)
+        sessions = [s for s, _ in placed]
+        placement = {id(s): mode for s, mode in placed}
+        head = f"\n  Would open {len(sessions)} Ghostty terminal(s)  (--dry-run):\n"
+    elif target == "terminal":
+        head = f"\n  Would open {len(sessions)} Terminal.app window(s)  (--dry-run):\n"
     else:
         head = (f"\n  Would open {len(sessions)} Terminator window(s)  "
                 f"(--dry-run; i3 will tile them):\n")
@@ -1036,10 +1326,17 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
                 ts_short = m["timestamp"][:16] if m["timestamp"] else ""
                 print(f"      [{j+1}] {ts_short} [{m['role']}] "
                       f"{_truncate(m['snippet'], 140)}")
+        if s.window_id:
+            print(f"    saved in: {s.terminal} window {s.window_id}, tab {s.tab_index}")
         print(f"    title   : {title}")
         if target == "byobu":
             print(f"    slug    : {_pane_title(s)}")
             print(f"    cmd     : {resume_cmd(s)}")
+        elif target == "ghostty":
+            print(f"    opens as: {placement[id(s)]}")
+            print(f"    cmd     : {_shell_line(s)}")
+        elif target == "terminal":
+            print(f"    cmd     : {_shell_line(s)}")
         else:
             argv = terminator_argv(s, title)
             print(f"    cmd     : {' '.join(shlex.quote(a) for a in argv)}")
@@ -1048,13 +1345,14 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
 
 def print_stats(all_found: list[Session], after_filter: list[Session],
                 ranked: list[Session]) -> None:
-    print(f"  scanned: {len(all_found)} sessions on disk  "
-          f"→ {len(after_filter)} after filters  "
-          f"→ {len(ranked)} ranked by last activity")
+    arrow = paint("→", "accent")
+    print(f"  {paint('scanned:', 'accent')} {paint(len(all_found), 'bold')} sessions on disk  "
+          f"{arrow} {paint(len(after_filter), 'bold')} after filters  "
+          f"{arrow} {paint(len(ranked), 'ok')} ranked by last activity")
 
 
 # ---------------------------------------------------------------------------
-# Live snapshot: detect running sessions from /proc
+# Live snapshot: detect running sessions
 # ---------------------------------------------------------------------------
 
 
@@ -1079,16 +1377,52 @@ def _most_recent_jsonl(project_dir: Path) -> tuple[str, Path] | None:
     return (best[1], best[2]) if best else None
 
 
-def _find_claude_session(pid: int, argv: list[str], cwd: str) -> str | None:
-    """Find session_id for a running Claude process."""
-    # 1. If --resume <id> is in argv, take it directly
+def _claude_pid_record(pid: int, started: float | None = None) -> dict | None:
+    """Claude Code's own record for a running process: ~/.claude/sessions/<pid>.json.
+
+    It holds the live sessionId (which changes on /clear) and the launch cwd,
+    so it beats guessing from argv or the newest JSONL in the project dir.
+    A crash or reboot can leave a record behind for a pid that is later
+    reused; when the process start time is known, a record whose startedAt
+    is older than the process belongs to that earlier process and is ignored.
+    The agent writes it a second or two after starting.
+    """
+    try:
+        rec = json.loads((CLAUDE_PID_DIR / f"{pid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("pid") != pid or not rec.get("sessionId"):
+        return None
+    born = rec.get("startedAt")
+    if started and isinstance(born, (int, float)) and born / 1000 < started - 5:
+        return None
+    return rec
+
+
+def _claude_jsonl_path(session_id: str, cwd: str | None) -> Path | None:
+    if cwd:
+        p = CLAUDE_ROOT / _encode_cwd_to_project(cwd) / f"{session_id}.jsonl"
+        if p.exists():
+            return p
+    for p in CLAUDE_ROOT.glob(f"*/{session_id}.jsonl"):
+        return p
+    return None
+
+
+def _find_claude_session(pid: int, argv: list[str], cwd: str,
+                         rec: dict | None = None) -> str | None:
+    """Find session_id for a running Claude process; rec is its pid record, if any."""
+    # 1. Claude Code's per-pid record, when this version writes one
+    if rec:
+        return rec["sessionId"]
+    # 2. If --resume <id> is in argv, take it directly
     for i, arg in enumerate(argv):
         if arg == "--resume" and i + 1 < len(argv):
             return argv[i + 1]
         if arg.startswith("--resume="):
             return arg.split("=", 1)[1]
-    # 2. If --continue, it's the most recent session in project dir
-    # 3. Fallback: map cwd → project dir → most recent JSONL
+    # 3. If --continue, it's the most recent session in project dir
+    # 4. Fallback: map cwd → project dir → most recent JSONL
     encoded = _encode_cwd_to_project(cwd)
     project_dir = CLAUDE_ROOT / encoded
     if project_dir.is_dir():
@@ -1098,23 +1432,187 @@ def _find_claude_session(pid: int, argv: list[str], cwd: str) -> str | None:
     return None
 
 
-def _find_codex_session(pid: int) -> tuple[str, Path] | None:
-    """Find session_id for a running Codex process via its open fds."""
-    fd_dir = Path(f"/proc/{pid}/fd")
+# ---------------------------------------------------------------------------
+# Process table: /proc on Linux, ps + lsof elsewhere (macOS)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    uid: int
+    tty: str | None     # "ttys003" on macOS; None when there is no controlling tty
+    argv: list[str]
+    cmd: str            # the raw command line, for matching app bundle paths
+    start: float | None = None  # process start, seconds since the epoch
+
+
+def _list_procs() -> dict[int, Proc]:
+    if Path("/proc").is_dir():
+        return _list_procs_linux()
     try:
-        fds = list(fd_dir.iterdir())
-    except OSError:
-        return None
-    codex_root = str(CODEX_ROOT)
-    for fd in fds:
-        try:
-            target = os.readlink(fd)
-        except OSError:
+        out = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,ppid=,uid=,tty=,lstart=,args="],
+            capture_output=True, text=True, timeout=10,
+            env=dict(os.environ, LC_ALL="C"),  # lstart in English, for strptime
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    return _parse_ps(out)
+
+
+def _parse_ps(out: str) -> dict[int, Proc]:
+    """Parse `ps -o pid=,ppid=,uid=,tty=,lstart=,args=` (lstart is five words,
+    "Tue Oct 27 20:45:15 2026", in local time). argv is split on whitespace,
+    which is lossy for arguments with spaces but enough to spot the tool and
+    a --resume id."""
+    import time
+    procs: dict[int, Proc] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 9)
+        if len(parts) < 10:
             continue
+        try:
+            pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        tty = None if parts[3] in ("??", "-", "?") else parts[3]
+        try:
+            start = time.mktime(time.strptime(" ".join(parts[4:9]), "%a %b %d %H:%M:%S %Y"))
+        except ValueError:
+            start = None
+        procs[pid] = Proc(pid, ppid, uid, tty, parts[9].split(), parts[9], start)
+    return procs
+
+
+def _linux_boot_time() -> float | None:
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _list_procs_linux() -> dict[int, Proc]:
+    procs: dict[int, Proc] = {}
+    boot = _linux_boot_time()
+    ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            uid = pid_dir.stat().st_uid
+            raw = (pid_dir / "cmdline").read_bytes()
+            # comm is in parens and may contain spaces; after it, ppid is the
+            # 2nd field and starttime (clock ticks since boot) the 20th
+            fields = (pid_dir / "stat").read_text().rsplit(")", 1)[1].split()
+            ppid = int(fields[1])
+            start = boot + int(fields[19]) / ticks if boot is not None else None
+        except (OSError, ValueError, IndexError):
+            continue
+        argv = [a for a in raw.decode("utf-8", errors="replace").split("\0") if a]
+        procs[int(pid_dir.name)] = Proc(int(pid_dir.name), ppid, uid, None, argv,
+                                        " ".join(argv), start)
+    return procs
+
+
+def _parse_lsof_names(out: str) -> dict[int, list[str]]:
+    """Parse `lsof -F pn` output into {pid: [file names]}."""
+    names: dict[int, list[str]] = {}
+    pid = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                pid = None
+            else:
+                names.setdefault(pid, [])
+        elif line.startswith("n") and pid is not None:
+            names[pid].append(line[1:])
+    return names
+
+
+def _proc_cwds(pids: list[int]) -> dict[int, str]:
+    if not pids:
+        return {}
+    if Path("/proc").is_dir():
+        cwds = {}
+        for pid in pids:
+            try:
+                cwds[pid] = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                pass
+        return cwds
+    try:
+        out = subprocess.run(
+            ["lsof", "-n", "-P", "-a", "-d", "cwd", "-p", ",".join(map(str, pids)), "-F", "pn"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout  # exits 1 when any pid is gone; the rest is still printed
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    return {pid: names[0] for pid, names in _parse_lsof_names(out).items() if names}
+
+
+def _proc_open_files(pid: int) -> list[str]:
+    if Path("/proc").is_dir():
+        paths = []
+        try:
+            fds = list(Path(f"/proc/{pid}/fd").iterdir())
+        except OSError:
+            return []
+        for fd in fds:
+            try:
+                paths.append(os.readlink(fd))
+            except OSError:
+                continue
+        return paths
+    try:
+        # -n -P: no DNS or port-name lookups for the process's sockets, which
+        # can outlast the timeout when the network is slow or down
+        out = subprocess.run(["lsof", "-n", "-P", "-p", str(pid), "-F", "pn"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return _parse_lsof_names(out).get(pid, [])
+
+
+def _find_codex_session(pid: int) -> tuple[str, Path] | None:
+    """Find session_id for a running Codex process via its open files."""
+    codex_root = str(CODEX_ROOT)
+    for target in _proc_open_files(pid):
         if target.startswith(codex_root) and target.endswith(".jsonl"):
             p = Path(target)
             # session_id is in the filename: rollout-<timestamp>-<uuid>.jsonl
             return (p.stem, p)
+    return None
+
+
+def _host_terminal(pid: int, procs: dict[int, Proc]) -> str | None:
+    """Walk up the parent chain to the terminal hosting a process."""
+    check = pid
+    for _ in range(12):
+        p = procs.get(check)
+        if not p or p.ppid in (0, check):
+            return None
+        p = procs.get(p.ppid)
+        if not p:
+            return None
+        exe = os.path.basename(p.argv[0]) if p.argv else ""
+        if "Ghostty.app/" in p.cmd or exe == "ghostty":
+            return "ghostty"
+        if "Terminal.app/" in p.cmd:
+            return "terminal"
+        if "iTerm.app/" in p.cmd or "iTerm2" in exe:
+            return "iterm"
+        if exe.startswith("tmux"):
+            return "tmux"
+        if exe == "terminator" or any(os.path.basename(a) == "terminator" for a in p.argv[1:2]):
+            return "terminator"
+        check = p.pid
     return None
 
 
@@ -1127,7 +1625,7 @@ def _get_i3_window_info() -> dict[int, tuple[str, str]]:
         wmout = subprocess.run(
             ["wmctrl", "-lp"], capture_output=True, text=True, timeout=5
         ).stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         return {}
     # wid → workspace name from i3 tree
     wid_to_ws: dict[int, str] = {}
@@ -1154,91 +1652,290 @@ def _get_i3_window_info() -> dict[int, tuple[str, str]]:
     return pid_info
 
 
-def _find_window_for_pid(pid: int, pid_info: dict[int, tuple[str, str]]) -> tuple[str, str]:
+def _find_window_for_pid(pid: int, pid_info: dict[int, tuple[str, str]],
+                         procs: dict[int, Proc]) -> tuple[str, str]:
     """Walk up parent chain to find the terminal window hosting a process."""
     check = pid
     for _ in range(5):
         if check in pid_info:
             return pid_info[check]
-        try:
-            ppid = int(Path(f"/proc/{check}/stat").read_text().split()[3])
-            check = ppid
-        except (OSError, ValueError, IndexError):
+        p = procs.get(check)
+        if not p:
             break
+        check = p.ppid
     return ("?", "?")
 
 
-def snapshot_active() -> list[dict]:
-    """Scan /proc for running claude/codex processes and return their session info."""
+# AppleScript output is split on ASCII unit (31) and record (30) separators,
+# which cannot appear in a path or a terminal title.
+_US, _RS = "\x1f", "\x1e"
+
+
+def _osascript(script: str, *argv: str, timeout: int = 15) -> str | None:
+    sys.stdout.flush()  # keep progress lines ahead of any error below
+    try:
+        r = subprocess.run(["osascript", "-", *argv], input=script,
+                           capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        # usually macOS waiting on the one-time "allow to control" prompt
+        print(f"  [!] osascript: no answer after {timeout}s (is an Automation "
+              f"permission prompt waiting?)", file=sys.stderr)
+        return None
+    if r.returncode != 0:
+        print(f"  [!] osascript: {r.stderr.strip()}", file=sys.stderr)
+        return None
+    return r.stdout.rstrip("\n")
+
+
+def _split_records(out: str | None) -> list[list[str]]:
+    if not out:
+        return []
+    return [rec.split(_US) for rec in out.split(_RS) if rec]
+
+
+_GHOSTTY_LIST = f"""
+set us to character id {ord(_US)}
+set rs to character id {ord(_RS)}
+set out to ""
+tell application "Ghostty"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with x in terminals of t
+        set out to out & (id of w) & us & (index of t) & us & (working directory of x) & us & (name of x) & rs
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out
+"""
+
+_TERMINAL_LIST = f"""
+set us to character id {ord(_US)}
+set rs to character id {ord(_RS)}
+set out to ""
+tell application "Terminal"
+  repeat with w in windows
+    -- some of Terminal's windows have no tabs; skip them
+    try
+      -- Terminal's tabs have no index property, so count them
+      set k to 0
+      repeat with t in tabs of w
+        set k to k + 1
+        set out to out & (id of w) & us & k & us & (tty of t) & us & (name of w) & us & (count of processes of t) & rs
+      end repeat
+    end try
+  end repeat
+end tell
+return out
+"""
+
+
+def _ghostty_terminals() -> list[dict]:
+    """Every Ghostty terminal surface, in window/tab order (Ghostty 1.3+)."""
+    return [
+        {"window_id": r[0], "tab_index": int(r[1]), "cwd": r[2], "title": r[3]}
+        for r in _split_records(_osascript(_GHOSTTY_LIST)) if len(r) == 4 and r[1].isdigit()
+    ]
+
+
+def _terminal_app_tabs() -> list[dict]:
+    """Every Terminal.app tab with its tty, in window/tab order. A tab whose
+    shell has exited ("[Process completed]") still reports its old tty, which
+    macOS may since have given to a new window, so tabs with no processes
+    are left out."""
+    return [
+        {"window_id": r[0], "tab_index": int(r[1]), "tty": r[2], "title": r[3]}
+        for r in _split_records(_osascript(_TERMINAL_LIST))
+        if len(r) == 5 and r[1].isdigit() and r[4] != "0"
+    ]
+
+
+def _session_title(jsonl_path: str | None) -> str | None:
+    """The title the agent shows for a session, as it sets the terminal title:
+    its last custom title (from /rename), else its last AI-generated title."""
+    if not jsonl_path:
+        return None
+    custom = ai = None
+    try:
+        with open(jsonl_path, errors="replace") as f:
+            for line in f:
+                if '"customTitle"' not in line and '"aiTitle"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") == "custom-title" and d.get("customTitle"):
+                    custom = d["customTitle"]
+                elif d.get("type") == "ai-title" and d.get("aiTitle"):
+                    ai = d["aiTitle"]
+    except OSError:
+        return None
+    return custom or ai
+
+
+def _bare_title(title: str) -> str:
+    """A terminal title without the status symbol the agent puts in front (✳, ◐, ⠂ ...)."""
+    i = 0
+    while i < len(title) and (ord(title[i]) > 127 or title[i].isspace()):
+        i += 1
+    return title[i:].strip()
+
+
+def _agent_title(title: str) -> bool:
+    """Agent sessions title their terminal with a status symbol first; a plain shell does not."""
+    return bool(title) and ord(title[0]) > 127
+
+
+def _same_dir(a: str | None, b: str | None) -> bool:
+    """Same folder, after symlinks: lsof reports the real path, the shell may report a link."""
+    return bool(a and b) and os.path.realpath(a) == os.path.realpath(b)
+
+
+def _match_macos_windows(results: list[dict], procs: dict[int, Proc],
+                         ghostty: list[dict], terminal: list[dict],
+                         titles: dict[int, str] | None = None) -> None:
+    """Fill window_id/tab_index/window_title on snapshot entries in place.
+
+    Only a process with a controlling tty can be in a terminal window;
+    background sessions have none and are left unplaced. Terminal.app tabs
+    expose their tty, so that match is exact. Ghostty does not, so a session
+    is matched to, in order: the terminal titled with the session's title
+    (titles maps pid to it); a terminal in the session's folder whose title
+    starts with an agent status symbol; any terminal in that folder. Exact
+    title matches are made for every session first, so a fallback never
+    takes a terminal another session's title points at.
+    """
+    def place(entry: dict, hit: dict) -> None:
+        entry["window_id"] = hit["window_id"]
+        entry["tab_index"] = hit["tab_index"]
+        entry["window_title"] = hit["title"]
+
+    by_tty = {t["tty"]: t for t in terminal}
+    titles = titles or {}
+    in_ghostty: list[dict] = []
+    for entry in sorted(results, key=lambda e: e["pid"]):
+        p = procs.get(entry["pid"])
+        if not p or not p.tty:
+            continue
+        if entry.get("terminal") == "terminal":
+            hit = by_tty.get(f"/dev/{p.tty}")
+            if hit:
+                place(entry, hit)
+        elif entry.get("terminal") == "ghostty":
+            in_ghostty.append(entry)
+
+    unclaimed = list(ghostty)
+    rest = []
+    for entry in in_ghostty:
+        title = titles.get(entry["pid"])
+        hit = next((c for c in unclaimed if title and _bare_title(c["title"]) == title), None)
+        if hit:
+            unclaimed.remove(hit)
+            place(entry, hit)
+        else:
+            rest.append(entry)
+    for entry in rest:
+        here = [c for c in unclaimed if _same_dir(c["cwd"], entry["cwd"])]
+        hit = next((c for c in here if _agent_title(c["title"])), None) or next(iter(here), None)
+        if hit:
+            unclaimed.remove(hit)
+            place(entry, hit)
+
+
+def snapshot_active(with_windows: bool = True) -> list[dict]:
+    """Find running claude/codex processes and return their session info.
+
+    with_windows=False skips the window manager / AppleScript queries; the
+    duplicate check in --load only needs session ids.
+    """
     my_uid = os.getuid()
     results: dict[str, dict] = {}  # keyed by session_id to dedupe
-    pid_info = _get_i3_window_info()
+    procs = _list_procs()
 
-    proc = Path("/proc")
-    for pid_dir in proc.iterdir():
-        if not pid_dir.name.isdigit():
+    candidates: list[tuple[Proc, str]] = []
+    for p in procs.values():
+        if p.uid != my_uid or not p.argv:
             continue
-        pid = int(pid_dir.name)
-        try:
-            if pid_dir.stat().st_uid != my_uid:
-                continue
-        except OSError:
-            continue
-        # read cmdline
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-            argv = [a for a in raw.decode("utf-8", errors="replace").split("\0") if a]
-        except OSError:
-            continue
-        if not argv:
-            continue
-        exe = os.path.basename(argv[0])
+        exe = os.path.basename(p.argv[0])
         # identify tool
-        tool: str | None = None
         if exe == "claude":
             tool = "claude"
         elif exe == "codex":
             tool = "codex"
-        elif exe in ("node", "bash") and any("codex" in a for a in argv[1:3]):
+        elif exe in ("node", "bash") and any("codex" in a for a in p.argv[1:3]):
             tool = "codex"
         else:
             continue
-        # get cwd
-        try:
-            cwd = os.readlink(pid_dir / "cwd")
-        except OSError:
+        candidates.append((p, tool))
+
+    cwds = _proc_cwds([p.pid for p, _ in candidates])
+    for p, tool in sorted(candidates, key=lambda c: c[0].pid):
+        cwd = cwds.get(p.pid)
+        if not cwd:
             continue
         # find session_id
         session_id: str | None = None
         jsonl_path: str | None = None
         if tool == "claude":
-            session_id = _find_claude_session(pid, argv, cwd)
+            rec = _claude_pid_record(p.pid, p.start)
+            session_id = _find_claude_session(p.pid, p.argv, cwd, rec)
             if session_id:
-                encoded = _encode_cwd_to_project(cwd)
-                p = CLAUDE_ROOT / encoded / f"{session_id}.jsonl"
-                if p.exists():
-                    jsonl_path = str(p)
+                found = _claude_jsonl_path(session_id, (rec or {}).get("cwd") or cwd)
+                if found:
+                    jsonl_path = str(found)
         elif tool == "codex":
-            found = _find_codex_session(pid)
+            found = _find_codex_session(p.pid)
             if found:
                 session_id, jp = found
                 jsonl_path = str(jp)
         if not session_id:
             continue
-        # workspace + window title from i3
-        ws, win_title = _find_window_for_pid(pid, pid_info)
         # dedupe: keep first seen (lowest PID tends to be the "real" one)
         if session_id not in results:
             results[session_id] = {
                 "tool": tool,
                 "session_id": session_id,
                 "cwd": cwd,
-                "pid": pid,
+                "pid": p.pid,
                 "jsonl_path": jsonl_path,
-                "workspace": ws,
-                "window_title": win_title,
+                "terminal": _host_terminal(p.pid, procs),
+                "workspace": "?",
+                "window_title": "?",
             }
-    return list(results.values())
+
+    entries = list(results.values())
+    if not with_windows or not entries:
+        return entries
+    if Path("/proc").is_dir():
+        # workspace + window title from i3
+        pid_info = _get_i3_window_info()
+        for entry in entries:
+            entry["workspace"], entry["window_title"] = _find_window_for_pid(
+                entry["pid"], pid_info, procs)
+    elif IS_MACOS:
+        hosts = {e["terminal"] for e in entries}
+        titles = {e["pid"]: _session_title(e["jsonl_path"]) for e in entries
+                  if e["terminal"] == "ghostty" and e["tool"] == "claude"}
+        _match_macos_windows(
+            entries, procs,
+            ghostty=_ghostty_terminals() if "ghostty" in hosts else [],
+            terminal=_terminal_app_tabs() if "terminal" in hosts else [],
+            titles={pid: t for pid, t in titles.items() if t},
+        )
+    return entries
+
+
+def _placement_label(entry: dict) -> str:
+    """Where a snapshot entry was running: i3 workspace on Linux, window/tab on macOS."""
+    if entry.get("window_id"):
+        return f"{entry.get('terminal')} {entry['window_id'][-6:]}/tab {entry.get('tab_index')}"
+    ws = entry.get("workspace")
+    if ws and ws != "?":
+        return f"ws={ws!r}"
+    return entry.get("terminal") or "?"
 
 
 def save_snapshot(entries: list[dict]) -> Path:
@@ -1287,6 +1984,9 @@ def snapshot_to_sessions(entries: list[dict]) -> list[Session]:
         if parsed:
             parsed.workspace = rec.get("workspace")
             parsed.window_title = rec.get("window_title")
+            parsed.terminal = rec.get("terminal")
+            parsed.window_id = rec.get("window_id")
+            parsed.tab_index = rec.get("tab_index")
             sessions.append(parsed)
     return sessions
 
@@ -1416,8 +2116,8 @@ def cache_record(s: Session) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _row_text(s: Session, width: int) -> str:
-    tag = "!" if s.interrupted else " "
+def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
+    """One picker row as (text, role) pieces; roles as in termui."""
     age = f"{s.age_days:4.1f}d"
     tool = f"{s.tool:<6}"
     cwd = short_cwd(s.cwd) or "?"
@@ -1428,126 +2128,153 @@ def _row_text(s: Session, width: int) -> str:
         st = (s.pr_state or "")[:1]
         pr_marker = f" #{s.pr_number}{st}"
     label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
-    hits = f" ({len(s.search_matches)} hits)" if s.search_matches else ""
-    branch_part = f"  {branch}{pr_marker}" if branch else pr_marker
-    left = f"{tag} {age} {tool} {cwd}{branch_part}{hits}"
-    remaining = max(10, width - len(left) - 7)
-    return f"{left}  {_truncate(label, remaining)}"
+    n_hits = len(s.search_matches)
+    hits = f" ({n_hits} hit{'' if n_hits == 1 else 's'})" if n_hits else ""
+    segs = [
+        ("!" if s.interrupted else " ", "warn"),
+        (f" {age} ", ""),
+        (tool, "accent"),
+        (f" {cwd}", ""),
+    ]
+    if branch:
+        segs.append((f"  {branch}", "ok"))
+    if pr_marker:
+        segs.append((pr_marker, "ok" if s.pr_state == "open" else ""))
+    if hits:
+        segs.append((hits, "warn"))
+    used = sum(len(t) for t, _ in segs)
+    remaining = max(10, width - used - 7)
+    segs.append((f"  {_truncate(label, remaining)}", ""))
+    return segs
+
+
+def _row_text(s: Session, width: int) -> str:
+    return "".join(t for t, _ in _row_segments(s, width))
+
+
+# Codex names its turns after event types; show them like the others
+_ROLE_NAMES = {"user_message": "user", "agent_message": "agent"}
+
+
+def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
+    """Every line of the details page, as (text, role) pieces like _row_segments."""
+    label_w = 13
+    # 3 spaces of indent, the label column, then one space before the value
+    text_w = max(20, width - label_w - 5)
+    out: list[list[tuple[str, str]]] = []
+
+    def heading(title: str) -> None:
+        out.append([])
+        out.append([(f" {title}", "bold")])
+
+    def field(label: str, value, role: str = "", max_lines: int = 0,
+              label_role: str = "accent") -> None:
+        if value in (None, ""):
+            return
+        for n, line in enumerate(wrap(str(value), text_w, max_lines)):
+            text = (label if n == 0 else "")[:label_w]
+            out.append([(f"   {text:<{label_w}} ", label_role), (line, role)])
+
+    def para(text: str | None, role: str = "", max_lines: int = 0) -> None:
+        for line in wrap(text, width - 4, max_lines):
+            out.append([("   " + line, role)])
+
+    for line in wrap(s.topic or s.first_user_prompt or "(no prompt)", width - 2, 2):
+        out.append([(f" {line}", "bold")])
+
+    heading("Session")
+    field("tool", s.tool)
+    field("id", s.session_id)
+    if s.interrupted:
+        field("status", "interrupted: the agent had the last turn", "warn")
+    elif s.closed_with_clear:
+        field("status", "closed with /clear")
+    else:
+        field("status", "you had the last turn")
+    field("started", fmt_dt(s.first_ts))
+    field("last active", f"{fmt_dt(s.last_ts)}  ({s.age_days:.1f}d ago)")
+    field("span", f"{s.span_minutes:.0f} min")
+    field("messages", f"{s.message_count} total · {s.user_message_count} yours")
+
+    heading("Where")
+    field("folder", short_cwd(s.cwd))
+    field("git remote", s.git_remote)
+    field("branch", s.git_branch, "ok")
+    if s.pr_number:
+        field("PR", f"#{s.pr_number} ({s.pr_state or '?'})  {s.pr_title or ''}",
+              "ok" if s.pr_state == "open" else "")
+        field("", s.pr_url)
+    if s.window_id:
+        field("saved in", f"{s.terminal} window {s.window_id}, tab {s.tab_index}")
+    elif s.workspace and s.workspace != "?":
+        field("saved in", f"i3 workspace {s.workspace!r}")
+    if s.window_title and s.window_title != "?":
+        field("window", s.window_title)
+
+    if s.abstract or s.summary_error:
+        heading("Summary")
+        para(s.abstract)
+        if s.summary_error:
+            para(f"summary unavailable: {s.summary_error}", "warn")
+
+    heading("Prompts")
+    field("first", s.first_user_prompt, max_lines=6)
+    if s.last_user_prompt != s.first_user_prompt:
+        field("last", s.last_user_prompt, max_lines=6)
+
+    if s.search_matches:
+        heading(f"Search hits ({len(s.search_matches)})")
+        for n, m in enumerate(s.search_matches, 1):
+            ts = (m.get("timestamp") or "")[:16]
+            role = _ROLE_NAMES.get(m.get("role", ""), m.get("role", ""))
+            field(f"[{n}] {role}", f"{ts}  {m.get('snippet', '')}", max_lines=4)
+
+    turns = [t for t in (s.last_hour_transcript or "").split("\n\n") if t.strip()]
+    if turns:
+        heading(f"Last hour of conversation (last {min(len(turns), 12)} of {len(turns)} turns)")
+        for turn in turns[-12:]:
+            m = re.match(r"\[(\w+)\] (.*)", turn, re.S)
+            role, text = (m.group(1), m.group(2)) if m else ("", turn)
+            # your turns in green, the agent's in the accent colour
+            field(role, text, max_lines=4, label_role="ok" if role == "user" else "accent")
+
+    heading("Resume")
+    field("command", resume_cmd(s))
+    field("transcript", short_cwd(str(s.path)))
+    return out
+
+
+def _picker_footer(cur: Session) -> tuple[list[tuple[str, str]], str]:
+    """Footer for the highlighted session: location pieces, then the abstract."""
+    loc: list[tuple[str, str]] = []
+    if cur.cwd:
+        loc.append((short_cwd(cur.cwd), "bold"))
+    if cur.git_branch:
+        loc.append((f"branch: {cur.git_branch}", "ok"))
+    if cur.pr_number:
+        pr_str = f"PR #{cur.pr_number}"
+        if cur.pr_state:
+            pr_str += f" ({cur.pr_state})"
+        if cur.pr_title:
+            pr_str += f" — {_truncate(cur.pr_title, 60)}"
+        loc.append((pr_str, "ok" if cur.pr_state == "open" else "bold"))
+    loc_segs: list[tuple[str, str]] = []
+    for n, part in enumerate(loc):
+        if n:
+            loc_segs.append(("  ·  ", ""))
+        loc_segs.append(part)
+    if cur.search_matches:
+        desc_line = cur.search_matches[0]["snippet"]
+    else:
+        desc_line = (cur.abstract or _truncate(cur.last_user_prompt, 200)
+                     or "(no preview)")
+    return loc_segs, desc_line
 
 
 def tui_pick(sessions: list[Session]) -> list[Session] | None:
     """Return user-selected subset, or None if user quit. Requires a real TTY."""
-    if not sessions:
-        return []
-    try:
-        import curses
-    except ImportError:
-        print("curses not available — skipping TUI, returning all sessions.",
-              file=sys.stderr)
-        return list(sessions)
-
-    selected = [False] * len(sessions)
-
-    def run(stdscr):
-        curses.curs_set(0)
-        stdscr.keypad(True)
-        idx = 0
-        top = 0
-        while True:
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            # header (1) + 2-line footer (2) + 1 buffer = 4 lines reserved
-            body_h = max(1, h - 4)
-            # scroll
-            if idx < top:
-                top = idx
-            elif idx >= top + body_h:
-                top = idx - body_h + 1
-            # header
-            count_sel = sum(selected)
-            header = (f" restore-terminals — {count_sel}/{len(sessions)} selected   "
-                      f"[space] toggle   [a] all   [n] none   [i] invert   "
-                      f"[enter] confirm   [q] quit ")
-            try:
-                stdscr.addnstr(0, 0, header.ljust(w)[:w], w, curses.A_REVERSE)
-            except curses.error:
-                pass
-            # rows
-            for i in range(top, min(len(sessions), top + body_h)):
-                s = sessions[i]
-                mark = "[x]" if selected[i] else "[ ]"
-                text = f"{mark} {_row_text(s, w - 5)}"
-                attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-                try:
-                    stdscr.addnstr(1 + (i - top), 0, text[:w], w, attr)
-                except curses.error:
-                    pass
-            # footer: line 1 = location (cwd + branch + PR), line 2 = abstract
-            cur = sessions[idx]
-            loc_parts: list[str] = []
-            if cur.cwd:
-                loc_parts.append(short_cwd(cur.cwd))
-            if cur.git_branch:
-                loc_parts.append(f"branch: {cur.git_branch}")
-            if cur.pr_number:
-                pr_str = f"PR #{cur.pr_number}"
-                if cur.pr_state:
-                    pr_str += f" ({cur.pr_state})"
-                if cur.pr_title:
-                    pr_str += f" — {_truncate(cur.pr_title, 60)}"
-                loc_parts.append(pr_str)
-            loc_line = "  ·  ".join(loc_parts)
-            if cur.search_matches:
-                desc_line = cur.search_matches[0]["snippet"]
-            else:
-                desc_line = (cur.abstract or _truncate(cur.last_user_prompt, 200)
-                             or "(no preview)")
-            try:
-                stdscr.addnstr(h - 2, 0, _truncate(loc_line, w - 1)[:w], w,
-                               curses.A_DIM | curses.A_BOLD)
-                stdscr.addnstr(h - 1, 0, _truncate(desc_line, w - 1)[:w], w,
-                               curses.A_DIM)
-            except curses.error:
-                pass
-            stdscr.refresh()
-            c = stdscr.getch()
-            if c in (ord("q"), 27):  # q or ESC
-                return None
-            if c in (curses.KEY_DOWN, ord("j")):
-                idx = min(len(sessions) - 1, idx + 1)
-            elif c in (curses.KEY_UP, ord("k")):
-                idx = max(0, idx - 1)
-            elif c == curses.KEY_NPAGE:
-                idx = min(len(sessions) - 1, idx + body_h)
-            elif c == curses.KEY_PPAGE:
-                idx = max(0, idx - body_h)
-            elif c in (curses.KEY_HOME, ord("g")):
-                idx = 0
-            elif c in (curses.KEY_END, ord("G")):
-                idx = len(sessions) - 1
-            elif c == ord(" "):
-                selected[idx] = not selected[idx]
-            elif c == ord("a"):
-                for i in range(len(selected)):
-                    selected[i] = True
-            elif c == ord("n"):
-                for i in range(len(selected)):
-                    selected[i] = False
-            elif c == ord("i"):
-                for i in range(len(selected)):
-                    selected[i] = not selected[i]
-            elif c in (10, 13, curses.KEY_ENTER):
-                picked = [s for s, keep in zip(sessions, selected) if keep]
-                if not picked:
-                    picked = [sessions[idx]]
-                return picked
-
-    try:
-        import curses
-        return curses.wrapper(run)
-    except Exception as e:
-        print(f"TUI error: {e}", file=sys.stderr)
-        return list(sessions)
+    return pick(sessions, title="restore-terminals", noun="session", row=_row_segments,
+                footer=_picker_footer, details=_detail_lines, tagline=TAGLINE)
 
 
 # ---------------------------------------------------------------------------
@@ -1580,32 +2307,33 @@ def enrich_sessions(
         summary_targets = [s for s in sessions if needs_summary(s, cache, refresh)]
         skipped = len(sessions) - len(summary_targets)
         if skipped:
-            print(f"\n  cache hit: {skipped} session(s) reused from "
-                  f"{cache_path} (use --refresh to regenerate)")
+            print(f"\n  {paint('cache hit:', 'ok')} {paint(skipped, 'bold')} session(s) reused from "
+                  f"{short_cwd(str(cache_path))} (use --refresh to regenerate)")
         if summary_targets:
-            print(f"  summarizing {len(summary_targets)} session(s) via `claude -p` "
-                  f"({summary_workers} in parallel)...")
+            print(f"  {paint('summarizing', 'accent')} {paint(len(summary_targets), 'bold')} "
+                  f"session(s) via `claude -p` ({summary_workers} in parallel)...")
             with ThreadPoolExecutor(max_workers=summary_workers) as ex:
                 futs = {ex.submit(summarize, s): s for s in summary_targets}
                 done = 0
                 for fut in as_completed(futs):
                     s = futs[fut]
                     done += 1
-                    marker = "✓" if s.topic else "·"
+                    marker = paint("✓", "ok") if s.topic else paint("·", "warn")
                     label = s.topic or s.summary_error or "(no topic)"
-                    print(f"    [{done}/{len(summary_targets)}] {marker} "
+                    print(f"    {paint(f'[{done}/{len(summary_targets)}]', 'accent')} {marker} "
                           f"{short_cwd(s.cwd)}  ({s.tool}) — "
-                          f"{_truncate(label, 70)}")
+                          f"{paint(_truncate(label, 70), '' if s.topic else 'warn')}")
 
     pr_targets: list[Session] = []
     if fetch_pr_enabled:
         pr_targets = [s for s in sessions if needs_pr_fetch(s, refresh, pr_ttl_hours)]
         if pr_targets:
-            print(f"  fetching PR info for {len(pr_targets)} session(s) via `gh`...")
+            print(f"  {paint('fetching PR info', 'accent')} for {paint(len(pr_targets), 'bold')} "
+                  f"session(s) via `gh`...")
             with ThreadPoolExecutor(max_workers=6) as ex:
                 list(ex.map(fetch_pr_info, pr_targets))
             n_with_pr = sum(1 for s in pr_targets if s.pr_number)
-            print(f"    found {n_with_pr} PR(s)")
+            print(f"    found {paint(n_with_pr, 'ok' if n_with_pr else 'bold')} PR(s)")
 
     touched_ids = {id(s) for s in summary_targets} | {id(s) for s in pr_targets}
     if touched_ids:
@@ -1613,33 +2341,92 @@ def enrich_sessions(
             if id(s) in touched_ids:
                 cache[(s.tool, s.session_id)] = cache_record(s)
         save_cache(cache_path, cache)
-        print(f"  cache updated: {cache_path}")
+        print(f"  {paint('cache updated:', 'ok')} {short_cwd(str(cache_path))}")
 
 
-def _launch_dispatch(args, sessions: list[Session]) -> int:
-    if args.target == "byobu":
+def _launch_dispatch(args, sessions: list[Session], target: str, layout: str) -> int:
+    if target == "byobu":
         return launch_byobu(
             sessions,
-            layout=args.layout,
+            layout=layout,
             max_splits=args.max_splits,
             split_direction=args.split_direction,
             session_name=args.byobu_session,
         )
+    if target == "ghostty":
+        return launch_ghostty(sessions, layout=layout, max_splits=args.max_splits)
+    if target == "terminal":
+        return launch_terminal_app(sessions)
     return launch(sessions)
 
 
+def _target_groups(target: str, sessions: list[Session]) -> list[tuple[str, list[Session]]]:
+    """Split sessions by the backend that opens them, in first-seen order.
+
+    An explicit --target, and auto on Linux, take them all. With auto on
+    macOS, a session from a snapshot goes back to the terminal it was saved
+    from, and the rest go to the terminal restore runs in.
+    """
+    if target != "auto" or not IS_MACOS:
+        return [(_resolve_target(target, sessions), sessions)]
+    groups: dict[str, list[Session]] = {}
+    rest = []
+    for s in sessions:
+        if s.terminal in ("ghostty", "terminal"):
+            groups.setdefault(s.terminal, []).append(s)
+        else:
+            rest.append(s)
+    if rest:
+        groups.setdefault(_resolve_target("auto", rest), []).extend(rest)
+    return list(groups.items())
+
+
+def _layout_for(args, target: str) -> str:
+    """--layout for one backend: tabs and saved only mean something to Ghostty."""
+    if args.layout in ("tabs", "saved") and target != "ghostty":
+        return "hybrid"
+    return args.layout or ("windows" if target == "ghostty" else "hybrid")
+
+
+def _check_layout(ap, args, groups: list[tuple[str, list[Session]]]) -> None:
+    if args.layout in ("tabs", "saved") and all(t != "ghostty" for t, _ in groups):
+        ap.error(f"--layout={args.layout} needs --target=ghostty")
+
+
+def _plan_and_launch(ap, args, sessions: list[Session]) -> None:
+    """Resolve --target and --layout, print the plan, and launch with --execute."""
+    groups = _target_groups(args.target, sessions)
+    _check_layout(ap, args, groups)
+    for target, group in groups:
+        layout = _layout_for(args, target)
+        print_plan(group, use_summary=args.summarize, target=target,
+                   layout=layout, max_splits=args.max_splits)
+        if args.execute and group:
+            print(f"  launching {len(group)} {_backend_label(target)}...")
+            n = _launch_dispatch(args, group, target, layout)
+            print(f"  done — {n}/{len(group)} placed\n")
+        else:
+            print("  (dry-run; nothing was launched — add --execute to launch)\n")
+
+
 def _backend_label(target: str) -> str:
-    return "byobu/tmux pane(s)" if target == "byobu" else "Terminator window(s)"
+    return {
+        "byobu": "byobu/tmux pane(s)",
+        "ghostty": "Ghostty terminal(s)",
+        "terminal": "Terminal.app window(s)",
+    }.get(target, "Terminator window(s)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="restore",
-        description="Show which Claude/Codex sessions to reopen as Terminator windows.",
+        description="Show which Claude/Codex sessions to reopen, and reopen them in "
+                    "Terminator, Ghostty, Terminal.app or tmux.",
         epilog=(
             "Typical flow:\n"
             "  restore              # preview — last 7 days, TUI-pick, cached summaries\n"
-            "  restore --execute    # same, but open each Terminator window\n"
+            "  restore --execute    # same, but open them (Terminator on Linux,\n"
+            "                       #   the terminal you are in on macOS)\n"
             "\n"
             "Save + restore running sessions:\n"
             "  restore --save                 # snapshot all running sessions now\n"
@@ -1654,6 +2441,12 @@ def main() -> int:
             "  restore --target=byobu --layout=splits      # all picked sessions as splits\n"
             "  restore --target=byobu --layout=windows     # one window per session\n"
             "  restore --target=byobu --max-splits=6       # 6 splits per window, then overflow\n"
+            "\n"
+            "macOS:\n"
+            "  restore --target=ghostty --execute          # one Ghostty window per session\n"
+            "  restore --target=ghostty --layout=tabs      # one Ghostty window, a tab per session\n"
+            "  restore --load --layout=saved --execute     # back into the saved windows and tabs\n"
+            "  restore --target=terminal --execute         # one Terminal.app window per session\n"
             "\n"
             "Other:\n"
             "  restore 14           # lookback 14 days\n"
@@ -1671,16 +2464,22 @@ def main() -> int:
                     help="don't launch the TUI picker, print everything")
     ap.add_argument("--execute", action="store_true",
                     help="actually launch (default: dry-run only)")
-    ap.add_argument("--target", choices=["terminator", "byobu"], default="terminator",
-                    help="launch backend: 'terminator' (i3 windows) or 'byobu' "
-                         "(tmux panes/windows in one session). default: terminator")
-    ap.add_argument("--layout", choices=["splits", "windows", "hybrid"], default="hybrid",
-                    help="byobu only: 'splits' = all panes in one window, "
+    ap.add_argument("--target", choices=["auto", "terminator", "byobu", "ghostty", "terminal"],
+                    default="auto",
+                    help="launch backend: 'terminator' (i3 windows), 'byobu' (tmux panes/windows "
+                         "in one session), 'ghostty' (Ghostty 1.3+ windows, splits or tabs, macOS) or "
+                         "'terminal' (Terminal.app windows). default: auto = terminator on Linux; "
+                         "on macOS the terminal a snapshot was saved from, else the one you are in")
+    ap.add_argument("--layout", choices=["splits", "windows", "hybrid", "tabs", "saved"],
+                    default=None,
+                    help="byobu and ghostty: 'splits' = all panes in one window, "
                          "'windows' = one window per session, "
                          "'hybrid' = split up to --max-splits per window, overflow to new windows. "
-                         "default: hybrid")
+                         "ghostty only: 'tabs' = one window, a tab per session; "
+                         "'saved' = snapshot sessions back in their saved window and tab. "
+                         "default: hybrid for byobu, windows for ghostty")
     ap.add_argument("--max-splits", type=int, default=4,
-                    help="byobu hybrid layout: max panes per window before a new window starts (default: 4)")
+                    help="hybrid layout: max panes per window before a new one starts (default: 4)")
     ap.add_argument("--split-direction", choices=["h", "v"], default="h",
                     help="byobu only: 'h' = side-by-side (default, good for wide screens), "
                          "'v' = stacked top/bottom")
@@ -1705,6 +2504,8 @@ def main() -> int:
     ap.add_argument("--summary-workers", type=int, default=3, help=argparse.SUPPRESS)
     ap.add_argument("--cache", default=str(DEFAULT_CACHE), help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.layout in ("tabs", "saved") and args.target not in ("auto", "ghostty"):
+        ap.error(f"--layout={args.layout} needs --target=ghostty")
 
     # Defaults: summarize unless --no-ai; pick via TUI if TTY and not --no-pick.
     args.summarize = not args.no_ai
@@ -1720,13 +2521,12 @@ def main() -> int:
             print("  no running claude/codex sessions found.")
             return 0
         path = save_snapshot(active)
-        print(f"  saved {len(active)} session(s) to {path}")
+        print(f"  saved {len(active)} session(s) to {short_cwd(str(path))}")
         for entry in active:
-            ws = entry.get('workspace', '?')
-            wt = entry.get('window_title', '?')
-            print(f"    ws={ws!r:<6}  {entry['tool']:<6}  "
+            wt = entry.get('window_title') or '?'
+            print(f"    {_placement_label(entry):<22}  {entry['tool']:<6}  "
                   f"{short_cwd(entry['cwd']):<50}  title={wt[:60]}")
-        print(f"  restore with: restore --load")
+        print("  restore with: restore --load")
         return 0
 
     # --load: restore from a saved snapshot
@@ -1735,23 +2535,26 @@ def main() -> int:
                      else Path(args.load).expanduser())
         entries = load_snapshot(snap_path)
         if not entries:
-            print(f"  no snapshot found at {snap_path}")
+            print(f"  no snapshot found at {short_cwd(str(snap_path))}")
             return 1
-        print(f"  loaded {len(entries)} session(s) from {snap_path}")
+        print(f"  {paint('loaded', 'ok')} {paint(len(entries), 'bold')} session(s) "
+              f"from {short_cwd(str(snap_path))}")
         # Skip sessions already running
-        already_running = {r["session_id"] for r in snapshot_active()}
+        already_running = {r["session_id"] for r in snapshot_active(with_windows=False)}
         before = len(entries)
         entries = [e for e in entries if e["session_id"] not in already_running]
         skipped = before - len(entries)
         if skipped:
-            print(f"  skipped {skipped} already-running session(s)")
+            print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
         if not entries:
-            print("  all sessions are already running — nothing to restore.")
+            print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
             return 0
         ranked = snapshot_to_sessions(entries)
         if not ranked:
-            print("  none of the saved sessions could be parsed (files gone?)")
+            print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
+        # fail on a layout no session can use before summaries, PRs and the picker
+        _check_layout(ap, args, _target_groups(args.target, ranked))
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
         cache_path = Path(args.cache).expanduser()
         cache = load_cache(cache_path)
@@ -1773,13 +2576,7 @@ def main() -> int:
                 print("  (cancelled)")
                 return 0
             to_show = picked
-        print_plan(to_show, use_summary=args.summarize, target=args.target)
-        if args.execute and to_show:
-            print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
-            n = _launch_dispatch(args, to_show)
-            print(f"  done — {n}/{len(to_show)} placed\n")
-        else:
-            print("  (dry-run — add --execute to launch)\n")
+        _plan_and_launch(ap, args, to_show)
         return 0
 
     # --find mode: content search, then rank by relevance
@@ -1795,7 +2592,7 @@ def main() -> int:
         # text, not the raw JSON line) for snippets and cwd/branch matches.
         rg_paths = _rg_candidate_paths(args.find, tools)
         if rg_paths is not None:
-            print(f"  rg pre-filter: {len(rg_paths)} candidate file(s)")
+            print(f"  {paint('rg pre-filter:', 'accent')} {paint(len(rg_paths), 'bold')} candidate file(s)")
         # In search mode, relax the activity filters (min msgs=1, min span=0)
         # so we don't miss sessions that briefly touched the topic.
         all_found = discover(tools, only_paths=rg_paths)
@@ -1805,14 +2602,14 @@ def main() -> int:
             project_glob=args.project,
             include_cleared=args.include_cleared,
         )
-        print(f"  searching {len(filtered)} sessions (last {args.days}d) "
+        print(f"  {paint('searching', 'accent')} {paint(len(filtered), 'bold')} sessions (last {args.days}d) "
               f"for /{args.find}/i ...")
         hits = [s for s in filtered if search_session(s, pat)]
         hits.sort(key=search_relevance, reverse=True)
         if not hits:
-            print(f"\n  No sessions match '{args.find}'.\n")
+            print(f"\n  {paint(f'No sessions match {args.find!r}.', 'warn')}\n")
             return 0
-        print(f"  {len(hits)} session(s) match, ranked by relevance\n")
+        print(f"  {paint(len(hits), 'ok')} session(s) match, ranked by relevance\n")
         ranked = hits
     else:
         # Normal mode: activity-based
@@ -1827,6 +2624,8 @@ def main() -> int:
         ranked = rank(filtered)
         print_stats(all_found, filtered, ranked)
 
+    # fail on a layout no session can use before summaries, PRs and the picker
+    _check_layout(ap, args, _target_groups(args.target, ranked))
     cache_path = Path(args.cache).expanduser()
     cache = load_cache(cache_path)
 
@@ -1854,15 +2653,9 @@ def main() -> int:
             print("  (cancelled)")
             return 0
         to_show = picked
-        print(f"\n  selected {len(to_show)}/{len(ranked)} session(s)")
+        print(f"\n  {paint('selected', 'ok')} {paint(f'{len(to_show)}/{len(ranked)}', 'bold')} session(s)")
 
-    print_plan(to_show, use_summary=args.summarize, target=args.target)
-    if args.execute and to_show:
-        print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
-        n = _launch_dispatch(args, to_show)
-        print(f"  done — {n}/{len(to_show)} placed\n")
-    else:
-        print("  (dry-run; nothing was launched — add --execute to launch)\n")
+    _plan_and_launch(ap, args, to_show)
     return 0
 
 

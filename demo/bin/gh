@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Stand-in for `gh pr list --head <branch>` in demo recordings."""
+import json, os, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+branch = args[args.index("--head") + 1] if "--head" in args else ""
+prs = json.loads((Path(os.environ["HOME"]) / ".demo-answers.json").read_text())["prs"]
+time.sleep(0.3)
+pr = prs.get(branch)
+if pr:
+    pr = dict(pr, url=f"https://github.com/acme/{Path.cwd().name}/pull/{pr['number']}")
+print(json.dumps([pr] if pr else []))
