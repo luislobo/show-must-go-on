@@ -281,7 +281,7 @@ The details page shows everything restore knows about the session: its id, statu
 | `space` | Toggle this session's checkbox |
 | `←` / `h` / `q` / `ESC` | Back to the list |
 
-The current row has a `▶` in the gutter and bold text. Colours come from your terminal's own palette, so they follow its light or dark theme: cyan for the tool and the key hints, green for ticked rows, branches and open PRs, and yellow for interrupted sessions (`!`) and search hits. Only the normal ANSI colours are used, never the bright ones, which are hard to read on light backgrounds. The progress lines printed while restore scans, summarizes and searches use the same colours, with the numbers in bold; they stay plain when the output is piped or redirected. Set `NO_COLOR=1` to turn colour off.
+The current row has a `▶` in the gutter and bold text. Colours come from your terminal's own palette, so they follow its light or dark theme: cyan for the tool and the key hints, green for ticked rows, branches and open PRs, and yellow for interrupted sessions (`!`) and search hits. Only the normal ANSI colours are used, never the bright ones, which are hard to read on light backgrounds. The progress lines printed while restore scans, summarizes and searches use the same colours, with the numbers in bold; they stay plain when the output is piped or redirected. `find-session` uses them too, and highlights the search term in yellow inside each snippet. Set `NO_COLOR=1` to turn colour off.
 
 ## How it works
 
@@ -384,7 +384,7 @@ Everything in it is fictional. `demo/make_home.py` builds a home folder with mad
 python3 -m unittest discover tests
 ```
 
-The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping and the tagline. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
+The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping and the tagline. `tests/test_find_session.py` covers `find-session`'s output, in colour and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
 
 ```bash
 docker run --rm -v "$PWD":/repo:ro python:3.10-slim \
