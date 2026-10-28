@@ -831,7 +831,7 @@ def launch(sessions: list[Session]) -> int:
             launched += 1
             print(f"  ✓ spawned pid={p.pid}: {short_cwd(s.cwd)}  —  {title}{ws_label}")
         except FileNotFoundError:
-            print(f"  ✗ terminator not found in PATH — aborting", file=sys.stderr)
+            print("  ✗ terminator not found in PATH — aborting", file=sys.stderr)
             return launched
         except OSError as e:
             print(f"  ✗ failed for {short_cwd(s.cwd)}: {e}", file=sys.stderr)
@@ -2518,7 +2518,7 @@ def main() -> int:
             wt = entry.get('window_title') or '?'
             print(f"    {_placement_label(entry):<22}  {entry['tool']:<6}  "
                   f"{short_cwd(entry['cwd']):<50}  title={wt[:60]}")
-        print(f"  restore with: restore --load")
+        print("  restore with: restore --load")
         return 0
 
     # --load: restore from a saved snapshot
