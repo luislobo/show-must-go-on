@@ -2,6 +2,8 @@
 
 Recover and relaunch your AI coding sessions after a reboot.
 
+![restore in a terminal: scanning and summarising sessions, the session picker, a session's details page, the dry-run plan, and a search](docs/show-must-go-on-demo.gif)
+
 If you run multiple terminals with AI coding agents (Claude Code, Codex) and lose them to a restart, crash, or reboot, this tool scans their session history on disk, figures out what you were working on, and reopens everything: as Terminator windows on the correct i3 workspaces on Linux, or as Ghostty or Terminal.app windows on macOS. For remote or headless work, it can also rebuild the selected sessions as tmux/byobu panes.
 
 ## The problem
@@ -376,7 +378,11 @@ tests/                        # stdlib unittest suites
 
 `demo/render.sh <out-dir>` records a 45-second walkthrough and renders it as an MP4 in GitHub Dark and GitHub Light colours, plus a GIF. It needs `agg` (`brew install agg`) and `ffmpeg`.
 
-Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; and `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast. Re-run it after changing the interface so the video stays current.
+Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; and `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast. Re-run it after changing the interface so the video stays current, and copy the GIF over the one at the top of this README:
+
+```bash
+demo/render.sh demo/out && cp demo/out/show-must-go-on-demo.gif docs/
+```
 
 ## Running the tests
 
