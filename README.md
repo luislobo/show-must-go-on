@@ -26,7 +26,7 @@ restore --execute        # recover from session history on disk
 
 - **Session discovery** — scans `~/.claude/projects/` and `~/.codex/sessions/` for all session history
 - **Live snapshot** (`--save`) — detects running claude/codex sessions (via `/proc` on Linux, `ps` and `lsof` on macOS), captures their session IDs, cwds, **i3 workspace names** or **Ghostty/Terminal.app window and tab**, and **window titles**
-- **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly
+- **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused
 - **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
 - **Smart filtering** — configurable lookback window, minimum activity thresholds, dead-cwd detection
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
@@ -53,7 +53,7 @@ restore --execute        # recover from session history on disk
 - **Claude Code** and/or **Codex** CLI — the tools whose sessions you want to recover
 - **Linux or macOS** — running sessions are found through `/proc` on Linux and `ps`/`lsof` on macOS
 
-`--target` defaults to `auto`: Terminator on Linux; on macOS, the terminal a snapshot was saved from, otherwise the terminal you run `restore` in (Ghostty, else Terminal.app).
+`--target` defaults to `auto`: Terminator on Linux. On macOS, each session from a snapshot goes back to the terminal it was saved from, so a snapshot with both Ghostty and Terminal.app sessions opens in both; anything else opens in the terminal you run `restore` in, found from its parent processes, which also works inside tmux. In a terminal restore cannot drive, such as iTerm, it says so and uses Terminal.app.
 
 For the Linux GUI backend (`--target=terminator`):
 
@@ -327,12 +327,12 @@ With `--target=ghostty`, each session:
 Layouts:
 
 - `--layout=windows` (default): one window per session, no tabs
-- `--layout=splits`: all selected sessions as splits in one window
+- `--layout=splits`: all selected sessions as splits in one window, evened out as they are made
 - `--layout=hybrid`: up to `--max-splits` splits per window, then a new window
 - `--layout=tabs`: one window with a tab per session
 - `--layout=saved`: sessions from a snapshot go back to their saved window and tab, and sessions that shared a tab become splits; any others get a window each
 
-Ghostty does not report which tty a terminal is attached to, so `--save` matches each session to the Ghostty terminal whose working directory is the session's cwd. With several sessions in one folder, `--layout=saved` can put them back in a different order.
+Ghostty does not report which tty a terminal is attached to. Claude Code titles its terminal with the session's title, which the transcript records, so `--save` matches each session to the Ghostty terminal with that title. When there is no title to go on (Codex, or a session without one yet), it falls back to a terminal in the session's folder, preferring one whose title starts with an agent status symbol such as ✳ over a plain shell. Folders are compared after resolving symlinks, and background sessions, which have no terminal, are not placed in a window.
 
 Ghostty windows opened while the screen was locked did not start their shells in testing, so run `--execute` from an unlocked session.
 
@@ -390,6 +390,14 @@ The tests use only the standard library. `tests/test_restore_terminals.py` cover
 docker run --rm -v "$PWD":/repo:ro python:3.10-slim \
   bash -c 'cp -r /repo /tmp/r && cd /tmp/r && python3 -m unittest discover tests'
 ```
+
+`tests/test_live_macos.py` drives the real Terminal.app and Ghostty: it launches sessions and checks that each shell ran in its own folder, that four Ghostty splits share the width evenly, and that `--save` records the window of a session running in each app. It opens and closes windows, so it runs only when asked, and needs an unlocked screen for Ghostty:
+
+```bash
+SMGO_LIVE=1 python3 -m unittest tests.test_live_macos
+```
+
+The live tests close only the windows they opened, and quit Terminal.app again if it was not running before.
 
 ## Reusing the terminal UI
 
