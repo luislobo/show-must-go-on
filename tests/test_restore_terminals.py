@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -514,6 +515,31 @@ class DetailsPage(unittest.TestCase):
         lines, _ = self.details(s)
         roles = {r for line in lines for _, r in line}
         self.assertTrue(roles <= set(termui.ROLE_COLORS) | {"", "bold"}, roles)
+
+
+class TargetGroups(unittest.TestCase):
+    def test_mixed_snapshot_goes_back_to_each_terminal(self):
+        ss = [session("g1", terminal="ghostty"), session("t1", terminal="terminal"),
+              session("g2", terminal="ghostty"), session("h1")]
+        with mock.patch.object(rt, "IS_MACOS", True), \
+             mock.patch.object(rt, "_current_terminal", return_value="terminal"):
+            groups = rt._target_groups("auto", ss)
+        self.assertEqual([(t, [s.session_id for s in g]) for t, g in groups],
+                         [("ghostty", ["g1", "g2"]), ("terminal", ["t1", "h1"])])
+
+    def test_explicit_target_and_linux_take_everything(self):
+        ss = [session("g1", terminal="ghostty"), session("t1", terminal="terminal")]
+        self.assertEqual([t for t, _ in rt._target_groups("byobu", ss)], ["byobu"])
+        with mock.patch.object(rt, "IS_MACOS", False):
+            self.assertEqual([t for t, _ in rt._target_groups("auto", ss)], ["terminator"])
+
+    def test_ghostty_layouts_apply_to_the_ghostty_group_only(self):
+        args = types.SimpleNamespace(layout="saved")
+        self.assertEqual(rt._layout_for(args, "ghostty"), "saved")
+        self.assertEqual(rt._layout_for(args, "terminal"), "hybrid")
+        args.layout = None
+        self.assertEqual(rt._layout_for(args, "ghostty"), "windows")
+        self.assertEqual(rt._layout_for(args, "byobu"), "hybrid")
 
 
 class SnapshotCompat(unittest.TestCase):

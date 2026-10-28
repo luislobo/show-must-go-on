@@ -2263,20 +2263,49 @@ def _launch_dispatch(args, sessions: list[Session], target: str, layout: str) ->
     return launch(sessions)
 
 
+def _target_groups(target: str, sessions: list[Session]) -> list[tuple[str, list[Session]]]:
+    """Split sessions by the backend that opens them, in first-seen order.
+
+    An explicit --target, and auto on Linux, take them all. With auto on
+    macOS, a session from a snapshot goes back to the terminal it was saved
+    from, and the rest go to the terminal restore runs in.
+    """
+    if target != "auto" or not IS_MACOS:
+        return [(_resolve_target(target, sessions), sessions)]
+    groups: dict[str, list[Session]] = {}
+    rest = []
+    for s in sessions:
+        if s.terminal in ("ghostty", "terminal"):
+            groups.setdefault(s.terminal, []).append(s)
+        else:
+            rest.append(s)
+    if rest:
+        groups.setdefault(_resolve_target("auto", rest), []).extend(rest)
+    return list(groups.items())
+
+
+def _layout_for(args, target: str) -> str:
+    """--layout for one backend: tabs and saved only mean something to Ghostty."""
+    if args.layout in ("tabs", "saved") and target != "ghostty":
+        return "hybrid"
+    return args.layout or ("windows" if target == "ghostty" else "hybrid")
+
+
 def _plan_and_launch(ap, args, sessions: list[Session]) -> None:
     """Resolve --target and --layout, print the plan, and launch with --execute."""
-    target = _resolve_target(args.target, sessions)
-    layout = args.layout or ("windows" if target == "ghostty" else "hybrid")
-    if layout in ("tabs", "saved") and target != "ghostty":
-        ap.error(f"--layout={layout} needs --target=ghostty")
-    print_plan(sessions, use_summary=args.summarize, target=target,
-               layout=layout, max_splits=args.max_splits)
-    if args.execute and sessions:
-        print(f"  launching {len(sessions)} {_backend_label(target)}...")
-        n = _launch_dispatch(args, sessions, target, layout)
-        print(f"  done — {n}/{len(sessions)} placed\n")
-    else:
-        print("  (dry-run; nothing was launched — add --execute to launch)\n")
+    groups = _target_groups(args.target, sessions)
+    if args.layout in ("tabs", "saved") and all(t != "ghostty" for t, _ in groups):
+        ap.error(f"--layout={args.layout} needs --target=ghostty")
+    for target, group in groups:
+        layout = _layout_for(args, target)
+        print_plan(group, use_summary=args.summarize, target=target,
+                   layout=layout, max_splits=args.max_splits)
+        if args.execute and group:
+            print(f"  launching {len(group)} {_backend_label(target)}...")
+            n = _launch_dispatch(args, group, target, layout)
+            print(f"  done — {n}/{len(group)} placed\n")
+        else:
+            print("  (dry-run; nothing was launched — add --execute to launch)\n")
 
 
 def _backend_label(target: str) -> str:
