@@ -1,0 +1,8 @@
+#!/bin/bash
+# Stand-in for the codex CLI in the Linux VM test: `codex resume <rollout>`
+# keeps the rollout file open, which is how restore finds a running codex
+# session, and becomes a long-running process named `codex`.
+set -eu
+[ "${1:-}" = resume ] || { echo "usage: codex resume <rollout.jsonl>" >&2; exit 2; }
+exec 3<"$2"
+exec -a codex sleep infinity

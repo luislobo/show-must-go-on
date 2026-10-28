@@ -399,6 +399,13 @@ SMGO_LIVE=1 python3 -m unittest tests.test_live_macos
 
 The live tests close only the windows they opened, and quit Terminal.app again if it was not running before.
 
+`tests/linux-vm/` runs restore end to end on a real Linux desktop stack (Xvfb, i3, Terminator and tmux) in a Lima VM on the Mac: sessions on named workspaces are saved, killed as in a crash, and restored to the same workspaces. See `tests/linux-vm/README.md`:
+
+```bash
+limactl start --name=smgo --param REPO="$PWD" tests/linux-vm/smgo.yaml
+limactl shell --workdir / smgo bash /repo/tests/linux-vm/e2e.sh
+```
+
 ## Reusing the terminal UI
 
 `termui.py` holds the parts of the interface that know nothing about AI sessions: the colour roles and their contrast rules, `NO_COLOR` and terminal detection, `paint()` for coloured progress lines, `wrap()` and `clip()`, the tagline, and `pick()`, the multi-select picker with its details page. It is one file, standard library only, Python 3.9+, so another project can copy it as is.
