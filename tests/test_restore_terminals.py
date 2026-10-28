@@ -375,8 +375,41 @@ class ResolveTarget(unittest.TestCase):
         with mock.patch.object(rt, "IS_MACOS", False):
             self.assertEqual(rt._resolve_target("auto", [session(terminal="ghostty")]), "terminator")
 
+    def test_macos_uses_the_terminal_found_among_the_parents(self):
+        with mock.patch.object(rt, "IS_MACOS", True), \
+             mock.patch.dict(os.environ, {"TERM_PROGRAM": "tmux"}):
+            with mock.patch.object(rt, "_current_terminal", return_value="ghostty"):
+                self.assertEqual(rt._resolve_target("auto", [session()]), "ghostty")
+            with mock.patch.object(rt, "_current_terminal", return_value="terminal"):
+                self.assertEqual(rt._resolve_target("auto", [session()]), "terminal")
+            err = io.StringIO()
+            with mock.patch.object(rt, "_current_terminal", return_value="iterm"), \
+                 mock.patch.object(sys, "stderr", err):
+                self.assertEqual(rt._resolve_target("auto", [session()]), "terminal")
+            self.assertIn("cannot open windows in iterm", err.getvalue())
+
+    def test_current_terminal_looks_past_tmux_to_its_client(self):
+        procs = {
+            1: proc(1, 0, "/sbin/launchd"),
+            50: proc(50, 1, "/Users/l/Applications/Ghostty.app/Contents/MacOS/ghostty"),
+            60: proc(60, 50, "-zsh"),
+            70: proc(70, 60, "tmux attach"),             # the client, inside Ghostty
+            80: proc(80, 1, "tmux new-session -d"),      # the server, a daemon
+            90: proc(90, 80, "-zsh"),
+            os.getpid(): proc(os.getpid(), 90, "python3 restore"),
+        }
+        with mock.patch.object(rt, "_list_procs", return_value=procs), \
+             mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,80,0"}), \
+             mock.patch.object(rt.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "70\n", "")):
+            self.assertEqual(rt._current_terminal(), "ghostty")
+        with mock.patch.object(rt, "_list_procs", return_value=procs), \
+             mock.patch.dict(os.environ, {"TMUX": ""}):
+            self.assertEqual(rt._current_terminal(), "tmux")
+
     def test_macos_prefers_snapshot_terminal_then_current(self):
-        with mock.patch.object(rt, "IS_MACOS", True):
+        with mock.patch.object(rt, "IS_MACOS", True), \
+             mock.patch.object(rt, "_current_terminal", return_value=None):
             with mock.patch.dict(os.environ, {"TERM_PROGRAM": "ghostty"}):
                 self.assertEqual(rt._resolve_target("auto", [session(terminal="terminal")]), "terminal")
                 self.assertEqual(rt._resolve_target("auto", [session()]), "ghostty")

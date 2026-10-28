@@ -980,9 +980,34 @@ def _resolve_target(target: str, sessions: list[Session]) -> str:
     saved = {s.terminal for s in sessions} & {"ghostty", "terminal"}
     if len(saved) == 1:
         return saved.pop()
-    if os.environ.get("TERM_PROGRAM") == "ghostty":
-        return "ghostty"
+    current = _current_terminal()
+    if current in ("ghostty", "terminal"):
+        return current
+    if current is None:
+        # no terminal among the parents (e.g. restore run from a script): trust the environment
+        if os.environ.get("TERM_PROGRAM") == "ghostty":
+            return "ghostty"
+    else:
+        print(f"  restore cannot open windows in {current}; using Terminal.app "
+              f"(choose with --target)", file=sys.stderr)
     return "terminal"
+
+
+def _current_terminal() -> str | None:
+    """The terminal restore runs in, from its parent processes. TERM_PROGRAM
+    is not enough: tmux overwrites it. Inside tmux, the walk starts from the
+    tmux client attached to this session, which runs in the real terminal."""
+    procs = _list_procs()
+    host = _host_terminal(os.getpid(), procs)
+    if host == "tmux" and os.environ.get("TMUX"):
+        try:
+            out = subprocess.run(["tmux", "display-message", "-p", "#{client_pid}"],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            out = ""
+        if out.isdigit():
+            host = _host_terminal(int(out), procs) or host
+    return host
 
 
 def _shell_quote_path(path: str) -> str:
