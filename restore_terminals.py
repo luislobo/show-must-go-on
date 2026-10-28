@@ -1941,10 +1941,15 @@ def _row_text(s: Session, width: int) -> str:
     return "".join(t for t, _ in _row_segments(s, width))
 
 
+# Codex names its turns after event types; show them like the others
+_ROLE_NAMES = {"user_message": "user", "agent_message": "agent"}
+
+
 def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
     """Every line of the details page, as (text, role) pieces like _row_segments."""
     label_w = 13
-    text_w = max(20, width - label_w - 4)
+    # 3 spaces of indent, the label column, then one space before the value
+    text_w = max(20, width - label_w - 5)
     out: list[list[tuple[str, str]]] = []
 
     def heading(title: str) -> None:
@@ -1956,7 +1961,8 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
         if value in (None, ""):
             return
         for n, line in enumerate(wrap(str(value), text_w, max_lines)):
-            out.append([(f"   {label if n == 0 else '':<{label_w}}", label_role), (line, role)])
+            text = (label if n == 0 else "")[:label_w]
+            out.append([(f"   {text:<{label_w}} ", label_role), (line, role)])
 
     def para(text: str | None, role: str = "", max_lines: int = 0) -> None:
         for line in wrap(text, width - 4, max_lines):
@@ -2009,7 +2015,8 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
         heading(f"Search hits ({len(s.search_matches)})")
         for n, m in enumerate(s.search_matches, 1):
             ts = (m.get("timestamp") or "")[:16]
-            field(f"[{n}] {m.get('role', '')}", f"{ts}  {m.get('snippet', '')}", max_lines=4)
+            role = _ROLE_NAMES.get(m.get("role", ""), m.get("role", ""))
+            field(f"[{n}] {role}", f"{ts}  {m.get('snippet', '')}", max_lines=4)
 
     turns = [t for t in (s.last_hour_transcript or "").split("\n\n") if t.strip()]
     if turns:

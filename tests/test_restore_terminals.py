@@ -322,6 +322,21 @@ class DetailsPage(unittest.TestCase):
         self.assertEqual(len(first), 6)  # capped at six lines
         self.assertTrue(first[-1].endswith("…"))
 
+    def test_long_labels_keep_a_gap_and_fit(self):
+        s = session(topic="t")
+        s.search_matches = [
+            {"timestamp": "2026-10-27T10:00", "role": "assistant", "snippet": "hit " * 60},
+            {"timestamp": "2026-10-27T10:01", "role": "agent_message", "snippet": "codex hit " * 30},
+            {"timestamp": "2026-10-27T10:02", "role": "some_very_long_role_name", "snippet": "x"},
+        ]
+        _, text = self.details(s, 100)
+        hits = [t for t in text if t.startswith("   [")]
+        self.assertTrue(any(t.startswith("   [1] assistant 2026") for t in hits), hits)
+        self.assertTrue(any(t.startswith("   [2] agent     2026") for t in hits), hits)
+        self.assertTrue(all(len(t) <= 100 for t in text), max(text, key=len))
+        # column 16 is the gap between the 13-character label and the value
+        self.assertTrue(all(t[16] == " " for t in hits), hits)
+
     def test_empty_fields_are_left_out(self):
         _, text = self.details(session())
         joined = "\n".join(text)
