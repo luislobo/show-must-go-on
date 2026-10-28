@@ -43,7 +43,7 @@ restore --execute        # recover from session history on disk
 - **Ghostty backend** (macOS) — `--target=ghostty` opens one Ghostty window per session through Ghostty's AppleScript support; splits, tabs, or the saved windows and tabs on request
 - **Terminal.app backend** (macOS) — `--target=terminal` opens one Terminal.app window per session
 - **Byobu/tmux backend** — `--target=byobu` rebuilds sessions into panes/windows for SSH or non-GUI machines
-- **Duplicate detection** — `--load` checks running processes for already-running sessions and skips them
+- **Duplicate detection** — sessions that are already running are left out of the picker and the plan in every mode (`--load`, the normal picker, `--find`), so a session is never resumed twice; a second copy would write to the same transcript
 - **Git metadata** — resolves each session's working directory to its git remote and current branch
 - **GitHub PR metadata** — when `gh` is installed and authenticated, shows PR number, state, title, and URL for matching branches
 - **Fast search prefilter** — when `rg` is installed, `--find` narrows candidate JSONL files before Python parsing
@@ -292,7 +292,7 @@ The current row has a `▶` in the gutter and bold text. Colours come from your 
 1. **Scan** — walks `~/.claude/projects/*/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`
 2. **Parse** — extracts timestamps, message counts, user prompts, cwd, and interrupted status from each JSONL file
 3. **Filter** — removes sessions outside the lookback window, below activity thresholds, or with dead cwds
-4. **Rank** — by last activity (normal mode) or by relevance score (search mode)
+4. **Rank** — by last activity (normal mode) or by relevance score (search mode), leaving out sessions that are already running
 5. **Summarize** — feeds project context (README.md, CLAUDE.md, etc.) + last-hour transcript to `claude -p`, caches the result
 6. **Pick** — curses TUI for interactive selection
 7. **Launch** — opens each session with the chosen `--target`:

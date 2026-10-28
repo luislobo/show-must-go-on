@@ -1963,6 +1963,20 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
     return entries
 
 
+def drop_running(sessions: list[Session]) -> list[Session]:
+    """Leave out sessions already open somewhere. Resuming one again starts a
+    second agent writing to the same transcript. A running codex session is
+    known by its rollout file's name, a parsed one by the id inside it, so
+    both are compared."""
+    running = {r["session_id"] for r in snapshot_active(with_windows=False)}
+    kept = [s for s in sessions
+            if s.session_id not in running and s.path.stem not in running]
+    skipped = len(sessions) - len(kept)
+    if skipped:
+        print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
+    return kept
+
+
 def _placement_label(entry: dict) -> str:
     """Where a snapshot entry was running: i3 workspace on Linux, window/tab on macOS."""
     if entry.get("window_id"):
@@ -2574,20 +2588,14 @@ def main() -> int:
             return 1
         print(f"  {paint('loaded', 'ok')} {paint(len(entries), 'bold')} session(s) "
               f"from {short_cwd(str(snap_path))}")
-        # Skip sessions already running
-        already_running = {r["session_id"] for r in snapshot_active(with_windows=False)}
-        before = len(entries)
-        entries = [e for e in entries if e["session_id"] not in already_running]
-        skipped = before - len(entries)
-        if skipped:
-            print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
-        if not entries:
-            print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
-            return 0
         ranked = snapshot_to_sessions(entries)
         if not ranked:
             print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
+        ranked = drop_running(ranked)
+        if not ranked:
+            print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
+            return 0
         # fail on a layout no session can use before summaries, PRs and the picker
         _check_layout(ap, args, _target_groups(args.target, ranked))
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
@@ -2659,6 +2667,7 @@ def main() -> int:
         ranked = rank(filtered)
         print_stats(all_found, filtered, ranked)
 
+    ranked = drop_running(ranked)
     # fail on a layout no session can use before summaries, PRs and the picker
     _check_layout(ap, args, _target_groups(args.target, ranked))
     cache_path = Path(args.cache).expanduser()

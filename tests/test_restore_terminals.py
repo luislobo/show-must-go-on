@@ -710,7 +710,7 @@ class SnapshotCompat(unittest.TestCase):
 
 
 class RunningSessions(unittest.TestCase):
-    """What restore treats as a running session."""
+    """What restore treats as already running, and leaves out of the picker."""
 
     def test_recorded_process_counts_whatever_its_name(self):
         with tempfile.TemporaryDirectory() as d:
@@ -735,6 +735,44 @@ class RunningSessions(unittest.TestCase):
                     mock.patch.object(rt, "_list_procs", return_value=procs), \
                     mock.patch.object(rt, "_proc_cwds", return_value={60: "/w/a"}):
                 self.assertEqual(rt.snapshot_active(with_windows=False), [])
+
+    def test_running_sessions_are_left_out(self):
+        ss = [session("a"), session("b"), session("c")]
+        with mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "b"}]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            kept = rt.drop_running(ss)
+        self.assertEqual([s.session_id for s in kept], ["a", "c"])
+        self.assertIn("1", out.getvalue())
+        self.assertIn("already-running", out.getvalue())
+
+    def test_running_codex_session_is_known_by_its_rollout_file(self):
+        now = datetime.now(timezone.utc)
+        rollout = "rollout-2026-10-28T09-00-00-0199aaaa"
+        s = rt.Session(tool="codex", session_id="0199aaaa", path=Path(f"/c/{rollout}.jsonl"),
+                       cwd="/w/a", first_ts=now, last_ts=now)
+        with mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": rollout}]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(rt.drop_running([s]), [])
+
+    def test_picker_never_sees_a_running_session(self):
+        ss = [session("a"), session("b")]
+        shown = []
+        def pick(items):   # returns None: cancelled, so nothing launches
+            shown.extend(s.session_id for s in items)
+        with mock.patch.object(rt, "discover", return_value=ss), \
+                mock.patch.object(rt, "apply_filters", side_effect=lambda found, **kw: found), \
+                mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "a"}]), \
+                mock.patch.object(rt, "enrich_sessions"), \
+                mock.patch.object(rt, "tui_pick", side_effect=pick), \
+                mock.patch.object(rt, "print_stats"), \
+                tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(sys, "argv", ["restore", "--no-ai", "--no-gh",
+                                                "--cache", f"{d}/cache.json"]), \
+                mock.patch("sys.stdin.isatty", return_value=True), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                mock.patch.object(out, "isatty", return_value=True, create=True):
+            rt.main()
+        self.assertEqual(shown, ["b"])
 
 
 class SnapshotLiveProcess(unittest.TestCase):
