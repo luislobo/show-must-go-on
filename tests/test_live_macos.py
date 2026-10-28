@@ -214,6 +214,16 @@ class GhosttyLive(LiveBase):
         self.assertEqual(sorted(lines or []), sorted(str(d) for d in dirs),
                          "no shell ran: is the screen locked?")
 
+    def test_splits_share_the_width_evenly(self):
+        ss = [session(f"s{i}", self.base) for i in range(4)]
+        cmd = lambda s: f"sleep 1; echo $(tput cols) >> '{self.marker}'"
+        with mock.patch.object(rt, "resume_cmd", cmd):
+            self.launch(lambda: rt.launch_ghostty(ss, layout="splits", max_splits=4))
+        widths = wait_for(lambda: self.marker.exists() and len(self.marker.read_text().split()) >= 4
+                          and [int(w) for w in self.marker.read_text().split()])
+        self.assertTrue(widths, "no shell ran: is the screen locked?")
+        self.assertLessEqual(max(widths) - min(widths), 1, widths)
+
     def test_save_records_the_window(self):
         [d] = self.folders(1)
         with mock.patch.object(rt, "resume_cmd", lambda s: "exec -a claude sleep 60"):

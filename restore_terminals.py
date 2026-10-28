@@ -1088,7 +1088,9 @@ on run argv
         else if mode is "tab" then
           set t to new tab in w with configuration cfg
         else
+          -- a split halves the focused terminal; even them out each time
           split (focused terminal of t) direction right with configuration cfg
+          perform action "equalize_splits" on (focused terminal of t)
         end if
         set n to n + 1
       end repeat
