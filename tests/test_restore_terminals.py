@@ -15,7 +15,7 @@ import tempfile
 import time
 import types
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -540,6 +540,43 @@ class TargetGroups(unittest.TestCase):
         args.layout = None
         self.assertEqual(rt._layout_for(args, "ghostty"), "windows")
         self.assertEqual(rt._layout_for(args, "byobu"), "hybrid")
+
+
+class EarlyLayoutCheck(unittest.TestCase):
+    """A layout no session can use fails before summaries, PR lookups and the picker."""
+
+    def run_main(self, argv, home):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["restore", *argv]), \
+             mock.patch.multiple(rt, CLAUDE_ROOT=home / "projects", CODEX_ROOT=home / "codex",
+                                 SNAPSHOTS_DIR=home / "snapshots", IS_MACOS=False), \
+             mock.patch.object(rt, "enrich_sessions") as enrich, \
+             mock.patch.object(rt, "tui_pick") as picker, \
+             mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()):
+            with self.assertRaises(SystemExit) as stop:
+                rt.main()
+        return stop.exception.code, enrich, picker, err.getvalue()
+
+    def test_history_path_fails_before_enrichment(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(os.path.realpath(d))
+            work = home / "w"
+            work.mkdir()
+            proj = home / "projects" / rt._encode_cwd_to_project(str(work))
+            proj.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            with (proj / "s1.jsonl").open("w") as f:
+                for i in range(12):
+                    ts = (now - timedelta(minutes=60 - i * 5)).isoformat()
+                    role = "user" if i % 2 == 0 else "assistant"
+                    content = f"prompt {i}" if role == "user" else [{"type": "text", "text": "ok"}]
+                    f.write(json.dumps({"type": role, "timestamp": ts, "cwd": str(work),
+                                        "message": {"role": role, "content": content}}) + "\n")
+            code, enrich, picker, err = self.run_main(["--layout=saved", "--no-gh"], home)
+        self.assertEqual(code, 2)
+        self.assertIn("--layout=saved needs --target=ghostty", err)
+        enrich.assert_not_called()
+        picker.assert_not_called()
 
 
 class SnapshotCompat(unittest.TestCase):

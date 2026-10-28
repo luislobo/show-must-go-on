@@ -987,10 +987,14 @@ def _resolve_target(target: str, sessions: list[Session]) -> str:
         # no terminal among the parents (e.g. restore run from a script): trust the environment
         if os.environ.get("TERM_PROGRAM") == "ghostty":
             return "ghostty"
-    else:
+    elif current not in _NOTICES:
+        _NOTICES.add(current)
         print(f"  restore cannot open windows in {current}; using Terminal.app "
               f"(choose with --target)", file=sys.stderr)
     return "terminal"
+
+
+_NOTICES: set[str] = set()   # terminals already reported as unsupported
 
 
 def _current_terminal() -> str | None:
@@ -2291,11 +2295,15 @@ def _layout_for(args, target: str) -> str:
     return args.layout or ("windows" if target == "ghostty" else "hybrid")
 
 
+def _check_layout(ap, args, groups: list[tuple[str, list[Session]]]) -> None:
+    if args.layout in ("tabs", "saved") and all(t != "ghostty" for t, _ in groups):
+        ap.error(f"--layout={args.layout} needs --target=ghostty")
+
+
 def _plan_and_launch(ap, args, sessions: list[Session]) -> None:
     """Resolve --target and --layout, print the plan, and launch with --execute."""
     groups = _target_groups(args.target, sessions)
-    if args.layout in ("tabs", "saved") and all(t != "ghostty" for t, _ in groups):
-        ap.error(f"--layout={args.layout} needs --target=ghostty")
+    _check_layout(ap, args, groups)
     for target, group in groups:
         layout = _layout_for(args, target)
         print_plan(group, use_summary=args.summarize, target=target,
@@ -2452,6 +2460,8 @@ def main() -> int:
         if not ranked:
             print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
+        # fail on a layout no session can use before summaries, PRs and the picker
+        _check_layout(ap, args, _target_groups(args.target, ranked))
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
         cache_path = Path(args.cache).expanduser()
         cache = load_cache(cache_path)
@@ -2521,6 +2531,8 @@ def main() -> int:
         ranked = rank(filtered)
         print_stats(all_found, filtered, ranked)
 
+    # fail on a layout no session can use before summaries, PRs and the picker
+    _check_layout(ap, args, _target_groups(args.target, ranked))
     cache_path = Path(args.cache).expanduser()
     cache = load_cache(cache_path)
 
