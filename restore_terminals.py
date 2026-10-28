@@ -2247,20 +2247,36 @@ def enrich_sessions(
         print(f"  {paint('cache updated:', 'ok')} {short_cwd(str(cache_path))}")
 
 
-def _launch_dispatch(args, sessions: list[Session]) -> int:
-    if args.target == "byobu":
+def _launch_dispatch(args, sessions: list[Session], target: str, layout: str) -> int:
+    if target == "byobu":
         return launch_byobu(
             sessions,
-            layout=args.layout,
+            layout=layout,
             max_splits=args.max_splits,
             split_direction=args.split_direction,
             session_name=args.byobu_session,
         )
-    if args.target == "ghostty":
-        return launch_ghostty(sessions, layout=args.layout, max_splits=args.max_splits)
-    if args.target == "terminal":
+    if target == "ghostty":
+        return launch_ghostty(sessions, layout=layout, max_splits=args.max_splits)
+    if target == "terminal":
         return launch_terminal_app(sessions)
     return launch(sessions)
+
+
+def _plan_and_launch(ap, args, sessions: list[Session]) -> None:
+    """Resolve --target and --layout, print the plan, and launch with --execute."""
+    target = _resolve_target(args.target, sessions)
+    layout = args.layout or ("windows" if target == "ghostty" else "hybrid")
+    if layout in ("tabs", "saved") and target != "ghostty":
+        ap.error(f"--layout={layout} needs --target=ghostty")
+    print_plan(sessions, use_summary=args.summarize, target=target,
+               layout=layout, max_splits=args.max_splits)
+    if args.execute and sessions:
+        print(f"  launching {len(sessions)} {_backend_label(target)}...")
+        n = _launch_dispatch(args, sessions, target, layout)
+        print(f"  done — {n}/{len(sessions)} placed\n")
+    else:
+        print("  (dry-run; nothing was launched — add --execute to launch)\n")
 
 
 def _backend_label(target: str) -> str:
@@ -2428,18 +2444,7 @@ def main() -> int:
                 print("  (cancelled)")
                 return 0
             to_show = picked
-        args.target = _resolve_target(args.target, to_show)
-        args.layout = args.layout or ("windows" if args.target == "ghostty" else "hybrid")
-        if args.layout in ("tabs", "saved") and args.target != "ghostty":
-            ap.error(f"--layout={args.layout} needs --target=ghostty")
-        print_plan(to_show, use_summary=args.summarize, target=args.target,
-                   layout=args.layout, max_splits=args.max_splits)
-        if args.execute and to_show:
-            print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
-            n = _launch_dispatch(args, to_show)
-            print(f"  done — {n}/{len(to_show)} placed\n")
-        else:
-            print("  (dry-run — add --execute to launch)\n")
+        _plan_and_launch(ap, args, to_show)
         return 0
 
     # --find mode: content search, then rank by relevance
@@ -2516,18 +2521,7 @@ def main() -> int:
         to_show = picked
         print(f"\n  {paint('selected', 'ok')} {paint(f'{len(to_show)}/{len(ranked)}', 'bold')} session(s)")
 
-    args.target = _resolve_target(args.target, to_show)
-    args.layout = args.layout or ("windows" if args.target == "ghostty" else "hybrid")
-    if args.layout in ("tabs", "saved") and args.target != "ghostty":
-        ap.error(f"--layout={args.layout} needs --target=ghostty")
-    print_plan(to_show, use_summary=args.summarize, target=args.target,
-               layout=args.layout, max_splits=args.max_splits)
-    if args.execute and to_show:
-        print(f"  launching {len(to_show)} {_backend_label(args.target)}...")
-        n = _launch_dispatch(args, to_show)
-        print(f"  done — {n}/{len(to_show)} placed\n")
-    else:
-        print("  (dry-run; nothing was launched — add --execute to launch)\n")
+    _plan_and_launch(ap, args, to_show)
     return 0
 
 
