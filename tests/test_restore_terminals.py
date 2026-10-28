@@ -251,6 +251,15 @@ class MacWindowMatching(unittest.TestCase):
         self.assertIsNone(rt._session_title(None))
         self.assertIsNone(rt._session_title("/nonexistent.jsonl"))
 
+    def test_terminal_tabs_whose_shell_exited_are_left_out(self):
+        us, rs = rt._US, rt._RS
+        out = (f"736{us}1{us}/dev/ttys014{us}old{us}0{rs}"
+               f"770{us}1{us}/dev/ttys014{us}new{us}2{rs}"
+               f"770{us}2{us}/dev/ttys015{us}other{us}1{rs}")
+        with mock.patch.object(rt, "_osascript", return_value=out):
+            tabs = rt._terminal_app_tabs()
+        self.assertEqual([(t["window_id"], t["tab_index"]) for t in tabs], [("770", 1), ("770", 2)])
+
     def test_records_split_on_separators(self):
         out = f"a{rt._US}1{rt._US}/p q{rt._US}title{rt._RS}b{rt._US}2{rt._US}{rt._US}t2{rt._RS}"
         self.assertEqual(rt._split_records(out), [["a", "1", "/p q", "title"], ["b", "2", "", "t2"]])

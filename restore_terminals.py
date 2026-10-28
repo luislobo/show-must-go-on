@@ -1665,9 +1665,15 @@ set rs to character id {ord(_RS)}
 set out to ""
 tell application "Terminal"
   repeat with w in windows
-    repeat with t in tabs of w
-      set out to out & (id of w) & us & (index of t) & us & (tty of t) & us & (name of w) & rs
-    end repeat
+    -- some of Terminal's windows have no tabs; skip them
+    try
+      -- Terminal's tabs have no index property, so count them
+      set k to 0
+      repeat with t in tabs of w
+        set k to k + 1
+        set out to out & (id of w) & us & k & us & (tty of t) & us & (name of w) & us & (count of processes of t) & rs
+      end repeat
+    end try
   end repeat
 end tell
 return out
@@ -1683,10 +1689,14 @@ def _ghostty_terminals() -> list[dict]:
 
 
 def _terminal_app_tabs() -> list[dict]:
-    """Every Terminal.app tab with its tty, in window/tab order."""
+    """Every Terminal.app tab with its tty, in window/tab order. A tab whose
+    shell has exited ("[Process completed]") still reports its old tty, which
+    macOS may since have given to a new window, so tabs with no processes
+    are left out."""
     return [
         {"window_id": r[0], "tab_index": int(r[1]), "tty": r[2], "title": r[3]}
-        for r in _split_records(_osascript(_TERMINAL_LIST)) if len(r) == 4 and r[1].isdigit()
+        for r in _split_records(_osascript(_TERMINAL_LIST))
+        if len(r) == 5 and r[1].isdigit() and r[4] != "0"
     ]
 
 
