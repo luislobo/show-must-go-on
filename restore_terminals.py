@@ -1047,22 +1047,26 @@ on run argv
     set w to missing value
     set t to missing value
     set n to 0
-    repeat with i from 1 to (count of argv) by 3
-      set mode to item i of argv
-      set cfg to new surface configuration
-      set initial working directory of cfg to item (i + 1) of argv
-      set initial input of cfg to (item (i + 2) of argv) & linefeed
-      if mode is "window" or w is missing value then
-        set w to new window with configuration cfg
-        set t to selected tab of w
-      else if mode is "tab" then
-        set t to new tab in w with configuration cfg
-      else
-        split (focused terminal of t) direction right with configuration cfg
-      end if
-      set n to n + 1
-    end repeat
-    return n
+    try
+      repeat with i from 1 to (count of argv) by 3
+        set mode to item i of argv
+        set cfg to new surface configuration
+        set initial working directory of cfg to item (i + 1) of argv
+        set initial input of cfg to (item (i + 2) of argv) & linefeed
+        if mode is "window" or w is missing value then
+          set w to new window with configuration cfg
+          set t to selected tab of w
+        else if mode is "tab" then
+          set t to new tab in w with configuration cfg
+        else
+          split (focused terminal of t) direction right with configuration cfg
+        end if
+        set n to n + 1
+      end repeat
+    on error errMsg
+      return (n as text) & "|" & errMsg
+    end try
+    return n as text
   end tell
 end run
 """
@@ -1072,61 +1076,81 @@ on run argv
   set wasRunning to application "Terminal" is running
   tell application "Terminal"
     set n to 0
-    repeat with i from 1 to (count of argv) by 2
-      if n is 0 and not wasRunning then
-        -- a cold start opens a default window; use it instead of leaving it empty
-        delay 1
-        if (count of windows) > 0 then
-          set t to do script (item i of argv) in window 1
+    try
+      repeat with i from 1 to (count of argv) by 2
+        if n is 0 and not wasRunning then
+          -- a cold start opens a default window; use it instead of leaving it empty
+          delay 1
+          if (count of windows) > 0 then
+            set t to do script (item i of argv) in window 1
+          else
+            set t to do script (item i of argv)
+          end if
         else
           set t to do script (item i of argv)
         end if
-      else
-        set t to do script (item i of argv)
-      end if
-      set custom title of t to item (i + 1) of argv
-      set n to n + 1
-    end repeat
+        set custom title of t to item (i + 1) of argv
+        set n to n + 1
+      end repeat
+    on error errMsg
+      activate
+      return (n as text) & "|" & errMsg
+    end try
     activate
-    return n
+    return n as text
   end tell
 end run
 """
 
 
-def _osascript_count(script: str, argv: list[str]) -> int:
+def _osascript_progress(script: str, argv: list[str]) -> tuple[int, str | None]:
+    """Run a launch script. It returns how many items it opened, plus "|" and
+    the error when one stopped it part-way."""
     out = _osascript(script, *argv, timeout=60)
+    if out is None:
+        return 0, "osascript failed"
+    count, _, err = out.partition("|")
     try:
-        return int(out or 0)
+        return int(count or 0), err or None
     except ValueError:
-        return 0
+        return 0, out
+
+
+def _report_launch(app: str, lines: list[str], opened: int, err: str | None, hint: str) -> None:
+    """One line per session, after the fact: ✓ for what opened, ✗ for the rest."""
+    for i, line in enumerate(lines):
+        print(f"  {'✓' if i < opened else '✗'} {line}")
+    if opened < len(lines):
+        why = f": {err}" if err else ""
+        print(f"  ✗ {app} opened {opened}/{len(lines)}{why}. {hint}", file=sys.stderr)
 
 
 def launch_ghostty(sessions: list[Session], *, layout: str, max_splits: int) -> int:
     """Open the sessions in Ghostty windows, tabs and splits. Needs Ghostty 1.3+."""
     argv: list[str] = []
+    lines: list[str] = []
     for s, mode in ghostty_placements(sessions, layout, max_splits):
         argv += [mode, s.cwd or str(HOME), _shell_line(s)]
-        print(f"  ✓ {mode:<6} {short_cwd(s.cwd)}  —  {_pane_title(s)}")
-    n = _osascript_count(_GHOSTTY_LAUNCH, argv)
-    if n < len(sessions):
-        print(f"  ✗ Ghostty opened {n}/{len(sessions)}. It needs Ghostty 1.3+ "
-              f"and Automation permission for this terminal "
-              f"(System Settings → Privacy & Security → Automation).", file=sys.stderr)
+        lines.append(f"{mode:<6} {short_cwd(s.cwd)}  —  {_pane_title(s)}")
+    n, err = _osascript_progress(_GHOSTTY_LAUNCH, argv)
+    _report_launch("Ghostty", lines, n, err,
+                   "It needs Ghostty 1.3+ and Automation permission for this terminal "
+                   "(System Settings → Privacy & Security → Automation).")
     return n
 
 
 def launch_terminal_app(sessions: list[Session]) -> int:
     """Open one Terminal.app window per session."""
     argv: list[str] = []
+    lines: list[str] = []
     for s in sessions:
         title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
         argv += [_shell_line(s), title]
-        print(f"  ✓ window {short_cwd(s.cwd)}  —  {title}")
-    n = _osascript_count(_TERMINAL_LAUNCH, argv)
-    if n < len(sessions):
-        print(f"  ✗ Terminal opened {n}/{len(sessions)}. Check Automation permission "
-              f"(System Settings → Privacy & Security → Automation).", file=sys.stderr)
+        lines.append(f"window {short_cwd(s.cwd)}  —  {title}")
+    n, err = _osascript_progress(_TERMINAL_LAUNCH, argv)
+    _report_launch("Terminal", lines, n, err,
+                   "Check Automation permission "
+                   "(System Settings → Privacy & Security → Automation).")
     return n
 
 

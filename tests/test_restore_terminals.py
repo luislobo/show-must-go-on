@@ -5,8 +5,10 @@ Stdlib only. Run from the repo root:  python3 -m unittest discover tests
 """
 
 import importlib.util
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -300,6 +302,69 @@ class ShellLine(unittest.TestCase):
                 out = subprocess.run([shell, "-c", f"cd -- {line} && pwd"], capture_output=True,
                                      text=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin"})
                 self.assertEqual(out.stdout.strip(), str(home / "My Projects"), shell)
+
+
+class MacLaunchers(unittest.TestCase):
+    """What the Ghostty and Terminal.app launchers send, and how they report."""
+
+    def sessions(self):
+        return [session(sid="a", cwd=str(Path.home() / "Dev/a"), topic="Task A"),
+                session(sid="b", cwd="/opt/b c", topic="Task B")]
+
+    def run_launcher(self, launch, reply):
+        sent = {}
+
+        def fake(script, *argv, timeout=15):
+            sent["script"], sent["argv"] = script, list(argv)
+            return reply
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(rt, "_osascript", side_effect=fake), \
+             mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            n = launch(self.sessions())
+        return n, sent, out.getvalue(), err.getvalue()
+
+    def test_terminal_app_arguments(self):
+        n, sent, out, err = self.run_launcher(rt.launch_terminal_app, "2")
+        self.assertEqual(n, 2)
+        self.assertIs(sent["script"], rt._TERMINAL_LAUNCH)
+        self.assertEqual(sent["argv"], ["cd -- ~/Dev/a && claude --resume a", "Task A",
+                                        "cd -- '/opt/b c' && claude --resume b", "Task B"])
+        self.assertEqual(out.count("✓"), 2)
+        self.assertEqual(err, "")
+
+    def test_ghostty_arguments(self):
+        launch = lambda ss: rt.launch_ghostty(ss, layout="tabs", max_splits=4)
+        n, sent, out, _ = self.run_launcher(launch, "2")
+        self.assertIs(sent["script"], rt._GHOSTTY_LAUNCH)
+        self.assertEqual(sent["argv"], [
+            "window", str(Path.home() / "Dev/a"), "cd -- ~/Dev/a && claude --resume a",
+            "tab", "/opt/b c", "cd -- '/opt/b c' && claude --resume b"])
+        self.assertEqual(n, 2)
+
+    def test_failure_part_way_is_reported_per_session(self):
+        n, _, out, err = self.run_launcher(rt.launch_terminal_app, "1|Terminal got an error: boom")
+        self.assertEqual(n, 1)
+        lines = [line for line in out.splitlines() if line.strip()]
+        self.assertTrue(lines[0].lstrip().startswith("✓"), lines)
+        self.assertTrue(lines[1].lstrip().startswith("✗"), lines)
+        self.assertIn("opened 1/2: Terminal got an error: boom", err)
+
+    def test_osascript_failure(self):
+        launch = lambda ss: rt.launch_ghostty(ss, layout="windows", max_splits=4)
+        n, _, out, err = self.run_launcher(launch, None)
+        self.assertEqual(n, 0)
+        self.assertNotIn("✓", out)
+        self.assertIn("Ghostty opened 0/2: osascript failed", err)
+
+    @unittest.skipUnless(shutil.which("osacompile"), "macOS only")
+    def test_launch_scripts_compile(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("_GHOSTTY_LAUNCH", "_TERMINAL_LAUNCH", "_GHOSTTY_LIST", "_TERMINAL_LIST"):
+                src = Path(d) / f"{name}.applescript"
+                src.write_text(getattr(rt, name))
+                r = subprocess.run(["osacompile", "-o", str(Path(d) / f"{name}.scpt"), str(src)],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
 
 
 class ResolveTarget(unittest.TestCase):
