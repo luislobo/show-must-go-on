@@ -28,7 +28,7 @@ restore --execute        # recover from session history on disk
 
 - **Session discovery** — scans `~/.claude/projects/` and `~/.codex/sessions/` for all session history
 - **Live snapshot** (`--save`) — detects running claude/codex sessions (via `/proc` on Linux, `ps` and `lsof` on macOS), captures their session IDs, cwds, **i3 workspace names** or **Ghostty/Terminal.app window and tab**, and **window titles**
-- **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused
+- **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused. When Claude Code writes these records, a `claude` process without one (`claude agents`, `claude mcp …`) is not counted as a session
 - **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
 - **Smart filtering** — configurable lookback window, minimum activity thresholds, dead-cwd detection
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
@@ -303,7 +303,7 @@ The current row has a `▶` in the gutter and bold text. Colours come from your 
 
 ### Snapshot mode (--save / --load)
 
-1. **Save** — lists running `claude`/`codex` processes (`/proc` on Linux, `ps` + `lsof` on macOS), resolves each to its session ID (via `~/.claude/sessions/<pid>.json`, `--resume` args, the process's open files, or cwd-to-project mapping), and records where it runs: the i3 workspace and window title via `i3-msg -t get_tree` + `wmctrl -lp` on Linux, or the Ghostty / Terminal.app window and tab via AppleScript on macOS
+1. **Save** — lists running `claude`/`codex` processes (`/proc` on Linux, `ps` + `lsof` on macOS), resolves each to its session ID (via `~/.claude/sessions/<pid>.json`, the `--session-id` or `--resume` argument, the process's open files, or, only for Claude Code versions that write no pid records, the newest transcript for its folder), and records where it runs: the i3 workspace and window title via `i3-msg -t get_tree` + `wmctrl -lp` on Linux, or the Ghostty / Terminal.app window and tab via AppleScript on macOS
 2. **Load** — reads the snapshot, checks which sessions are already running (skips those), parses the JSONL files for metadata, runs through the same summarize/pick/launch pipeline
 3. **Launch** — on Linux, spawns each Terminator window, then uses `i3-msg '[id=<wid>] move to workspace <name>'` to place it on the saved workspace. On macOS, opens the sessions in Ghostty or Terminal.app; `--layout=saved` puts Ghostty sessions back in their saved window and tab
 

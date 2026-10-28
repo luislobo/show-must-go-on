@@ -1399,6 +1399,19 @@ def _claude_pid_record(pid: int, started: float | None = None) -> dict | None:
     return rec
 
 
+def _claude_pid_record_pids() -> list[int]:
+    """Pids that have a record in CLAUDE_PID_DIR, live or left behind."""
+    try:
+        names = [p.stem for p in CLAUDE_PID_DIR.glob("*.json")]
+    except OSError:
+        return []
+    return [int(n) for n in names if n.isdigit()]
+
+
+def _claude_writes_pid_records() -> bool:
+    return bool(_claude_pid_record_pids())
+
+
 def _claude_jsonl_path(session_id: str, cwd: str | None) -> Path | None:
     if cwd:
         p = CLAUDE_ROOT / _encode_cwd_to_project(cwd) / f"{session_id}.jsonl"
@@ -1415,14 +1428,29 @@ def _find_claude_session(pid: int, argv: list[str], cwd: str,
     # 1. Claude Code's per-pid record, when this version writes one
     if rec:
         return rec["sessionId"]
-    # 2. If --resume <id> is in argv, take it directly
+    # 2. The id on the command line. Arguments after "--" belong to a command
+    # this process hosts (Claude's background pty host), which is found on
+    # its own. --session-id names the session a --fork-session writes to;
+    # --resume takes an id or a transcript path.
+    if "--" in argv:
+        argv = argv[:argv.index("--")]
+    flags: dict[str, str] = {}
     for i, arg in enumerate(argv):
-        if arg == "--resume" and i + 1 < len(argv):
-            return argv[i + 1]
-        if arg.startswith("--resume="):
-            return arg.split("=", 1)[1]
-    # 3. If --continue, it's the most recent session in project dir
-    # 4. Fallback: map cwd → project dir → most recent JSONL
+        name, eq, value = arg.partition("=")
+        if name in ("--session-id", "--resume"):
+            if not eq:
+                value = argv[i + 1] if i + 1 < len(argv) else ""
+            flags.setdefault(name, value)
+    for name in ("--session-id", "--resume"):
+        value = flags.get(name)
+        if value and not value.startswith("-"):
+            return Path(value).stem if value.endswith(".jsonl") else value
+    # 3. Newest transcript in the folder's project dir: a guess, made only when
+    # Claude Code writes no pid records. When it does, a process without one
+    # is not a session (`claude agents`, `claude mcp ...`), and guessing would
+    # pin someone else's session on it.
+    if _claude_writes_pid_records():
+        return None
     encoded = _encode_cwd_to_project(cwd)
     project_dir = CLAUDE_ROOT / encoded
     if project_dir.is_dir():
@@ -1855,6 +1883,9 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
     results: dict[str, dict] = {}  # keyed by session_id to dedupe
     procs = _list_procs()
 
+    # a process with a pid record is a claude session whatever its name; the
+    # installed binary runs as .../claude/versions/<version>
+    recorded = set(_claude_pid_record_pids())
     candidates: list[tuple[Proc, str]] = []
     for p in procs.values():
         if p.uid != my_uid or not p.argv:
@@ -1867,6 +1898,8 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
             tool = "codex"
         elif exe in ("node", "bash") and any("codex" in a for a in p.argv[1:3]):
             tool = "codex"
+        elif p.pid in recorded:
+            tool = "claude"
         else:
             continue
         candidates.append((p, tool))
@@ -1881,6 +1914,8 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
         jsonl_path: str | None = None
         if tool == "claude":
             rec = _claude_pid_record(p.pid, p.start)
+            if not rec and os.path.basename(p.argv[0]) != "claude":
+                continue   # its record was left behind by an earlier process
             session_id = _find_claude_session(p.pid, p.argv, cwd, rec)
             if session_id:
                 found = _claude_jsonl_path(session_id, (rec or {}).get("cwd") or cwd)

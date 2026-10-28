@@ -150,12 +150,31 @@ class ClaudeSessionLookup(unittest.TestCase):
     def test_pid_record_for_another_pid_is_ignored(self):
         (self.pid_dir / "42.json").write_text(json.dumps({"pid": 7, "sessionId": "old"}))
         self.assertIsNone(rt._claude_pid_record(42))
-        self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a", None), "newest")
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a", None), "x")
 
     def test_argv_resume_then_newest_file(self):
         self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a"), "x")
         self.assertEqual(rt._find_claude_session(42, ["claude", "--resume=y"], "/w/a"), "y")
         self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a"), "newest")
+
+    def test_no_guess_when_claude_writes_pid_records(self):
+        # `claude agents` has no record of its own; it is not the newest session in its folder
+        (self.pid_dir / "7.json").write_text(json.dumps({"pid": 7, "sessionId": "other"}))
+        self.assertIsNone(rt._find_claude_session(42, ["claude", "agents"], "/w/a"))
+        self.assertIsNone(rt._find_claude_session(42, ["claude"], "/w/a"))
+
+    def test_fork_names_its_session_and_a_resume_path_its_file(self):
+        argv = ["/x/claude/versions/2.1.312", "--session-id", "new", "--fork-session",
+                "--resume", "/p/-w-a/old.jsonl"]
+        self.assertEqual(rt._find_claude_session(42, argv, "/w/a"), "new")
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "/p/-w-a/old.jsonl"], "/w/a"),
+                         "old")
+
+    def test_hosted_command_line_is_not_the_hosts_session(self):
+        (self.pid_dir / "7.json").write_text(json.dumps({"pid": 7, "sessionId": "other"}))
+        argv = ["claude", "--bg-pty-host", "/tmp/s.sock", "210", "60", "--",
+                "/x/claude/versions/2.1.312", "--session-id", "new"]
+        self.assertIsNone(rt._find_claude_session(42, argv, "/w/a"))
 
     def test_record_older_than_the_process_is_ignored(self):
         started = 1_800_000_000.0
@@ -688,6 +707,34 @@ class SnapshotCompat(unittest.TestCase):
         self.assertEqual(s.workspace, " 1 ")
         self.assertIsNone(s.terminal)
         self.assertIsNone(s.window_id)
+
+
+class RunningSessions(unittest.TestCase):
+    """What restore treats as a running session."""
+
+    def test_recorded_process_counts_whatever_its_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            pid_dir = Path(d)
+            (pid_dir / "50.json").write_text(json.dumps({"pid": 50, "sessionId": "forked"}))
+            procs = {50: proc(50, 1, "/x/claude/versions/2.1.312 --session-id forked", uid=os.getuid()),
+                     51: proc(51, 1, "claude agents", uid=os.getuid())}
+            with mock.patch.multiple(rt, CLAUDE_PID_DIR=pid_dir, CLAUDE_ROOT=pid_dir / "none"), \
+                    mock.patch.object(rt, "_list_procs", return_value=procs), \
+                    mock.patch.object(rt, "_proc_cwds", return_value={50: "/w/a", 51: "/w/a"}):
+                found = rt.snapshot_active(with_windows=False)
+        self.assertEqual([(e["pid"], e["session_id"]) for e in found], [(50, "forked")])
+
+    def test_left_behind_record_does_not_make_a_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            pid_dir = Path(d)
+            (pid_dir / "60.json").write_text(json.dumps(
+                {"pid": 60, "sessionId": "gone", "startedAt": 1_000_000_000_000}))
+            procs = {60: proc(60, 1, "/usr/bin/python3 server.py --session-id x", uid=os.getuid())}
+            procs[60].start = 1_800_000_000.0   # started long after the record
+            with mock.patch.multiple(rt, CLAUDE_PID_DIR=pid_dir, CLAUDE_ROOT=pid_dir / "none"), \
+                    mock.patch.object(rt, "_list_procs", return_value=procs), \
+                    mock.patch.object(rt, "_proc_cwds", return_value={60: "/w/a"}):
+                self.assertEqual(rt.snapshot_active(with_windows=False), [])
 
 
 class SnapshotLiveProcess(unittest.TestCase):
