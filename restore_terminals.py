@@ -1416,7 +1416,7 @@ def _proc_cwds(pids: list[int]) -> dict[int, str]:
         return cwds
     try:
         out = subprocess.run(
-            ["lsof", "-a", "-d", "cwd", "-p", ",".join(map(str, pids)), "-F", "pn"],
+            ["lsof", "-n", "-P", "-a", "-d", "cwd", "-p", ",".join(map(str, pids)), "-F", "pn"],
             capture_output=True, text=True, timeout=10,
         ).stdout  # exits 1 when any pid is gone; the rest is still printed
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -1438,7 +1438,9 @@ def _proc_open_files(pid: int) -> list[str]:
                 continue
         return paths
     try:
-        out = subprocess.run(["lsof", "-p", str(pid), "-F", "pn"],
+        # -n -P: no DNS or port-name lookups for the process's sockets, which
+        # can outlast the timeout when the network is slow or down
+        out = subprocess.run(["lsof", "-n", "-P", "-p", str(pid), "-F", "pn"],
                              capture_output=True, text=True, timeout=10).stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []

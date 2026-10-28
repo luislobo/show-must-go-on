@@ -53,6 +53,24 @@ class ParsePs(unittest.TestCase):
                          {10: ["/Users/l/Dev"], 11: ["/a b/c", "/d.jsonl"]})
 
 
+class LsofCalls(unittest.TestCase):
+    def test_lsof_skips_name_lookups(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "p7\nn/x/rollout-1.jsonl\n", "")
+        with mock.patch.object(rt.Path, "is_dir", return_value=False), \
+             mock.patch.object(rt.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(rt._proc_open_files(7), ["/x/rollout-1.jsonl"])
+            rt._proc_cwds([7, 8])
+        self.assertEqual(len(calls), 2)
+        for argv in calls:
+            self.assertEqual(argv[0], "lsof")
+            self.assertIn("-n", argv)
+            self.assertIn("-P", argv)
+
+
 class HostTerminal(unittest.TestCase):
     def chain(self, host_cmd):
         return {
