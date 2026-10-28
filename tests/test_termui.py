@@ -46,7 +46,14 @@ class ProgressColors(unittest.TestCase):
                 self.assertTrue(termui.stdout_colors())
 
     def test_only_normal_colours(self):
-        self.assertEqual(set(termui.ANSI.values()), {"32", "33", "36", "1"})
+        self.assertEqual(set(termui.ANSI.values()), {"31", "32", "33", "36", "1"})
+
+    def test_every_role_paints(self):
+        with mock.patch.object(termui, "stdout_colors", return_value=True):
+            for role in list(termui.ROLE_COLORS) + ["bold"]:
+                self.assertTrue(termui.paint("x", role).startswith("\033["), role)
+            line = "".join(termui.paint(t, r) for t, r in termui.TAGLINE)
+            self.assertIn("\033[31m♥", line)
 
 
 class TextFitting(unittest.TestCase):

@@ -37,7 +37,7 @@ TAGLINE = [("Proudly made in Dallas with ", ""), ("♥", "heart"), (" ", "")]
 
 # The same roles as ANSI codes for progress lines, plus bold (default
 # colour) for numbers.
-ANSI = {"accent": "36", "ok": "32", "warn": "33", "bold": "1"}
+ANSI = {"accent": "36", "ok": "32", "warn": "33", "heart": "31", "bold": "1"}
 
 
 def colors_enabled(env, has_colors: bool) -> bool:
