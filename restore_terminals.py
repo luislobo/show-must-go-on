@@ -62,7 +62,9 @@ class Session:
     interrupted: bool = False       # last turn is assistant/tool — user wasn't replied to OR agent was mid-task
     closed_with_clear: bool = False # last user action was /clear — session was abandoned, not paused
     last_hour_transcript: str = ""  # populated lazily for summarization
-    topic: str | None = None        # short label from AI (used as window title)
+    agent_title: str | None = None  # the agent's own name for it: /rename, else the title it chose
+    renamed: bool = False           # agent_title was set with /rename
+    topic: str | None = None        # short label from AI
     slug: str | None = None         # short kebab-case slug from AI (used for tmux window/pane names)
     abstract: str | None = None     # 1-2 sentence summary from AI
     summary_error: str | None = None
@@ -169,6 +171,7 @@ def parse_claude(path: Path) -> Session | None:
     last_user_ts: datetime | None = None
     last_assistant_ts: datetime | None = None
     recent_lines: list[tuple[datetime, str, str]] = []  # (ts, role, text)
+    custom_title = ai_title = None   # the last of each wins, as in the agent
     try:
         with path.open() as f:
             for line in f:
@@ -191,7 +194,11 @@ def parse_claude(path: Path) -> Session | None:
                 t = d.get("type")
                 msg = d.get("message") if isinstance(d.get("message"), dict) else None
                 role = (msg or {}).get("role") if msg else None
-                if t == "user" and role == "user":
+                if t == "custom-title" and d.get("customTitle"):
+                    custom_title = d["customTitle"]
+                elif t == "ai-title" and d.get("aiTitle"):
+                    ai_title = d["aiTitle"]
+                elif t == "user" and role == "user":
                     text = _claude_user_text(msg) or ""
                     # skip pure tool_result payloads (Claude also uses role=user for those)
                     if text.strip():
@@ -224,6 +231,8 @@ def parse_claude(path: Path) -> Session | None:
     if not s.last_ts or not s.cwd:
         return None
     s.first_user_prompt = s.first_user_prompt or first_command
+    s.agent_title = custom_title or ai_title
+    s.renamed = bool(custom_title)
     # interrupted: last meaningful turn is assistant (agent was mid-reply when killed)
     if last_assistant_ts and last_user_ts and last_assistant_ts > last_user_ts:
         s.interrupted = True
@@ -819,13 +828,27 @@ def _i3_move_command(wid: str, workspace: str) -> str:
     return f'[id={wid}] move to workspace "{name}"'
 
 
+def display_title(s: Session) -> str:
+    """The session's name: the agent's own title first, as the agent shows it."""
+    return s.agent_title or s.topic or s.first_user_prompt or "(empty)"
+
+
+def _second_title(s: Session) -> str | None:
+    """restore's topic, shown beside the agent's title unless it says the same."""
+    if not s.agent_title or not s.topic:
+        return None
+    if s.topic.strip().casefold() == s.agent_title.strip().casefold():
+        return None
+    return s.topic
+
+
 def launch(sessions: list[Session]) -> int:
     """Spawn one detached Terminator window per session. Returns count launched."""
     import time
     launched = 0
     procs: list[tuple[Session, subprocess.Popen, str]] = []  # (session, proc, title)
     for s in sessions:
-        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        title = _truncate(display_title(s), 60)
         argv = terminator_argv(s, title)
         try:
             p = subprocess.Popen(
@@ -1225,7 +1248,7 @@ def launch_terminal_app(sessions: list[Session]) -> int:
     argv: list[str] = []
     lines: list[str] = []
     for s in sessions:
-        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        title = _truncate(display_title(s), 60)
         argv += [_shell_line(s), title]
         lines.append(f"window {short_cwd(s.cwd)}  —  {title}")
     n, err = _osascript_progress(_TERMINAL_LAUNCH, argv)
@@ -1286,7 +1309,7 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
     print(head)
     for i, s in enumerate(sessions, 1):
         flag = " [INTERRUPTED]" if s.interrupted else ""
-        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        title = _truncate(display_title(s), 60)
         print(f"  ── window {i}/{len(sessions)}{flag} ──")
         print(f"    tool    : {s.tool}")
         print(f"    cwd     : {short_cwd(s.cwd)}")
@@ -2177,6 +2200,7 @@ def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
         st = (s.pr_state or "")[:1]
         pr_marker = f" #{s.pr_number}{st}"
     label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
+    second = _second_title(s)
     n_hits = len(s.search_matches)
     hits = f" ({n_hits} hit{'' if n_hits == 1 else 's'})" if n_hits else ""
     segs = [
@@ -2193,7 +2217,21 @@ def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
         segs.append((hits, "warn"))
     used = sum(len(t) for t, _ in segs)
     remaining = max(10, width - used - 7)
-    segs.append((f"  {_truncate(label, remaining)}", ""))
+    if not s.agent_title:
+        segs.append((f"  {_truncate(label, remaining)}", ""))
+        return segs
+    # the agent's title first; restore's topic after it, in what room is left.
+    # When both do not fit, the topic gives way first, down to 12 characters;
+    # past that the agent's title is cut too, keeping at least half the room.
+    room_for_first = remaining
+    if second:
+        room_for_first = max(10, remaining // 2, remaining - 3 - min(len(second), 12))
+    first = _truncate(s.agent_title, room_for_first)
+    segs.append(("  ", ""))
+    segs.append((first, "bold"))
+    room = remaining - len(first) - 3
+    if second and room >= 8:
+        segs.append((f" · {_truncate(second, room)}", ""))
     return segs
 
 
@@ -2228,10 +2266,16 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
         for line in wrap(text, width - 4, max_lines):
             out.append([("   " + line, role)])
 
-    for line in wrap(s.topic or s.first_user_prompt or "(no prompt)", width - 2, 2):
+    for line in wrap(s.agent_title or s.topic or s.first_user_prompt or "(no prompt)",
+                     width - 2, 2):
         out.append([(f" {line}", "bold")])
+    if _second_title(s):
+        for line in wrap(_second_title(s), width - 2, 2):
+            out.append([(f" {line}", "")])
 
     heading("Session")
+    if s.agent_title:
+        field("named by", "you, with /rename" if s.renamed else "the agent")
     field("tool", s.tool)
     field("id", s.session_id)
     if s.interrupted:

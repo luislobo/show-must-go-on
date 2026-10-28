@@ -536,6 +536,25 @@ class PromptText(unittest.TestCase):
         s = rt.parse_claude(path)
         self.assertEqual((s.first_user_prompt, s.last_user_prompt), ("/mcp", "/model"))
 
+    def test_agent_title_prefers_rename_and_the_last_of_each(self):
+        path = self.write([({}, "user", "hello")])
+        with path.open("a") as f:
+            for rec in ({"type": "ai-title", "aiTitle": "First guess"},
+                        {"type": "ai-title", "aiTitle": "Loader retries"},
+                        {"type": "custom-title", "customTitle": "my name"},
+                        {"type": "custom-title", "customTitle": "loader v2"}):
+                f.write(json.dumps({**rec, "sessionId": "s"}) + "\n")
+        s = rt.parse_claude(path)
+        self.assertEqual((s.agent_title, s.renamed), ("loader v2", True))
+
+    def test_title_the_agent_chose(self):
+        path = self.write([({}, "user", "hello")])
+        with path.open("a") as f:
+            f.write(json.dumps({"type": "ai-title", "aiTitle": "Loader retries"}) + "\n")
+        s = rt.parse_claude(path)
+        self.assertEqual((s.agent_title, s.renamed), ("Loader retries", False))
+        self.assertIsNone(rt.parse_claude(self.write([({}, "user", "hi")])).agent_title)
+
 
 class PickerRows(unittest.TestCase):
     def test_row_pieces_and_roles(self):
@@ -566,6 +585,33 @@ class PickerRows(unittest.TestCase):
         s = session(topic="x" * 200)
         self.assertLessEqual(len(rt._row_text(s, 80)), 80)
 
+    def test_agent_title_comes_first_then_the_topic(self):
+        s = session(cwd="/w/a", agent_title="loader v2", topic="Fix the loader retries")
+        segs = rt._row_segments(s, 120)
+        self.assertIn(("loader v2", "bold"), segs)
+        self.assertTrue(rt._row_text(s, 120).endswith("  loader v2 · Fix the loader retries"))
+
+    def test_same_title_twice_is_shown_once(self):
+        s = session(cwd="/w/a", agent_title="Fix the loader", topic="fix the loader ")
+        self.assertTrue(rt._row_text(s, 120).endswith("  Fix the loader"))
+
+    def test_long_agent_title_is_kept_whole_when_the_row_has_room(self):
+        s = session(cwd="/w/a", agent_title="Webhook retries flooding slow endpoints",
+                    topic="Webhook retry backoff fix")
+        self.assertTrue(rt._row_text(s, 100).endswith(
+            "  Webhook retries flooding slow endpoints · Webhook retry backoff fix"))
+        # short of room, the topic is cut before the agent's title
+        text = rt._row_text(s, 85)
+        self.assertIn("  Webhook retries flooding slow endpoints · Webhook", text)
+        self.assertTrue(text.endswith("…"), text)
+
+    def test_both_titles_fit_the_width(self):
+        s = session(cwd="/w/a", agent_title="a" * 90, topic="b" * 90)
+        for width in (60, 80, 120):
+            text = rt._row_text(s, width)
+            self.assertLessEqual(len(text), width)
+            self.assertIn("a" * 10, text)
+
 
 class DetailsPage(unittest.TestCase):
     def details(self, s, width=100):
@@ -593,6 +639,21 @@ class DetailsPage(unittest.TestCase):
         self.assertEqual(roles["assistant"], "accent")
         status = [line for line in lines if line and line[0][0].strip() == "status"][0]
         self.assertEqual(status[1][1], "warn")
+
+    def test_both_titles_head_the_page(self):
+        s = session(agent_title="loader v2", renamed=True, topic="Fix the loader retries")
+        _, text = self.details(s)
+        self.assertEqual(text[:2], [" loader v2", " Fix the loader retries"])
+        self.assertIn("you, with /rename", "\n".join(text))
+        s = session(agent_title="Loader retries", topic="loader retries")
+        _, text = self.details(s)
+        self.assertEqual(text[:2], [" Loader retries", ""])
+        self.assertIn("the agent", "\n".join(text))
+
+    def test_window_title_is_the_agents_title(self):
+        self.assertEqual(rt.display_title(session(agent_title="loader v2", topic="t")), "loader v2")
+        self.assertEqual(rt.display_title(session(topic="t")), "t")
+        self.assertEqual(rt.display_title(session(first_user_prompt="p")), "p")
 
     def test_lines_fit_and_long_text_is_capped(self):
         s = session(first_user_prompt="word " * 400, last_user_prompt="x")

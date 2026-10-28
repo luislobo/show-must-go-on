@@ -32,6 +32,7 @@ restore --execute        # recover from session history on disk
 - **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
 - **Smart filtering** — configurable lookback window, minimum activity thresholds, dead-cwd detection
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
+- **Agent titles** — the name Claude Code gives a session, or the one you set with `/rename`, is shown first in the picker, the details page and the plan, with the AI topic beside it (once, when the two say the same); it is also the window title restore opens. Codex sessions show the AI topic only
 - **Persistent cache** — summaries are saved to `~/.ai/sessions.jsonl`; subsequent runs reuse them unless the session has new activity
 - **Content search** — `--find` searches all session transcripts for a branch name, repo, Jira ticket, or any regex
 - **Relevance ranking** — search results ranked by match count, recency, user-message weight, and git branch match
@@ -296,7 +297,7 @@ The current row has a `▶` in the gutter and bold text. Colours come from your 
 5. **Summarize** — feeds project context (README.md, CLAUDE.md, etc.) + last-hour transcript to `claude -p`, caches the result
 6. **Pick** — curses TUI for interactive selection
 7. **Launch** — opens each session with the chosen `--target`:
-   - `terminator`: spawns `terminator -u --working-directory <cwd> --title <topic> -x bash -lc '<tool> --resume <id>; exec $SHELL'`
+   - `terminator`: spawns `terminator -u --working-directory <cwd> --title <title> -x bash -lc '<tool> --resume <id>; exec $SHELL'`
    - `ghostty`: creates Ghostty windows (or splits, or tabs) through AppleScript, each starting in `<cwd>` and typing `cd -- <cwd> && <tool> --resume <id>` into your shell
    - `terminal`: runs `cd -- <cwd> && <tool> --resume <id>` with Terminal.app's `do script`, one window per session
    - `byobu`: builds a tmux session (see below)
@@ -313,7 +314,7 @@ Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`
 
 Each Terminator window:
 - Starts in the session's working directory
-- Has the AI-generated topic as its window title (useful for i3 `for_window` rules)
+- Has the session's title as its window title (the agent's title, else the AI topic; useful for i3 `for_window` rules)
 - Gets moved to its saved i3 workspace (exact name match, including spaces)
 - Resumes the AI agent session
 - Falls back to a shell when the agent exits
