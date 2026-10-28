@@ -1606,32 +1606,97 @@ def _terminal_app_tabs() -> list[dict]:
     ]
 
 
+def _session_title(jsonl_path: str | None) -> str | None:
+    """The title the agent shows for a session, as it sets the terminal title:
+    its last custom title (from /rename), else its last AI-generated title."""
+    if not jsonl_path:
+        return None
+    custom = ai = None
+    try:
+        with open(jsonl_path, errors="replace") as f:
+            for line in f:
+                if '"customTitle"' not in line and '"aiTitle"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") == "custom-title" and d.get("customTitle"):
+                    custom = d["customTitle"]
+                elif d.get("type") == "ai-title" and d.get("aiTitle"):
+                    ai = d["aiTitle"]
+    except OSError:
+        return None
+    return custom or ai
+
+
+def _bare_title(title: str) -> str:
+    """A terminal title without the status symbol the agent puts in front (✳, ◐, ⠂ ...)."""
+    i = 0
+    while i < len(title) and (ord(title[i]) > 127 or title[i].isspace()):
+        i += 1
+    return title[i:].strip()
+
+
+def _agent_title(title: str) -> bool:
+    """Agent sessions title their terminal with a status symbol first; a plain shell does not."""
+    return bool(title) and ord(title[0]) > 127
+
+
+def _same_dir(a: str | None, b: str | None) -> bool:
+    """Same folder, after symlinks: lsof reports the real path, the shell may report a link."""
+    return bool(a and b) and os.path.realpath(a) == os.path.realpath(b)
+
+
 def _match_macos_windows(results: list[dict], procs: dict[int, Proc],
-                         ghostty: list[dict], terminal: list[dict]) -> None:
+                         ghostty: list[dict], terminal: list[dict],
+                         titles: dict[int, str] | None = None) -> None:
     """Fill window_id/tab_index/window_title on snapshot entries in place.
 
-    Terminal.app tabs expose their tty, so that match is exact. Ghostty does
-    not, so a session is matched to a surface whose working directory is the
-    session's cwd; several sessions in one folder are paired in pid order.
+    Only a process with a controlling tty can be in a terminal window;
+    background sessions have none and are left unplaced. Terminal.app tabs
+    expose their tty, so that match is exact. Ghostty does not, so a session
+    is matched to, in order: the terminal titled with the session's title
+    (titles maps pid to it); a terminal in the session's folder whose title
+    starts with an agent status symbol; any terminal in that folder. Exact
+    title matches are made for every session first, so a fallback never
+    takes a terminal another session's title points at.
     """
+    def place(entry: dict, hit: dict) -> None:
+        entry["window_id"] = hit["window_id"]
+        entry["tab_index"] = hit["tab_index"]
+        entry["window_title"] = hit["title"]
+
     by_tty = {t["tty"]: t for t in terminal}
-    unclaimed = list(ghostty)
+    titles = titles or {}
+    in_ghostty: list[dict] = []
     for entry in sorted(results, key=lambda e: e["pid"]):
-        hit = None
+        p = procs.get(entry["pid"])
+        if not p or not p.tty:
+            continue
         if entry.get("terminal") == "terminal":
-            p = procs.get(entry["pid"])
-            if p and p.tty:
-                hit = by_tty.get(f"/dev/{p.tty}")
+            hit = by_tty.get(f"/dev/{p.tty}")
+            if hit:
+                place(entry, hit)
         elif entry.get("terminal") == "ghostty":
-            for cand in unclaimed:
-                if cand["cwd"] and cand["cwd"].rstrip("/") == entry["cwd"].rstrip("/"):
-                    hit = cand
-                    unclaimed.remove(cand)
-                    break
+            in_ghostty.append(entry)
+
+    unclaimed = list(ghostty)
+    rest = []
+    for entry in in_ghostty:
+        title = titles.get(entry["pid"])
+        hit = next((c for c in unclaimed if title and _bare_title(c["title"]) == title), None)
         if hit:
-            entry["window_id"] = hit["window_id"]
-            entry["tab_index"] = hit["tab_index"]
-            entry["window_title"] = hit["title"]
+            unclaimed.remove(hit)
+            place(entry, hit)
+        else:
+            rest.append(entry)
+    for entry in rest:
+        here = [c for c in unclaimed if _same_dir(c["cwd"], entry["cwd"])]
+        hit = next((c for c in here if _agent_title(c["title"])), None) or next(iter(here), None)
+        if hit:
+            unclaimed.remove(hit)
+            place(entry, hit)
 
 
 def snapshot_active(with_windows: bool = True) -> list[dict]:
@@ -1706,10 +1771,13 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
                 entry["pid"], pid_info, procs)
     elif IS_MACOS:
         hosts = {e["terminal"] for e in entries}
+        titles = {e["pid"]: _session_title(e["jsonl_path"]) for e in entries
+                  if e["terminal"] == "ghostty" and e["tool"] == "claude"}
         _match_macos_windows(
             entries, procs,
             ghostty=_ghostty_terminals() if "ghostty" in hosts else [],
             terminal=_terminal_app_tabs() if "terminal" in hosts else [],
+            titles={pid: t for pid, t in titles.items() if t},
         )
     return entries
 

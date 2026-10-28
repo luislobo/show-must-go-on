@@ -169,6 +169,65 @@ class MacWindowMatching(unittest.TestCase):
         self.assertEqual((by_pid[30]["window_id"], by_pid[30]["tab_index"]), ("g1", 2))
         self.assertEqual(by_pid[30]["window_title"], "second")
 
+    def ghostty(self, *terms):
+        return [{"window_id": w, "tab_index": 1, "cwd": cwd, "title": title} for w, cwd, title in terms]
+
+    def test_title_beats_folder_and_order(self):
+        procs = {10: proc(10, 1, "claude", tty="ttys001"), 20: proc(20, 1, "claude", tty="ttys002")}
+        entries = [{"pid": 10, "terminal": "ghostty", "cwd": "/w/a"},
+                   {"pid": 20, "terminal": "ghostty", "cwd": "/w/a"}]
+        terms = self.ghostty(("W1", "/w/a", "✳ Second task"), ("W2", "/w/a", "◐ First task"))
+        rt._match_macos_windows(entries, procs, terms, [], titles={10: "First task", 20: "Second task"})
+        self.assertEqual([e["window_id"] for e in entries], ["W2", "W1"])
+
+    def test_agent_terminal_beats_plain_shell_in_the_same_folder(self):
+        procs = {10: proc(10, 1, "claude", tty="ttys001")}
+        entries = [{"pid": 10, "terminal": "ghostty", "cwd": "/w/a"}]
+        terms = self.ghostty(("W1", "/w/a", "zsh"), ("W2", "/w/a", "✳ Something"))
+        rt._match_macos_windows(entries, procs, terms, [])
+        self.assertEqual(entries[0]["window_id"], "W2")
+
+    def test_background_session_without_a_tty_gets_no_window(self):
+        procs = {10: proc(10, 1, "claude --bg-pty-host /tmp/x")}
+        entries = [{"pid": 10, "terminal": "ghostty", "cwd": "/w/a"}]
+        rt._match_macos_windows(entries, procs, self.ghostty(("W1", "/w/a", "✳ x")), [],
+                                titles={10: "x"})
+        self.assertNotIn("window_id", entries[0])
+
+    def test_folders_match_through_a_symlink(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(os.path.realpath(d)) / "real"
+            real.mkdir()
+            link = Path(os.path.realpath(d)) / "link"
+            link.symlink_to(real)
+            procs = {10: proc(10, 1, "claude", tty="ttys001")}
+            entries = [{"pid": 10, "terminal": "ghostty", "cwd": str(real)}]
+            rt._match_macos_windows(entries, procs, self.ghostty(("W1", str(link), "✳ x")), [])
+        self.assertEqual(entries[0].get("window_id"), "W1")
+
+    def test_bare_title_and_agent_title(self):
+        self.assertEqual(rt._bare_title("✳ TLA+ spec"), "TLA+ spec")
+        self.assertEqual(rt._bare_title('⠂ "MDM fixes"'), '"MDM fixes"')
+        self.assertEqual(rt._bare_title("~/Dev"), "~/Dev")
+        self.assertTrue(rt._agent_title("◑ Show-must-go-on"))
+        self.assertFalse(rt._agent_title("restore"))
+        self.assertFalse(rt._agent_title(""))
+
+    def test_session_title_prefers_the_last_custom_title(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.jsonl"
+            lines = [{"type": "ai-title", "aiTitle": "First AI title"},
+                     {"type": "user", "message": {"role": "user", "content": "aiTitle in text"}},
+                     {"type": "ai-title", "aiTitle": "Second AI title"}]
+            path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+            self.assertEqual(rt._session_title(str(path)), "Second AI title")
+            with path.open("a") as f:
+                f.write(json.dumps({"type": "custom-title", "customTitle": "Renamed"}) + "\n")
+                f.write(json.dumps({"type": "ai-title", "aiTitle": "Later AI title"}) + "\n")
+            self.assertEqual(rt._session_title(str(path)), "Renamed")
+        self.assertIsNone(rt._session_title(None))
+        self.assertIsNone(rt._session_title("/nonexistent.jsonl"))
+
     def test_records_split_on_separators(self):
         out = f"a{rt._US}1{rt._US}/p q{rt._US}title{rt._RS}b{rt._US}2{rt._US}{rt._US}t2{rt._RS}"
         self.assertEqual(rt._split_records(out), [["a", "1", "/p q", "title"], ["b", "2", "", "t2"]])
