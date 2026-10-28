@@ -1325,17 +1325,24 @@ def _most_recent_jsonl(project_dir: Path) -> tuple[str, Path] | None:
     return (best[1], best[2]) if best else None
 
 
-def _claude_pid_record(pid: int) -> dict | None:
+def _claude_pid_record(pid: int, started: float | None = None) -> dict | None:
     """Claude Code's own record for a running process: ~/.claude/sessions/<pid>.json.
 
     It holds the live sessionId (which changes on /clear) and the launch cwd,
     so it beats guessing from argv or the newest JSONL in the project dir.
+    A crash or reboot can leave a record behind for a pid that is later
+    reused; when the process start time is known, a record whose startedAt
+    is older than the process belongs to that earlier process and is ignored.
+    The agent writes it a second or two after starting.
     """
     try:
         rec = json.loads((CLAUDE_PID_DIR / f"{pid}.json").read_text())
     except (OSError, ValueError):
         return None
     if not isinstance(rec, dict) or rec.get("pid") != pid or not rec.get("sessionId"):
+        return None
+    born = rec.get("startedAt")
+    if started and isinstance(born, (int, float)) and born / 1000 < started - 5:
         return None
     return rec
 
@@ -1350,10 +1357,10 @@ def _claude_jsonl_path(session_id: str, cwd: str | None) -> Path | None:
     return None
 
 
-def _find_claude_session(pid: int, argv: list[str], cwd: str) -> str | None:
-    """Find session_id for a running Claude process."""
+def _find_claude_session(pid: int, argv: list[str], cwd: str,
+                         rec: dict | None = None) -> str | None:
+    """Find session_id for a running Claude process; rec is its pid record, if any."""
     # 1. Claude Code's per-pid record, when this version writes one
-    rec = _claude_pid_record(pid)
     if rec:
         return rec["sessionId"]
     # 2. If --resume <id> is in argv, take it directly
@@ -1386,6 +1393,7 @@ class Proc:
     tty: str | None     # "ttys003" on macOS; None when there is no controlling tty
     argv: list[str]
     cmd: str            # the raw command line, for matching app bundle paths
+    start: float | None = None  # process start, seconds since the epoch
 
 
 def _list_procs() -> dict[int, Proc]:
@@ -1393,8 +1401,9 @@ def _list_procs() -> dict[int, Proc]:
         return _list_procs_linux()
     try:
         out = subprocess.run(
-            ["ps", "-axww", "-o", "pid=,ppid=,uid=,tty=,args="],
+            ["ps", "-axww", "-o", "pid=,ppid=,uid=,tty=,lstart=,args="],
             capture_output=True, text=True, timeout=10,
+            env=dict(os.environ, LC_ALL="C"),  # lstart in English, for strptime
         ).stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return {}
@@ -1402,37 +1411,59 @@ def _list_procs() -> dict[int, Proc]:
 
 
 def _parse_ps(out: str) -> dict[int, Proc]:
-    """Parse `ps -o pid=,ppid=,uid=,tty=,args=`. argv is split on whitespace,
+    """Parse `ps -o pid=,ppid=,uid=,tty=,lstart=,args=` (lstart is five words,
+    "Tue Oct 27 20:45:15 2026", in local time). argv is split on whitespace,
     which is lossy for arguments with spaces but enough to spot the tool and
     a --resume id."""
+    import time
     procs: dict[int, Proc] = {}
     for line in out.splitlines():
-        parts = line.split(None, 4)
-        if len(parts) < 5:
+        parts = line.split(None, 9)
+        if len(parts) < 10:
             continue
         try:
             pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
         tty = None if parts[3] in ("??", "-", "?") else parts[3]
-        procs[pid] = Proc(pid, ppid, uid, tty, parts[4].split(), parts[4])
+        try:
+            start = time.mktime(time.strptime(" ".join(parts[4:9]), "%a %b %d %H:%M:%S %Y"))
+        except ValueError:
+            start = None
+        procs[pid] = Proc(pid, ppid, uid, tty, parts[9].split(), parts[9], start)
     return procs
+
+
+def _linux_boot_time() -> float | None:
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _list_procs_linux() -> dict[int, Proc]:
     procs: dict[int, Proc] = {}
+    boot = _linux_boot_time()
+    ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
     for pid_dir in Path("/proc").iterdir():
         if not pid_dir.name.isdigit():
             continue
         try:
             uid = pid_dir.stat().st_uid
             raw = (pid_dir / "cmdline").read_bytes()
-            # comm is in parens and may contain spaces; ppid is the 2nd field after it
-            ppid = int((pid_dir / "stat").read_text().rsplit(")", 1)[1].split()[1])
+            # comm is in parens and may contain spaces; after it, ppid is the
+            # 2nd field and starttime (clock ticks since boot) the 20th
+            fields = (pid_dir / "stat").read_text().rsplit(")", 1)[1].split()
+            ppid = int(fields[1])
+            start = boot + int(fields[19]) / ticks if boot is not None else None
         except (OSError, ValueError, IndexError):
             continue
         argv = [a for a in raw.decode("utf-8", errors="replace").split("\0") if a]
-        procs[int(pid_dir.name)] = Proc(int(pid_dir.name), ppid, uid, None, argv, " ".join(argv))
+        procs[int(pid_dir.name)] = Proc(int(pid_dir.name), ppid, uid, None, argv,
+                                        " ".join(argv), start)
     return procs
 
 
@@ -1787,9 +1818,9 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
         session_id: str | None = None
         jsonl_path: str | None = None
         if tool == "claude":
-            session_id = _find_claude_session(p.pid, p.argv, cwd)
+            rec = _claude_pid_record(p.pid, p.start)
+            session_id = _find_claude_session(p.pid, p.argv, cwd, rec)
             if session_id:
-                rec = _claude_pid_record(p.pid)
                 found = _claude_jsonl_path(session_id, (rec or {}).get("cwd") or cwd)
                 if found:
                     jsonl_path = str(found)

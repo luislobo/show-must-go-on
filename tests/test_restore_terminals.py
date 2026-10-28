@@ -47,8 +47,8 @@ class Truncate(unittest.TestCase):
 
 class ParsePs(unittest.TestCase):
     def test_fields_and_missing_tty(self):
-        out = ("  8891  8695   501 ttys000  claude --dangerously-skip-permissions\n"
-               "  1171     1   501 ??       /Users/l/Applications/Ghostty.app/Contents/MacOS/ghostty\n"
+        out = ("  8891  8695   501 ttys000  Tue Oct 27 20:45:15 2026     claude --dangerously-skip-permissions\n"
+               "  1171     1   501 ??       Mon Oct  5 09:01:02 2026     /Users/l/Applications/Ghostty.app/Contents/MacOS/ghostty\n"
                "   bad line\n")
         procs = rt._parse_ps(out)
         self.assertEqual(sorted(procs), [1171, 8891])
@@ -56,6 +56,8 @@ class ParsePs(unittest.TestCase):
         self.assertEqual(procs[8891].tty, "ttys000")
         self.assertEqual(procs[8891].ppid, 8695)
         self.assertIsNone(procs[1171].tty)
+        self.assertEqual(procs[8891].start, time.mktime((2026, 10, 27, 20, 45, 15, 0, 0, -1)))
+        self.assertEqual(procs[1171].start, time.mktime((2026, 10, 5, 9, 1, 2, 0, 0, -1)))
 
     def test_lsof_names(self):
         out = "p10\nfcwd\nn/Users/l/Dev\np11\nn/a b/c\nn/d.jsonl\n"
@@ -134,16 +136,34 @@ class ClaudeSessionLookup(unittest.TestCase):
 
     def test_pid_record_beats_argv_and_newest_file(self):
         (self.pid_dir / "42.json").write_text(json.dumps({"pid": 42, "sessionId": "old", "cwd": "/w/a"}))
-        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a"), "old")
+        rec = rt._claude_pid_record(42)
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a", rec), "old")
 
     def test_pid_record_for_another_pid_is_ignored(self):
         (self.pid_dir / "42.json").write_text(json.dumps({"pid": 7, "sessionId": "old"}))
-        self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a"), "newest")
+        self.assertIsNone(rt._claude_pid_record(42))
+        self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a", None), "newest")
 
     def test_argv_resume_then_newest_file(self):
         self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a"), "x")
         self.assertEqual(rt._find_claude_session(42, ["claude", "--resume=y"], "/w/a"), "y")
         self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a"), "newest")
+
+    def test_record_older_than_the_process_is_ignored(self):
+        started = 1_800_000_000.0
+        (self.pid_dir / "42.json").write_text(
+            json.dumps({"pid": 42, "sessionId": "left-behind", "startedAt": (started - 3600) * 1000}))
+        self.assertIsNone(rt._claude_pid_record(42, started))
+        self.assertEqual(rt._claude_pid_record(42)["sessionId"], "left-behind")  # start unknown
+
+    def test_record_written_just_after_start_is_used(self):
+        started = 1_800_000_000.0
+        (self.pid_dir / "42.json").write_text(
+            json.dumps({"pid": 42, "sessionId": "live", "startedAt": (started + 1.4) * 1000}))
+        self.assertEqual(rt._claude_pid_record(42, started)["sessionId"], "live")
+        (self.pid_dir / "42.json").write_text(
+            json.dumps({"pid": 42, "sessionId": "live", "startedAt": (started - 2) * 1000}))
+        self.assertEqual(rt._claude_pid_record(42, started)["sessionId"], "live")  # clock rounding
 
     def test_jsonl_path_found_outside_cwd_project(self):
         self.assertEqual(rt._claude_jsonl_path("old", "/elsewhere"),
@@ -601,6 +621,7 @@ class SnapshotLiveProcess(unittest.TestCase):
             base = Path(os.path.realpath(d))
             work = base / "work"
             work.mkdir()
+            spawned = time.time()
             child = subprocess.Popen(["bash", "-c", "exec -a claude sleep 30"], cwd=work)
             try:
                 pid_dir = base / "sessions"
@@ -615,6 +636,7 @@ class SnapshotLiveProcess(unittest.TestCase):
                     for _ in range(20):  # exec -a takes effect a moment after spawn
                         found = [e for e in rt.snapshot_active(with_windows=False)
                                  if e["pid"] == child.pid]
+                        start = rt._list_procs()[child.pid].start
                         if found:
                             entry = found[0]
                             break
@@ -623,6 +645,7 @@ class SnapshotLiveProcess(unittest.TestCase):
                 child.kill()
                 child.wait()
         self.assertIsNotNone(entry, "fake claude process not found")
+        self.assertAlmostEqual(start, spawned, delta=5)
         self.assertEqual(entry["session_id"], "fake-sid")
         self.assertEqual(entry["cwd"], str(work))
         self.assertEqual(entry["jsonl_path"], str(projects / "fake-sid.jsonl"))
