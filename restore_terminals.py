@@ -811,6 +811,14 @@ def terminator_argv(s: Session, title: str) -> list[str]:
     ]
 
 
+def _i3_move_command(wid: str, workspace: str) -> str:
+    """The i3 command that moves a window to a workspace by its exact name.
+    Unquoted, i3 drops a leading space (" 3 " became "3 "), so the name is
+    quoted, with backslashes and double quotes escaped."""
+    name = workspace.replace("\\", "\\\\").replace('"', '\\"')
+    return f'[id={wid}] move to workspace "{name}"'
+
+
 def launch(sessions: list[Session]) -> int:
     """Spawn one detached Terminator window per session. Returns count launched."""
     import time
@@ -853,7 +861,7 @@ def launch(sessions: list[Session]) -> int:
                     if len(parts) >= 3 and int(parts[2]) == p.pid:
                         wid = parts[0]
                         subprocess.run(
-                            ["i3-msg", f'[id={wid}] move to workspace {s.workspace}'],
+                            ["i3-msg", _i3_move_command(wid, s.workspace)],
                             capture_output=True, timeout=3,
                         )
                         print(f"    → moved to workspace {s.workspace!r}")

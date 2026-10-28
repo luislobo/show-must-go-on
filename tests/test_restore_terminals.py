@@ -65,6 +65,14 @@ class ParsePs(unittest.TestCase):
                          {10: ["/Users/l/Dev"], 11: ["/a b/c", "/d.jsonl"]})
 
 
+class I3Move(unittest.TestCase):
+    def test_workspace_name_is_quoted_exactly(self):
+        self.assertEqual(rt._i3_move_command("0x10", " 1 "), '[id=0x10] move to workspace " 1 "')
+        self.assertEqual(rt._i3_move_command("0x10", '2: "web"'),
+                         '[id=0x10] move to workspace "2: \\"web\\""')
+        self.assertEqual(rt._i3_move_command("0x10", "a\\b"), '[id=0x10] move to workspace "a\\\\b"')
+
+
 class LsofCalls(unittest.TestCase):
     def test_lsof_skips_name_lookups(self):
         calls = []
