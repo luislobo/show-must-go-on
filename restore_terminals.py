@@ -128,10 +128,44 @@ def _claude_user_text(msg: dict) -> str | None:
     return None
 
 
+# Text the agent itself puts in the user's turn: command echoes and their
+# output, shell (!) input and output, task and hook notices, interruptions.
+# Newer transcripts also flag these entries (see _prompt_text); older ones
+# only show the opening tag.
+_INSERTED_PREFIXES = (
+    "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+    "<bash-input>", "<bash-stdout>", "<bash-stderr>", "<task-notification>",
+    "<system-reminder>", "[Request interrupted by user",
+)
+_COMMAND_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+_COMMAND_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
+
+
+def _prompt_text(d: dict, text: str) -> str | None:
+    """What the person typed in this user entry, for display; None when the
+    agent inserted it (a summary, a notice, command output). A slash command
+    shows as typed, "/name args", instead of its <command-name> markup."""
+    if d.get("isMeta") or d.get("isCompactSummary") or d.get("isVisibleInTranscriptOnly"):
+        return None
+    origin = d.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None
+    m = _COMMAND_RE.search(text)
+    if m:
+        args = _COMMAND_ARGS_RE.search(text)
+        name = m.group(1) if m.group(1).startswith("/") else "/" + m.group(1)
+        return f"{name} {args.group(1)}".strip() if args else name
+    if text.lstrip().startswith(_INSERTED_PREFIXES):
+        return None
+    return text
+
+
 def parse_claude(path: Path) -> Session | None:
     """Parse a Claude Code .jsonl into a Session summary."""
     s = Session(tool="claude", session_id=path.stem, path=path, cwd=None,
                 first_ts=None, last_ts=None)
+    last_user_text = ""   # the last user entry as written, prompt or not
+    first_command: str | None = None
     last_user_ts: datetime | None = None
     last_assistant_ts: datetime | None = None
     recent_lines: list[tuple[datetime, str, str]] = []  # (ts, role, text)
@@ -162,12 +196,19 @@ def parse_claude(path: Path) -> Session | None:
                     # skip pure tool_result payloads (Claude also uses role=user for those)
                     if text.strip():
                         s.user_message_count += 1
-                        if s.first_user_prompt is None:
-                            s.first_user_prompt = text
-                        s.last_user_prompt = text
+                        last_user_text = text
+                        prompt = _prompt_text(d, text)
+                        if prompt:
+                            # the first prompt is the first thing written, not a /command
+                            if prompt.startswith("/"):
+                                first_command = first_command or prompt
+                            elif s.first_user_prompt is None:
+                                s.first_user_prompt = prompt
+                            s.last_user_prompt = prompt
                         if ts:
                             last_user_ts = ts
-                            recent_lines.append((ts, "user", text))
+                            if prompt:
+                                recent_lines.append((ts, "user", prompt))
                     s.message_count += 1
                     s.last_role = "user" if text.strip() else s.last_role
                 elif t == "assistant" and role == "assistant":
@@ -182,11 +223,12 @@ def parse_claude(path: Path) -> Session | None:
         return None
     if not s.last_ts or not s.cwd:
         return None
+    s.first_user_prompt = s.first_user_prompt or first_command
     # interrupted: last meaningful turn is assistant (agent was mid-reply when killed)
     if last_assistant_ts and last_user_ts and last_assistant_ts > last_user_ts:
         s.interrupted = True
     # closed_with_clear: user's last action was /clear — session was deliberately abandoned
-    if s.last_user_prompt and "<command-name>/clear</command-name>" in s.last_user_prompt:
+    if "<command-name>/clear</command-name>" in last_user_text:
         s.closed_with_clear = True
     # last-hour transcript (for optional summarization)
     if s.last_ts:

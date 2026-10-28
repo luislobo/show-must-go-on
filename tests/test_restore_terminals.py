@@ -449,6 +449,67 @@ class ResolveTarget(unittest.TestCase):
                 self.assertEqual(rt._resolve_target("auto", [session()]), "terminal")
 
 
+class PromptText(unittest.TestCase):
+    """Only what the person typed counts as a prompt for display."""
+
+    def test_inserted_entries_are_not_prompts(self):
+        for d, text in [
+            ({"isMeta": True}, "Base directory for this skill: ..."),
+            ({"isCompactSummary": True}, "This session is being continued from a previous ..."),
+            ({"isVisibleInTranscriptOnly": True}, "<artifact-content-authored-by-others/> ..."),
+            ({"origin": {"kind": "task-notification"}}, "<task-notification> <task-id>1</task-id>"),
+            ({}, "<local-command-stdout>Compacted</local-command-stdout>"),
+            ({}, "<local-command-caveat>The command below was run ...</local-command-caveat>"),
+            ({}, "<bash-input>ls</bash-input>"),
+            ({}, "<system-reminder>...</system-reminder>"),
+            ({}, "[Request interrupted by user for tool use]"),
+        ]:
+            self.assertIsNone(rt._prompt_text(d, text), text)
+
+    def test_typed_text_and_commands(self):
+        self.assertEqual(rt._prompt_text({"origin": {"kind": "human"}}, "fix it"), "fix it")
+        self.assertEqual(rt._prompt_text({}, "  plain old prompt"), "  plain old prompt")
+        cmd = ("<command-message>torq:check</command-message>\n<command-name>/torq:check</command-name>"
+               "\n<command-args>52180</command-args>")
+        self.assertEqual(rt._prompt_text({}, cmd), "/torq:check 52180")
+        self.assertEqual(rt._prompt_text({}, "<command-name>/compact</command-name>"), "/compact")
+
+    def write(self, entries):
+        d = tempfile.mkdtemp()
+        path = Path(d) / "s.jsonl"
+        now = datetime.now(timezone.utc)
+        with path.open("w") as f:
+            for i, (extra, role, content) in enumerate(entries):
+                ts = (now - timedelta(minutes=60 - i)).isoformat()
+                f.write(json.dumps({"type": role, "timestamp": ts, "cwd": d, **extra,
+                                    "message": {"role": role, "content": content}}) + "\n")
+        return path
+
+    def test_parse_keeps_counts_and_clear_detection(self):
+        ok = [{"type": "text", "text": "ok"}]
+        path = self.write([
+            ({"isCompactSummary": True}, "user", "This session is being continued ..."),
+            ({}, "user", "<command-name>/model</command-name>"),
+            ({}, "assistant", ok),
+            ({"origin": {"kind": "human"}}, "user", "the real first prompt"),
+            ({}, "assistant", ok),
+            ({"origin": {"kind": "task-notification"}}, "user", "<task-notification>x</task-notification>"),
+            ({}, "user", "<command-name>/clear</command-name>"),
+        ])
+        s = rt.parse_claude(path)
+        self.assertEqual(s.first_user_prompt, "the real first prompt")
+        self.assertEqual(s.last_user_prompt, "/clear")
+        self.assertTrue(s.closed_with_clear)
+        self.assertEqual(s.user_message_count, 5)   # counts every user entry, as before
+        self.assertNotIn("task-notification", s.last_hour_transcript)
+
+    def test_a_session_of_only_commands_shows_the_first_command(self):
+        path = self.write([({}, "user", "<command-name>/mcp</command-name>"),
+                           ({}, "user", "<command-name>/model</command-name>")])
+        s = rt.parse_claude(path)
+        self.assertEqual((s.first_user_prompt, s.last_user_prompt), ("/mcp", "/model"))
+
+
 class PickerRows(unittest.TestCase):
     def test_row_pieces_and_roles(self):
         s = session(cwd=str(Path.home() / "Dev"), topic="Fix the loader", interrupted=True,
