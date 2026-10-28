@@ -35,6 +35,13 @@ def proc(pid, ppid, cmd, tty=None, uid=501):
     return rt.Proc(pid, ppid, uid, tty, cmd.split(), cmd)
 
 
+class Truncate(unittest.TestCase):
+    def test_matches_termui_clip(self):
+        for text, n in (("a  b\nc", 10), ("abcdefghij", 5), (None, 5), ("", 5), ("x" * 200, 120)):
+            self.assertEqual(rt._truncate(text, n), termui.clip(text, n))
+        self.assertEqual(len(rt._truncate("y" * 500)), 120)
+
+
 class ParsePs(unittest.TestCase):
     def test_fields_and_missing_tty(self):
         out = ("  8891  8695   501 ttys000  claude --dangerously-skip-permissions\n"

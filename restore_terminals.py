@@ -30,7 +30,7 @@ from pathlib import Path
 # its own, but not under -I, -P or PYTHONSAFEPATH, so add it explicitly;
 # resolve() follows the ~/.local/bin symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from termui import TAGLINE, paint, pick, wrap  # noqa: E402
+from termui import TAGLINE, clip, paint, pick, wrap  # noqa: E402
 
 HOME = Path.home()
 IS_MACOS = sys.platform == "darwin"
@@ -109,10 +109,7 @@ def _parse_ts(s: str | None) -> datetime | None:
 
 
 def _truncate(s: str | None, n: int = 120) -> str:
-    if not s:
-        return ""
-    s = " ".join(s.split())
-    return s if len(s) <= n else s[: n - 1] + "…"
+    return clip(s, n)
 
 
 def _claude_user_text(msg: dict) -> str | None:
