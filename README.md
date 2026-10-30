@@ -377,9 +377,22 @@ tests/                        # stdlib unittest suites
 
 ## Demo video
 
-`demo/render.sh <out-dir>` records a 45-second walkthrough and renders it as an MP4 in GitHub Dark and GitHub Light colours, plus a GIF. It needs `agg` (`brew install agg`) and `ffmpeg`.
+`demo/render.sh <out-dir>` records a one-minute walkthrough and renders it as a narrated MP4 in GitHub Dark and GitHub Light colours, plus a silent GIF. It needs `agg` (`brew install agg`), `ffmpeg`, [`uv`](https://docs.astral.sh/uv/) and the Kokoro model files.
 
-Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; and `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast. Re-run it after changing the interface so the video stays current, and copy the GIF over the one at the top of this README:
+The narration is voiced by [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) v1.0 (82M parameters, Apache 2.0), run on your machine, with the voice `af_heart` at speed 1.1; nothing is sent anywhere. `demo/voice.py` declares its own packages, so `uv run` installs them on first use, but the two model files have to be fetched once into `~/.local/share/kokoro` (or `$KOKORO_HOME`):
+
+```bash
+mkdir -p ~/.local/share/kokoro && cd ~/.local/share/kokoro
+base=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+curl -fLO "$base/kokoro-v1.0.onnx" && curl -fLO "$base/voices-v1.0.bin"
+shasum -a 256 kokoro-v1.0.onnx voices-v1.0.bin
+# 7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5  kokoro-v1.0.onnx
+# bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d  voices-v1.0.bin
+```
+
+The lines are the `say` steps in `demo/record.py`, and `SPOKEN` there respells the words the voice gets wrong. They are voiced before recording, and the recorder waits for each line to finish before the next scene, so the voice always fits; the GIF shortens those pauses to 4 seconds. The speech is normalised to −16 LUFS, and each MP4 also carries the lines as English subtitles (`show-must-go-on-demo.srt` beside them). `SMGO_VOICE` and `SMGO_SPEED` pick another voice and speed.
+
+Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast; `demo/voice.py` voices the narration with Kokoro; and `demo/narrate.py` mixes the clips into one audio track and writes the subtitles. Re-run it after changing the interface so the video stays current, and copy the GIF over the one at the top of this README:
 
 ```bash
 demo/render.sh demo/out && cp demo/out/show-must-go-on-demo.gif docs/

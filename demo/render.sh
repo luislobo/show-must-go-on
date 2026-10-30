@@ -3,9 +3,15 @@
 #
 #   demo/render.sh <out-dir>
 #
-# Needs agg (brew install agg) and ffmpeg. Everything shown is fictional:
+# Needs agg (brew install agg), ffmpeg, uv and the Kokoro model files (see
+# "Demo video" in the README). Everything shown is fictional:
 # demo/make_home.py writes the projects and sessions, and demo/bin stands
 # in for `claude -p` and `gh`, so nothing is read from your own history.
+#
+# The MP4s are narrated with Kokoro, run locally by demo/voice.py
+# (SMGO_VOICE, SMGO_SPEED), and carry the lines as subtitles. The lines
+# are voiced first and the recording waits for each one, so the MP4s keep
+# every pause; the GIF has no sound and shortens pauses to 4 seconds.
 set -euo pipefail
 
 out="${1:?usage: demo/render.sh <out-dir>}"
@@ -16,7 +22,10 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 python3 "$here/make_home.py" "$work/home"
-python3 "$here/record.py" "$work/home" "$work/demo.cast"
+python3 "$here/record.py" --lines > "$work/lines.json"
+uv run --quiet "$here/voice.py" "$work/lines.json" "$work/narration"
+python3 "$here/record.py" "$work/home" "$work/demo.cast" "$work/narration"
+python3 "$here/narrate.py" "$work/narration" "$work/narration.m4a" "$work/captions.srt"
 
 # Palettes from Ghostty's "GitHub Dark Default" and "GitHub Light Default"
 # themes (background, foreground, colours 0-15). agg's built-in github-light
@@ -29,16 +38,26 @@ palette() {
   esac
 }
 
+render_gif() {   # $1 = theme, $2 = idle-time limit in seconds, $3 = output
+  agg --theme "$(palette "$1")" --font-size 17 --idle-time-limit "$2" --fps-cap 30 \
+      --last-frame-duration 5 "$work/demo.cast" "$3"
+}
+
 for theme in github-dark github-light; do
-  agg --theme "$(palette "$theme")" --font-size 17 --idle-time-limit 4 --fps-cap 30 \
-      --last-frame-duration 5 "$work/demo.cast" "$work/$theme.gif"
+  render_gif "$theme" 600 "$work/$theme-full.gif"
   # H.264 needs even dimensions and yuv420p to play everywhere
-  ffmpeg -v error -y -i "$work/$theme.gif" -movflags +faststart -pix_fmt yuv420p \
+  ffmpeg -v error -y -i "$work/$theme-full.gif" -pix_fmt yuv420p \
          -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" -c:v libx264 -crf 18 -preset slow \
-         "$work/$theme.mp4"
+         "$work/$theme-video.mp4"
+  ffmpeg -v error -y -i "$work/$theme-video.mp4" -i "$work/narration.m4a" -i "$work/captions.srt" \
+         -map 0:v -map 1:a -map 2:s -c:v copy -c:a copy -c:s mov_text \
+         -metadata:s:a:0 language=eng -metadata:s:s:0 language=eng \
+         -movflags +faststart "$work/$theme.mp4"
 done
+render_gif github-dark 4 "$work/github-dark.gif"
 
 mv "$work/demo.cast" "$out/show-must-go-on-demo.cast"
+mv "$work/captions.srt" "$out/show-must-go-on-demo.srt"
 mv "$work/github-dark.gif" "$out/show-must-go-on-demo.gif"
 mv "$work/github-dark.mp4" "$out/show-must-go-on-demo.mp4"
 mv "$work/github-light.mp4" "$out/show-must-go-on-demo-light.mp4"
