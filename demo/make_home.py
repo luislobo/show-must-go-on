@@ -10,6 +10,9 @@ Creates, under <demo-home>:
   .codex/sessions/YYYY/MM/DD/  a Codex rollout
   .ai/sessions.jsonl           cached summaries for some sessions, so the
                                rest are summarised live by demo/bin/claude
+
+Claude sessions also get the agent's own title: the one it picks (an
+ai-title record), and for some a name set with /rename (custom-title).
 """
 
 import json
@@ -92,6 +95,18 @@ SESSIONS = [
       "Good, commit it"]),
 ]
 
+# project → (title the agent picked, name set with /rename or None). The
+# picker shows it before the AI topic; docs-site's says the same as its
+# topic, so it is shown once. Codex sessions have no such title.
+AGENT_TITLES = {
+    "storefront": ("Three-step checkout", "checkout v2"),
+    "payments-api": ("Webhook retries flooding slow endpoints", None),
+    "infra": ("Split root Terraform module", "terraform split"),
+    "docs-site": ("Docs search index", None),
+    "data-pipeline": ("Nightly Parquet export", None),
+    "design-system": ("Product grid layout shift", None),
+}
+
 # branch → (number, state, title) for the gh stand-in
 PRS = {
     "feature/checkout-redesign": (142, "OPEN", "Redesign checkout as three steps"),
@@ -154,6 +169,13 @@ def main(home: Path) -> None:
                            else {"role": "assistant", "content": [{"type": "text", "text": text}]})
                     f.write(json.dumps({"type": role, "timestamp": iso(ts), "cwd": str(cwd),
                                         "sessionId": sid, "message": msg}) + "\n")
+                picked, renamed = AGENT_TITLES.get(proj, (None, None))
+                if picked:
+                    f.write(json.dumps({"type": "ai-title", "aiTitle": picked,
+                                        "sessionId": sid}) + "\n")
+                if renamed:
+                    f.write(json.dumps({"type": "custom-title", "customTitle": renamed,
+                                        "sessionId": sid}) + "\n")
         else:
             path = (home / ".codex" / "sessions" / f"{first:%Y}" / f"{first:%m}" / f"{first:%d}"
                     / f"rollout-{first:%Y-%m-%dT%H-%M-%S}-{sid}.jsonl")
