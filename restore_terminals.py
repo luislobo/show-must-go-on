@@ -62,7 +62,9 @@ class Session:
     interrupted: bool = False       # last turn is assistant/tool — user wasn't replied to OR agent was mid-task
     closed_with_clear: bool = False # last user action was /clear — session was abandoned, not paused
     last_hour_transcript: str = ""  # populated lazily for summarization
-    topic: str | None = None        # short label from AI (used as window title)
+    agent_title: str | None = None  # the agent's own name for it: /rename, else the title it chose
+    renamed: bool = False           # agent_title was set with /rename
+    topic: str | None = None        # short label from AI
     slug: str | None = None         # short kebab-case slug from AI (used for tmux window/pane names)
     abstract: str | None = None     # 1-2 sentence summary from AI
     summary_error: str | None = None
@@ -79,6 +81,7 @@ class Session:
     terminal: str | None = None     # host terminal at snapshot time: ghostty, terminal, terminator, tmux, ...
     window_id: str | None = None    # macOS terminal window id at snapshot time
     tab_index: int | None = None    # 1-based tab within window_id at snapshot time
+    skip_permissions: bool = False  # resume with the agent's permission checks off
 
     @property
     def span_minutes(self) -> float:
@@ -169,6 +172,7 @@ def parse_claude(path: Path) -> Session | None:
     last_user_ts: datetime | None = None
     last_assistant_ts: datetime | None = None
     recent_lines: list[tuple[datetime, str, str]] = []  # (ts, role, text)
+    custom_title = ai_title = None   # the last of each wins, as in the agent
     try:
         with path.open() as f:
             for line in f:
@@ -191,7 +195,11 @@ def parse_claude(path: Path) -> Session | None:
                 t = d.get("type")
                 msg = d.get("message") if isinstance(d.get("message"), dict) else None
                 role = (msg or {}).get("role") if msg else None
-                if t == "user" and role == "user":
+                if t == "custom-title" and d.get("customTitle"):
+                    custom_title = d["customTitle"]
+                elif t == "ai-title" and d.get("aiTitle"):
+                    ai_title = d["aiTitle"]
+                elif t == "user" and role == "user":
                     text = _claude_user_text(msg) or ""
                     # skip pure tool_result payloads (Claude also uses role=user for those)
                     if text.strip():
@@ -224,6 +232,8 @@ def parse_claude(path: Path) -> Session | None:
     if not s.last_ts or not s.cwd:
         return None
     s.first_user_prompt = s.first_user_prompt or first_command
+    s.agent_title = custom_title or ai_title
+    s.renamed = bool(custom_title)
     # interrupted: last meaningful turn is assistant (agent was mid-reply when killed)
     if last_assistant_ts and last_user_ts and last_assistant_ts > last_user_ts:
         s.interrupted = True
@@ -792,11 +802,27 @@ def search_relevance(s: Session) -> float:
 # ---------------------------------------------------------------------------
 
 
+# Each agent's option for running with no permission prompts, for
+# --dangerously-skip-permissions.
+SKIP_PERMISSIONS_FLAG = {
+    "claude": "--dangerously-skip-permissions",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",
+}
+
+
+def skip_permissions(sessions: list[Session], on: bool) -> None:
+    """Mark the sessions to resume with permission checks off. Set before the
+    picker, so its details page shows the command that will run."""
+    for s in sessions:
+        s.skip_permissions = on
+
+
 def resume_cmd(s: Session) -> str:
+    skip = f" {SKIP_PERMISSIONS_FLAG[s.tool]}" if s.skip_permissions else ""
     if s.tool == "claude":
-        return f"claude --resume {s.session_id}"
-    # codex: resume accepts the rollout path
-    return f"codex resume {shlex.quote(str(s.path))}"
+        return f"claude --resume {s.session_id}{skip}"
+    # codex: resume accepts the rollout path; options go before it
+    return f"codex resume{skip} {shlex.quote(str(s.path))}"
 
 
 def terminator_argv(s: Session, title: str) -> list[str]:
@@ -819,13 +845,27 @@ def _i3_move_command(wid: str, workspace: str) -> str:
     return f'[id={wid}] move to workspace "{name}"'
 
 
+def display_title(s: Session) -> str:
+    """The session's name: the agent's own title first, as the agent shows it."""
+    return s.agent_title or s.topic or s.first_user_prompt or "(empty)"
+
+
+def _second_title(s: Session) -> str | None:
+    """restore's topic, shown beside the agent's title unless it says the same."""
+    if not s.agent_title or not s.topic:
+        return None
+    if s.topic.strip().casefold() == s.agent_title.strip().casefold():
+        return None
+    return s.topic
+
+
 def launch(sessions: list[Session]) -> int:
     """Spawn one detached Terminator window per session. Returns count launched."""
     import time
     launched = 0
     procs: list[tuple[Session, subprocess.Popen, str]] = []  # (session, proc, title)
     for s in sessions:
-        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        title = _truncate(display_title(s), 60)
         argv = terminator_argv(s, title)
         try:
             p = subprocess.Popen(
@@ -1225,7 +1265,7 @@ def launch_terminal_app(sessions: list[Session]) -> int:
     argv: list[str] = []
     lines: list[str] = []
     for s in sessions:
-        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        title = _truncate(display_title(s), 60)
         argv += [_shell_line(s), title]
         lines.append(f"window {short_cwd(s.cwd)}  —  {title}")
     n, err = _osascript_progress(_TERMINAL_LAUNCH, argv)
@@ -1284,9 +1324,12 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
         head = (f"\n  Would open {len(sessions)} Terminator window(s)  "
                 f"(--dry-run; i3 will tile them):\n")
     print(head)
+    if any(s.skip_permissions for s in sessions):
+        print(f"  {paint('--dangerously-skip-permissions:', 'warn')} every session runs with its "
+              f"agent's permission checks off\n")
     for i, s in enumerate(sessions, 1):
         flag = " [INTERRUPTED]" if s.interrupted else ""
-        title = _truncate(s.topic or s.first_user_prompt or "(empty)", 60)
+        title = _truncate(display_title(s), 60)
         print(f"  ── window {i}/{len(sessions)}{flag} ──")
         print(f"    tool    : {s.tool}")
         print(f"    cwd     : {short_cwd(s.cwd)}")
@@ -1399,6 +1442,19 @@ def _claude_pid_record(pid: int, started: float | None = None) -> dict | None:
     return rec
 
 
+def _claude_pid_record_pids() -> list[int]:
+    """Pids that have a record in CLAUDE_PID_DIR, live or left behind."""
+    try:
+        names = [p.stem for p in CLAUDE_PID_DIR.glob("*.json")]
+    except OSError:
+        return []
+    return [int(n) for n in names if n.isdigit()]
+
+
+def _claude_writes_pid_records() -> bool:
+    return bool(_claude_pid_record_pids())
+
+
 def _claude_jsonl_path(session_id: str, cwd: str | None) -> Path | None:
     if cwd:
         p = CLAUDE_ROOT / _encode_cwd_to_project(cwd) / f"{session_id}.jsonl"
@@ -1415,14 +1471,29 @@ def _find_claude_session(pid: int, argv: list[str], cwd: str,
     # 1. Claude Code's per-pid record, when this version writes one
     if rec:
         return rec["sessionId"]
-    # 2. If --resume <id> is in argv, take it directly
+    # 2. The id on the command line. Arguments after "--" belong to a command
+    # this process hosts (Claude's background pty host), which is found on
+    # its own. --session-id names the session a --fork-session writes to;
+    # --resume takes an id or a transcript path.
+    if "--" in argv:
+        argv = argv[:argv.index("--")]
+    flags: dict[str, str] = {}
     for i, arg in enumerate(argv):
-        if arg == "--resume" and i + 1 < len(argv):
-            return argv[i + 1]
-        if arg.startswith("--resume="):
-            return arg.split("=", 1)[1]
-    # 3. If --continue, it's the most recent session in project dir
-    # 4. Fallback: map cwd → project dir → most recent JSONL
+        name, eq, value = arg.partition("=")
+        if name in ("--session-id", "--resume"):
+            if not eq:
+                value = argv[i + 1] if i + 1 < len(argv) else ""
+            flags.setdefault(name, value)
+    for name in ("--session-id", "--resume"):
+        value = flags.get(name)
+        if value and not value.startswith("-"):
+            return Path(value).stem if value.endswith(".jsonl") else value
+    # 3. Newest transcript in the folder's project dir: a guess, made only when
+    # Claude Code writes no pid records. When it does, a process without one
+    # is not a session (`claude agents`, `claude mcp ...`), and guessing would
+    # pin someone else's session on it.
+    if _claude_writes_pid_records():
+        return None
     encoded = _encode_cwd_to_project(cwd)
     project_dir = CLAUDE_ROOT / encoded
     if project_dir.is_dir():
@@ -1855,6 +1926,9 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
     results: dict[str, dict] = {}  # keyed by session_id to dedupe
     procs = _list_procs()
 
+    # a process with a pid record is a claude session whatever its name; the
+    # installed binary runs as .../claude/versions/<version>
+    recorded = set(_claude_pid_record_pids())
     candidates: list[tuple[Proc, str]] = []
     for p in procs.values():
         if p.uid != my_uid or not p.argv:
@@ -1867,6 +1941,8 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
             tool = "codex"
         elif exe in ("node", "bash") and any("codex" in a for a in p.argv[1:3]):
             tool = "codex"
+        elif p.pid in recorded:
+            tool = "claude"
         else:
             continue
         candidates.append((p, tool))
@@ -1881,6 +1957,8 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
         jsonl_path: str | None = None
         if tool == "claude":
             rec = _claude_pid_record(p.pid, p.start)
+            if not rec and os.path.basename(p.argv[0]) != "claude":
+                continue   # its record was left behind by an earlier process
             session_id = _find_claude_session(p.pid, p.argv, cwd, rec)
             if session_id:
                 found = _claude_jsonl_path(session_id, (rec or {}).get("cwd") or cwd)
@@ -1926,6 +2004,20 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
             titles={pid: t for pid, t in titles.items() if t},
         )
     return entries
+
+
+def drop_running(sessions: list[Session]) -> list[Session]:
+    """Leave out sessions already open somewhere. Resuming one again starts a
+    second agent writing to the same transcript. A running codex session is
+    known by its rollout file's name, a parsed one by the id inside it, so
+    both are compared."""
+    running = {r["session_id"] for r in snapshot_active(with_windows=False)}
+    kept = [s for s in sessions
+            if s.session_id not in running and s.path.stem not in running]
+    skipped = len(sessions) - len(kept)
+    if skipped:
+        print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
+    return kept
 
 
 def _placement_label(entry: dict) -> str:
@@ -2128,6 +2220,7 @@ def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
         st = (s.pr_state or "")[:1]
         pr_marker = f" #{s.pr_number}{st}"
     label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
+    second = _second_title(s)
     n_hits = len(s.search_matches)
     hits = f" ({n_hits} hit{'' if n_hits == 1 else 's'})" if n_hits else ""
     segs = [
@@ -2144,7 +2237,21 @@ def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
         segs.append((hits, "warn"))
     used = sum(len(t) for t, _ in segs)
     remaining = max(10, width - used - 7)
-    segs.append((f"  {_truncate(label, remaining)}", ""))
+    if not s.agent_title:
+        segs.append((f"  {_truncate(label, remaining)}", ""))
+        return segs
+    # the agent's title first; restore's topic after it, in what room is left.
+    # When both do not fit, the topic gives way first, down to 12 characters;
+    # past that the agent's title is cut too, keeping at least half the room.
+    room_for_first = remaining
+    if second:
+        room_for_first = max(10, remaining // 2, remaining - 3 - min(len(second), 12))
+    first = _truncate(s.agent_title, room_for_first)
+    segs.append(("  ", ""))
+    segs.append((first, "bold"))
+    room = remaining - len(first) - 3
+    if second and room >= 8:
+        segs.append((f" · {_truncate(second, room)}", ""))
     return segs
 
 
@@ -2179,10 +2286,16 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
         for line in wrap(text, width - 4, max_lines):
             out.append([("   " + line, role)])
 
-    for line in wrap(s.topic or s.first_user_prompt or "(no prompt)", width - 2, 2):
+    for line in wrap(s.agent_title or s.topic or s.first_user_prompt or "(no prompt)",
+                     width - 2, 2):
         out.append([(f" {line}", "bold")])
+    if _second_title(s):
+        for line in wrap(_second_title(s), width - 2, 2):
+            out.append([(f" {line}", "")])
 
     heading("Session")
+    if s.agent_title:
+        field("named by", "you, with /rename" if s.renamed else "the agent")
     field("tool", s.tool)
     field("id", s.session_id)
     if s.interrupted:
@@ -2485,6 +2598,11 @@ def main() -> int:
                          "'v' = stacked top/bottom")
     ap.add_argument("--byobu-session", default="restore",
                     help="byobu only: tmux session name to build into (default: restore)")
+    ap.add_argument("--dangerously-skip-permissions", action="store_true",
+                    help="resume every session with its agent's permission checks off: claude "
+                         "--dangerously-skip-permissions, codex "
+                         "--dangerously-bypass-approvals-and-sandbox. Only where the agents "
+                         "cannot do harm, such as a sandbox or a throwaway VM")
     ap.add_argument("--save", action="store_true",
                     help="snapshot currently running sessions to ~/.ai/snapshots/")
     ap.add_argument("--load", nargs="?", const="latest", default=None, metavar="FILE",
@@ -2539,20 +2657,15 @@ def main() -> int:
             return 1
         print(f"  {paint('loaded', 'ok')} {paint(len(entries), 'bold')} session(s) "
               f"from {short_cwd(str(snap_path))}")
-        # Skip sessions already running
-        already_running = {r["session_id"] for r in snapshot_active(with_windows=False)}
-        before = len(entries)
-        entries = [e for e in entries if e["session_id"] not in already_running]
-        skipped = before - len(entries)
-        if skipped:
-            print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
-        if not entries:
-            print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
-            return 0
         ranked = snapshot_to_sessions(entries)
         if not ranked:
             print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
+        ranked = drop_running(ranked)
+        if not ranked:
+            print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
+            return 0
+        skip_permissions(ranked, args.dangerously_skip_permissions)
         # fail on a layout no session can use before summaries, PRs and the picker
         _check_layout(ap, args, _target_groups(args.target, ranked))
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
@@ -2624,6 +2737,8 @@ def main() -> int:
         ranked = rank(filtered)
         print_stats(all_found, filtered, ranked)
 
+    ranked = drop_running(ranked)
+    skip_permissions(ranked, args.dangerously_skip_permissions)
     # fail on a layout no session can use before summaries, PRs and the picker
     _check_layout(ap, args, _target_groups(args.target, ranked))
     cache_path = Path(args.cache).expanduser()

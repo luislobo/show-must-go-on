@@ -150,12 +150,31 @@ class ClaudeSessionLookup(unittest.TestCase):
     def test_pid_record_for_another_pid_is_ignored(self):
         (self.pid_dir / "42.json").write_text(json.dumps({"pid": 7, "sessionId": "old"}))
         self.assertIsNone(rt._claude_pid_record(42))
-        self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a", None), "newest")
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a", None), "x")
 
     def test_argv_resume_then_newest_file(self):
         self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "x"], "/w/a"), "x")
         self.assertEqual(rt._find_claude_session(42, ["claude", "--resume=y"], "/w/a"), "y")
         self.assertEqual(rt._find_claude_session(42, ["claude"], "/w/a"), "newest")
+
+    def test_no_guess_when_claude_writes_pid_records(self):
+        # `claude agents` has no record of its own; it is not the newest session in its folder
+        (self.pid_dir / "7.json").write_text(json.dumps({"pid": 7, "sessionId": "other"}))
+        self.assertIsNone(rt._find_claude_session(42, ["claude", "agents"], "/w/a"))
+        self.assertIsNone(rt._find_claude_session(42, ["claude"], "/w/a"))
+
+    def test_fork_names_its_session_and_a_resume_path_its_file(self):
+        argv = ["/x/claude/versions/2.1.312", "--session-id", "new", "--fork-session",
+                "--resume", "/p/-w-a/old.jsonl"]
+        self.assertEqual(rt._find_claude_session(42, argv, "/w/a"), "new")
+        self.assertEqual(rt._find_claude_session(42, ["claude", "--resume", "/p/-w-a/old.jsonl"], "/w/a"),
+                         "old")
+
+    def test_hosted_command_line_is_not_the_hosts_session(self):
+        (self.pid_dir / "7.json").write_text(json.dumps({"pid": 7, "sessionId": "other"}))
+        argv = ["claude", "--bg-pty-host", "/tmp/s.sock", "210", "60", "--",
+                "/x/claude/versions/2.1.312", "--session-id", "new"]
+        self.assertIsNone(rt._find_claude_session(42, argv, "/w/a"))
 
     def test_record_older_than_the_process_is_ignored(self):
         started = 1_800_000_000.0
@@ -517,6 +536,25 @@ class PromptText(unittest.TestCase):
         s = rt.parse_claude(path)
         self.assertEqual((s.first_user_prompt, s.last_user_prompt), ("/mcp", "/model"))
 
+    def test_agent_title_prefers_rename_and_the_last_of_each(self):
+        path = self.write([({}, "user", "hello")])
+        with path.open("a") as f:
+            for rec in ({"type": "ai-title", "aiTitle": "First guess"},
+                        {"type": "ai-title", "aiTitle": "Loader retries"},
+                        {"type": "custom-title", "customTitle": "my name"},
+                        {"type": "custom-title", "customTitle": "loader v2"}):
+                f.write(json.dumps({**rec, "sessionId": "s"}) + "\n")
+        s = rt.parse_claude(path)
+        self.assertEqual((s.agent_title, s.renamed), ("loader v2", True))
+
+    def test_title_the_agent_chose(self):
+        path = self.write([({}, "user", "hello")])
+        with path.open("a") as f:
+            f.write(json.dumps({"type": "ai-title", "aiTitle": "Loader retries"}) + "\n")
+        s = rt.parse_claude(path)
+        self.assertEqual((s.agent_title, s.renamed), ("Loader retries", False))
+        self.assertIsNone(rt.parse_claude(self.write([({}, "user", "hi")])).agent_title)
+
 
 class PickerRows(unittest.TestCase):
     def test_row_pieces_and_roles(self):
@@ -547,6 +585,33 @@ class PickerRows(unittest.TestCase):
         s = session(topic="x" * 200)
         self.assertLessEqual(len(rt._row_text(s, 80)), 80)
 
+    def test_agent_title_comes_first_then_the_topic(self):
+        s = session(cwd="/w/a", agent_title="loader v2", topic="Fix the loader retries")
+        segs = rt._row_segments(s, 120)
+        self.assertIn(("loader v2", "bold"), segs)
+        self.assertTrue(rt._row_text(s, 120).endswith("  loader v2 · Fix the loader retries"))
+
+    def test_same_title_twice_is_shown_once(self):
+        s = session(cwd="/w/a", agent_title="Fix the loader", topic="fix the loader ")
+        self.assertTrue(rt._row_text(s, 120).endswith("  Fix the loader"))
+
+    def test_long_agent_title_is_kept_whole_when_the_row_has_room(self):
+        s = session(cwd="/w/a", agent_title="Webhook retries flooding slow endpoints",
+                    topic="Webhook retry backoff fix")
+        self.assertTrue(rt._row_text(s, 100).endswith(
+            "  Webhook retries flooding slow endpoints · Webhook retry backoff fix"))
+        # short of room, the topic is cut before the agent's title
+        text = rt._row_text(s, 85)
+        self.assertIn("  Webhook retries flooding slow endpoints · Webhook", text)
+        self.assertTrue(text.endswith("…"), text)
+
+    def test_both_titles_fit_the_width(self):
+        s = session(cwd="/w/a", agent_title="a" * 90, topic="b" * 90)
+        for width in (60, 80, 120):
+            text = rt._row_text(s, width)
+            self.assertLessEqual(len(text), width)
+            self.assertIn("a" * 10, text)
+
 
 class DetailsPage(unittest.TestCase):
     def details(self, s, width=100):
@@ -574,6 +639,21 @@ class DetailsPage(unittest.TestCase):
         self.assertEqual(roles["assistant"], "accent")
         status = [line for line in lines if line and line[0][0].strip() == "status"][0]
         self.assertEqual(status[1][1], "warn")
+
+    def test_both_titles_head_the_page(self):
+        s = session(agent_title="loader v2", renamed=True, topic="Fix the loader retries")
+        _, text = self.details(s)
+        self.assertEqual(text[:2], [" loader v2", " Fix the loader retries"])
+        self.assertIn("you, with /rename", "\n".join(text))
+        s = session(agent_title="Loader retries", topic="loader retries")
+        _, text = self.details(s)
+        self.assertEqual(text[:2], [" Loader retries", ""])
+        self.assertIn("the agent", "\n".join(text))
+
+    def test_window_title_is_the_agents_title(self):
+        self.assertEqual(rt.display_title(session(agent_title="loader v2", topic="t")), "loader v2")
+        self.assertEqual(rt.display_title(session(topic="t")), "t")
+        self.assertEqual(rt.display_title(session(first_user_prompt="p")), "p")
 
     def test_lines_fit_and_long_text_is_capped(self):
         s = session(first_user_prompt="word " * 400, last_user_prompt="x")
@@ -677,6 +757,64 @@ class EarlyLayoutCheck(unittest.TestCase):
         picker.assert_not_called()
 
 
+class SkipPermissions(unittest.TestCase):
+    """--dangerously-skip-permissions resumes each agent with its own option for it."""
+
+    def test_off_by_default(self):
+        self.assertEqual(rt.resume_cmd(session(sid="abc")), "claude --resume abc")
+        s = session(sid="r1")
+        s.tool, s.path = "codex", Path("/x/r 1.jsonl")
+        self.assertEqual(rt.resume_cmd(s), "codex resume '/x/r 1.jsonl'")
+
+    def test_each_agent_gets_its_own_option(self):
+        c = session(sid="abc", skip_permissions=True)
+        self.assertEqual(rt.resume_cmd(c), "claude --resume abc --dangerously-skip-permissions")
+        x = session(sid="r1", skip_permissions=True)
+        x.tool, x.path = "codex", Path("/x/r 1.jsonl")
+        # before the rollout path, where an option always parses
+        self.assertEqual(rt.resume_cmd(x),
+                         "codex resume --dangerously-bypass-approvals-and-sandbox '/x/r 1.jsonl'")
+
+    def test_every_launcher_carries_it(self):
+        s = session(sid="abc", cwd="/opt/a", skip_permissions=True)
+        self.assertIn("claude --resume abc --dangerously-skip-permissions",
+                      rt.terminator_argv(s, "t")[-1])
+        self.assertTrue(rt._shell_line(s).endswith("--dangerously-skip-permissions"))
+
+    def run_main(self, argv, home):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["restore", *argv]), \
+             mock.patch.multiple(rt, CLAUDE_ROOT=home / "projects", CODEX_ROOT=home / "codex",
+                                 SNAPSHOTS_DIR=home / "snapshots", IS_MACOS=False), \
+             mock.patch.object(rt, "enrich_sessions"), \
+             mock.patch.object(sys, "stdout", out):
+            self.assertEqual(rt.main(), 0)
+        return out.getvalue()
+
+    def test_the_plan_shows_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(os.path.realpath(d))
+            work = home / "w"
+            work.mkdir()
+            proj = home / "projects" / rt._encode_cwd_to_project(str(work))
+            proj.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            with (proj / "s1.jsonl").open("w") as f:
+                for i in range(12):
+                    ts = (now - timedelta(minutes=60 - i * 5)).isoformat()
+                    role = "user" if i % 2 == 0 else "assistant"
+                    content = f"prompt {i}" if role == "user" else [{"type": "text", "text": "ok"}]
+                    f.write(json.dumps({"type": role, "timestamp": ts, "cwd": str(work),
+                                        "message": {"role": role, "content": content}}) + "\n")
+            plain = self.run_main(["--no-pick", "--no-gh", "--no-ai"], home)
+            skip = self.run_main(["--no-pick", "--no-gh", "--no-ai",
+                                  "--dangerously-skip-permissions"], home)
+        self.assertIn("claude --resume s1", plain)
+        self.assertNotIn("dangerously", plain)
+        self.assertIn("claude --resume s1 --dangerously-skip-permissions", skip)
+        self.assertIn("permission checks off", skip)
+
+
 class SnapshotCompat(unittest.TestCase):
     def test_linux_snapshot_without_new_fields_loads(self):
         with tempfile.TemporaryDirectory() as d:
@@ -688,6 +826,72 @@ class SnapshotCompat(unittest.TestCase):
         self.assertEqual(s.workspace, " 1 ")
         self.assertIsNone(s.terminal)
         self.assertIsNone(s.window_id)
+
+
+class RunningSessions(unittest.TestCase):
+    """What restore treats as already running, and leaves out of the picker."""
+
+    def test_recorded_process_counts_whatever_its_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            pid_dir = Path(d)
+            (pid_dir / "50.json").write_text(json.dumps({"pid": 50, "sessionId": "forked"}))
+            procs = {50: proc(50, 1, "/x/claude/versions/2.1.312 --session-id forked", uid=os.getuid()),
+                     51: proc(51, 1, "claude agents", uid=os.getuid())}
+            with mock.patch.multiple(rt, CLAUDE_PID_DIR=pid_dir, CLAUDE_ROOT=pid_dir / "none"), \
+                    mock.patch.object(rt, "_list_procs", return_value=procs), \
+                    mock.patch.object(rt, "_proc_cwds", return_value={50: "/w/a", 51: "/w/a"}):
+                found = rt.snapshot_active(with_windows=False)
+        self.assertEqual([(e["pid"], e["session_id"]) for e in found], [(50, "forked")])
+
+    def test_left_behind_record_does_not_make_a_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            pid_dir = Path(d)
+            (pid_dir / "60.json").write_text(json.dumps(
+                {"pid": 60, "sessionId": "gone", "startedAt": 1_000_000_000_000}))
+            procs = {60: proc(60, 1, "/usr/bin/python3 server.py --session-id x", uid=os.getuid())}
+            procs[60].start = 1_800_000_000.0   # started long after the record
+            with mock.patch.multiple(rt, CLAUDE_PID_DIR=pid_dir, CLAUDE_ROOT=pid_dir / "none"), \
+                    mock.patch.object(rt, "_list_procs", return_value=procs), \
+                    mock.patch.object(rt, "_proc_cwds", return_value={60: "/w/a"}):
+                self.assertEqual(rt.snapshot_active(with_windows=False), [])
+
+    def test_running_sessions_are_left_out(self):
+        ss = [session("a"), session("b"), session("c")]
+        with mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "b"}]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            kept = rt.drop_running(ss)
+        self.assertEqual([s.session_id for s in kept], ["a", "c"])
+        self.assertIn("1", out.getvalue())
+        self.assertIn("already-running", out.getvalue())
+
+    def test_running_codex_session_is_known_by_its_rollout_file(self):
+        now = datetime.now(timezone.utc)
+        rollout = "rollout-2026-10-28T09-00-00-0199aaaa"
+        s = rt.Session(tool="codex", session_id="0199aaaa", path=Path(f"/c/{rollout}.jsonl"),
+                       cwd="/w/a", first_ts=now, last_ts=now)
+        with mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": rollout}]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(rt.drop_running([s]), [])
+
+    def test_picker_never_sees_a_running_session(self):
+        ss = [session("a"), session("b")]
+        shown = []
+        def pick(items):   # returns None: cancelled, so nothing launches
+            shown.extend(s.session_id for s in items)
+        with mock.patch.object(rt, "discover", return_value=ss), \
+                mock.patch.object(rt, "apply_filters", side_effect=lambda found, **kw: found), \
+                mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "a"}]), \
+                mock.patch.object(rt, "enrich_sessions"), \
+                mock.patch.object(rt, "tui_pick", side_effect=pick), \
+                mock.patch.object(rt, "print_stats"), \
+                tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(sys, "argv", ["restore", "--no-ai", "--no-gh",
+                                                "--cache", f"{d}/cache.json"]), \
+                mock.patch("sys.stdin.isatty", return_value=True), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                mock.patch.object(out, "isatty", return_value=True, create=True):
+            rt.main()
+        self.assertEqual(shown, ["b"])
 
 
 class SnapshotLiveProcess(unittest.TestCase):

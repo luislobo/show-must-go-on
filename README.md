@@ -28,10 +28,11 @@ restore --execute        # recover from session history on disk
 
 - **Session discovery** — scans `~/.claude/projects/` and `~/.codex/sessions/` for all session history
 - **Live snapshot** (`--save`) — detects running claude/codex sessions (via `/proc` on Linux, `ps` and `lsof` on macOS), captures their session IDs, cwds, **i3 workspace names** or **Ghostty/Terminal.app window and tab**, and **window titles**
-- **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused
+- **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused. When Claude Code writes these records, a `claude` process without one (`claude agents`, `claude mcp …`) is not counted as a session
 - **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
 - **Smart filtering** — configurable lookback window, minimum activity thresholds, dead-cwd detection
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
+- **Agent titles** — the name Claude Code gives a session, or the one you set with `/rename`, is shown first in the picker, the details page and the plan, with the AI topic beside it (once, when the two say the same); it is also the window title restore opens. Codex sessions show the AI topic only
 - **Persistent cache** — summaries are saved to `~/.ai/sessions.jsonl`; subsequent runs reuse them unless the session has new activity
 - **Content search** — `--find` searches all session transcripts for a branch name, repo, Jira ticket, or any regex
 - **Relevance ranking** — search results ranked by match count, recency, user-message weight, and git branch match
@@ -43,7 +44,7 @@ restore --execute        # recover from session history on disk
 - **Ghostty backend** (macOS) — `--target=ghostty` opens one Ghostty window per session through Ghostty's AppleScript support; splits, tabs, or the saved windows and tabs on request
 - **Terminal.app backend** (macOS) — `--target=terminal` opens one Terminal.app window per session
 - **Byobu/tmux backend** — `--target=byobu` rebuilds sessions into panes/windows for SSH or non-GUI machines
-- **Duplicate detection** — `--load` checks running processes for already-running sessions and skips them
+- **Duplicate detection** — sessions that are already running are left out of the picker and the plan in every mode (`--load`, the normal picker, `--find`), so a session is never resumed twice; a second copy would write to the same transcript
 - **Git metadata** — resolves each session's working directory to its git remote and current branch
 - **GitHub PR metadata** — when `gh` is installed and authenticated, shows PR number, state, title, and URL for matching branches
 - **Fast search prefilter** — when `rg` is installed, `--find` narrows candidate JSONL files before Python parsing
@@ -249,6 +250,15 @@ restore --find feature/my-branch --execute
 restore --find 'haproxy.*migration' 30
 ```
 
+### Resume without permission prompts
+
+```bash
+# Resume every session with its agent's permission checks off
+restore --load --dangerously-skip-permissions --execute
+```
+
+Each agent gets its own option for it: `claude --resume <id> --dangerously-skip-permissions` and `codex resume --dangerously-bypass-approvals-and-sandbox <rollout>`. The agents then run commands and edit files without asking, so use it only where they cannot do harm, such as a sandbox or a throwaway VM. It works with `--load`, `--find` and history alike, and the plan says when it is on. It is off unless you pass it, every time: a snapshot does not record it.
+
 ### Standalone search (no TUI, just results)
 
 ```bash
@@ -292,18 +302,18 @@ The current row has a `▶` in the gutter and bold text. Colours come from your 
 1. **Scan** — walks `~/.claude/projects/*/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`
 2. **Parse** — extracts timestamps, message counts, user prompts, cwd, and interrupted status from each JSONL file
 3. **Filter** — removes sessions outside the lookback window, below activity thresholds, or with dead cwds
-4. **Rank** — by last activity (normal mode) or by relevance score (search mode)
+4. **Rank** — by last activity (normal mode) or by relevance score (search mode), leaving out sessions that are already running
 5. **Summarize** — feeds project context (README.md, CLAUDE.md, etc.) + last-hour transcript to `claude -p`, caches the result
 6. **Pick** — curses TUI for interactive selection
 7. **Launch** — opens each session with the chosen `--target`:
-   - `terminator`: spawns `terminator -u --working-directory <cwd> --title <topic> -x bash -lc '<tool> --resume <id>; exec $SHELL'`
+   - `terminator`: spawns `terminator -u --working-directory <cwd> --title <title> -x bash -lc '<tool> --resume <id>; exec $SHELL'`
    - `ghostty`: creates Ghostty windows (or splits, or tabs) through AppleScript, each starting in `<cwd>` and typing `cd -- <cwd> && <tool> --resume <id>` into your shell
    - `terminal`: runs `cd -- <cwd> && <tool> --resume <id>` with Terminal.app's `do script`, one window per session
    - `byobu`: builds a tmux session (see below)
 
 ### Snapshot mode (--save / --load)
 
-1. **Save** — lists running `claude`/`codex` processes (`/proc` on Linux, `ps` + `lsof` on macOS), resolves each to its session ID (via `~/.claude/sessions/<pid>.json`, `--resume` args, the process's open files, or cwd-to-project mapping), and records where it runs: the i3 workspace and window title via `i3-msg -t get_tree` + `wmctrl -lp` on Linux, or the Ghostty / Terminal.app window and tab via AppleScript on macOS
+1. **Save** — lists running `claude`/`codex` processes (`/proc` on Linux, `ps` + `lsof` on macOS), resolves each to its session ID (via `~/.claude/sessions/<pid>.json`, the `--session-id` or `--resume` argument, the process's open files, or, only for Claude Code versions that write no pid records, the newest transcript for its folder), and records where it runs: the i3 workspace and window title via `i3-msg -t get_tree` + `wmctrl -lp` on Linux, or the Ghostty / Terminal.app window and tab via AppleScript on macOS
 2. **Load** — reads the snapshot, checks which sessions are already running (skips those), parses the JSONL files for metadata, runs through the same summarize/pick/launch pipeline
 3. **Launch** — on Linux, spawns each Terminator window, then uses `i3-msg '[id=<wid>] move to workspace <name>'` to place it on the saved workspace. On macOS, opens the sessions in Ghostty or Terminal.app; `--layout=saved` puts Ghostty sessions back in their saved window and tab
 
@@ -313,7 +323,7 @@ Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`
 
 Each Terminator window:
 - Starts in the session's working directory
-- Has the AI-generated topic as its window title (useful for i3 `for_window` rules)
+- Has the session's title as its window title (the agent's title, else the AI topic; useful for i3 `for_window` rules)
 - Gets moved to its saved i3 workspace (exact name match, including spaces)
 - Resumes the AI agent session
 - Falls back to a shell when the agent exits
@@ -376,9 +386,22 @@ tests/                        # stdlib unittest suites
 
 ## Demo video
 
-`demo/render.sh <out-dir>` records a 45-second walkthrough and renders it as an MP4 in GitHub Dark and GitHub Light colours, plus a GIF. It needs `agg` (`brew install agg`) and `ffmpeg`.
+`demo/render.sh <out-dir>` records a one-minute walkthrough and renders it as a narrated MP4 in GitHub Dark and GitHub Light colours, plus a silent GIF. It needs `agg` (`brew install agg`), `ffmpeg`, [`uv`](https://docs.astral.sh/uv/) and the Kokoro model files.
 
-Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; and `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast. Re-run it after changing the interface so the video stays current, and copy the GIF over the one at the top of this README:
+The narration is voiced by [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) v1.0 (82M parameters, Apache 2.0), run on your machine, with the voice `af_heart` at speed 1.1; nothing is sent anywhere. `demo/voice.py` declares its own packages, so `uv run` installs them on first use, but the two model files have to be fetched once into `~/.local/share/kokoro` (or `$KOKORO_HOME`):
+
+```bash
+mkdir -p ~/.local/share/kokoro && cd ~/.local/share/kokoro
+base=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+curl -fLO "$base/kokoro-v1.0.onnx" && curl -fLO "$base/voices-v1.0.bin"
+shasum -a 256 kokoro-v1.0.onnx voices-v1.0.bin
+# 7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5  kokoro-v1.0.onnx
+# bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d  voices-v1.0.bin
+```
+
+The lines are the `say` steps in `demo/record.py`, and `SPOKEN` there respells the words the voice gets wrong. They are voiced before recording, and the recorder waits for each line to finish before the next scene, so the voice always fits; the GIF shortens those pauses to 4 seconds. The speech is normalised to −16 LUFS, and each MP4 also carries the lines as English subtitles (`show-must-go-on-demo.srt` beside them). `SMGO_VOICE` and `SMGO_SPEED` pick another voice and speed.
+
+Everything in it is fictional. `demo/make_home.py` builds a home folder with made-up projects, git branches and Claude Code and Codex sessions; `demo/bin/` holds stand-ins for `claude -p` and `gh`, so the summaries and PR lookups play out without network calls; `demo/record.py` drives a shell in a pseudo-terminal on a fixed timeline and writes an asciicast; `demo/voice.py` voices the narration with Kokoro; and `demo/narrate.py` mixes the clips into one audio track and writes the subtitles. Re-run it after changing the interface so the video stays current, and copy the GIF over the one at the top of this README:
 
 ```bash
 demo/render.sh demo/out && cp demo/out/show-must-go-on-demo.gif docs/
