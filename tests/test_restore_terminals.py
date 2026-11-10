@@ -944,6 +944,8 @@ class Restart(unittest.TestCase):
         again.assert_not_called()
         code, out, save, again = self.run_restart(["--no-pick", "--execute"], entries, answer="y")
         self.assertEqual(code, 0)
+        self.assertIn("Will restart 1 session(s)", out)
+        self.assertNotIn("--dry-run", out)
         save.assert_called_once()
         [(s, e)] = again.call_args.args[0]
         self.assertEqual((s.session_id, e["terminal_id"]), ("a", "T1"))

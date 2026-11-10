@@ -2820,7 +2820,10 @@ def restart(args, tools: set[str]) -> int:
     if not picked:
         return 0
 
-    print(f"\n  Would restart {len(picked)} session(s) in their own terminal  (--dry-run):\n")
+    if args.execute:
+        print(f"\n  Will restart {len(picked)} session(s) in their own terminal:\n")
+    else:
+        print(f"\n  Would restart {len(picked)} session(s) in their own terminal  (--dry-run):\n")
     if any(s.skip_permissions for s in picked):
         print(f"  {paint('--dangerously-skip-permissions:', 'warn')} every session comes back "
               f"with its agent's permission checks off\n")
