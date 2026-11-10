@@ -71,10 +71,11 @@ class TextFitting(unittest.TestCase):
 
 
 class Tagline(unittest.TestCase):
-    def test_heart_is_the_only_red(self):
+    def test_red_is_only_on_symbols(self):
         self.assertEqual("".join(t for t, _ in termui.TAGLINE).strip(), "Proudly made in Dallas with ♥")
         self.assertEqual([t for t, r in termui.TAGLINE if r == "heart"], ["♥"])
-        self.assertEqual(termui.ROLE_COLORS["heart"], "COLOR_RED")
+        red = {r for r, c in termui.ROLE_COLORS.items() if c == "COLOR_RED"}
+        self.assertEqual(red, {"heart", "alert"})
 
 
 class ImportBesideScript(unittest.TestCase):

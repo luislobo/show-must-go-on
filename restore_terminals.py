@@ -20,8 +20,10 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -82,6 +84,8 @@ class Session:
     window_id: str | None = None    # macOS terminal window id at snapshot time
     tab_index: int | None = None    # 1-based tab within window_id at snapshot time
     skip_permissions: bool = False  # resume with the agent's permission checks off
+    aerospace_workspace: str | None = None  # macOS AeroSpace workspace at snapshot time
+    live: dict | None = None        # its snapshot_active() entry while an agent runs it
 
     @property
     def span_minutes(self) -> float:
@@ -810,6 +814,23 @@ SKIP_PERMISSIONS_FLAG = {
 }
 
 
+def runs_without_checks(tool: str, argv: list[str]) -> bool:
+    """Whether a running agent's command line turned its permission checks off.
+    Only the command line is seen: a mode changed inside the session (Shift+Tab
+    in Claude Code) or set in the agent's settings is not."""
+    args = argv[1:]
+    if SKIP_PERMISSIONS_FLAG.get(tool) in args:
+        return True
+    if tool == "codex":
+        return "--yolo" in args
+    for i, a in enumerate(args):
+        if a == "--permission-mode=bypassPermissions":
+            return True
+        if a == "--permission-mode" and args[i + 1:i + 2] == ["bypassPermissions"]:
+            return True
+    return False
+
+
 def skip_permissions(sessions: list[Session], on: bool) -> None:
     """Mark the sessions to resume with permission checks off. Set before the
     picker, so its details page shows the command that will run."""
@@ -1246,30 +1267,85 @@ def _report_launch(app: str, lines: list[str], opened: int, err: str | None, hin
         print(f"  ✗ {app} opened {opened}/{len(lines)}{why}. {hint}", file=sys.stderr)
 
 
+def _launch_by_window(terminal: str, script: str,
+                      windows: list[tuple[list[str], int, str | None, int]],
+                      ) -> tuple[int, str | None, list[str]]:
+    """Run a launch script, and put each window it makes on its AeroSpace workspace.
+
+    windows holds, per window to make, the script's arguments, how many
+    sessions they open, the workspace, and how many windows AeroSpace will
+    see: one per tab, since it lists each native tab as a window. With no
+    workspace to go to, or no AeroSpace, everything goes in one run.
+    Otherwise one run per window, and the windows that appear in AeroSpace's
+    list after it are the ones it made, and are moved. Returns the sessions
+    opened, the error that stopped a run, and a note per window on where it
+    went."""
+    before = _aerospace_windows(terminal) if any(w[2] for w in windows) else None
+    if before is None:
+        n, err = _osascript_progress(script, [a for argv, *_ in windows for a in argv])
+        return n, err, [""] * len(windows)
+    known = {w["id"] for w in before}
+    opened, notes = 0, []
+    for argv, count, ws, expect in windows:
+        n, err = _osascript_progress(script, argv)
+        opened += n
+        note = ""
+        if n and ws:
+            new: list[dict] = []
+            deadline = time.monotonic() + 5
+            while len(new) < expect and time.monotonic() < deadline:
+                time.sleep(0.2)
+                new = [w for w in _aerospace_windows(terminal) or [] if w["id"] not in known]
+            known |= {w["id"] for w in new}
+            moved = [w for w in new if _aerospace_move(w["id"], ws)]
+            if new and len(moved) == len(new):
+                note = f"  → workspace {ws}"
+            else:
+                note = f"  (not moved to workspace {ws})"
+        notes.append(note)
+        if err or n < count:
+            return opened, err, notes
+    return opened, None, notes
+
+
+def _window_notes(notes: list[str], per_window: list[int]) -> list[str]:
+    """Spread one note per window over its sessions' lines: on the first only."""
+    out: list[str] = []
+    for note, count in zip(notes, per_window):
+        out += [note] + [""] * (count - 1)
+    return out
+
+
 def launch_ghostty(sessions: list[Session], *, layout: str, max_splits: int) -> int:
-    """Open the sessions in Ghostty windows, tabs and splits. Needs Ghostty 1.3+."""
-    argv: list[str] = []
+    """Open the sessions in Ghostty windows, tabs and splits, each window on the
+    AeroSpace workspace of its first session when that was saved. Needs Ghostty 1.3+."""
+    windows: list[tuple[list[str], int, str | None, int]] = []
     lines: list[str] = []
     for s, mode in ghostty_placements(sessions, layout, max_splits):
-        argv += [mode, s.cwd or str(HOME), _shell_line(s)]
+        if mode == "window" or not windows:
+            windows.append(([], 0, s.aerospace_workspace, 0))
+        argv, count, ws, tabs = windows[-1]
+        windows[-1] = (argv + [mode, s.cwd or str(HOME), _shell_line(s)], count + 1, ws,
+                       tabs + (mode != "split"))
         lines.append(f"{mode:<6} {short_cwd(s.cwd)}  —  {_pane_title(s)}")
-    n, err = _osascript_progress(_GHOSTTY_LAUNCH, argv)
-    _report_launch("Ghostty", lines, n, err,
+    n, err, notes = _launch_by_window("ghostty", _GHOSTTY_LAUNCH, windows)
+    notes = _window_notes(notes, [w[1] for w in windows])
+    _report_launch("Ghostty", [line + note for line, note in zip(lines, notes)], n, err,
                    "It needs Ghostty 1.3+ and Automation permission for this terminal "
                    "(System Settings → Privacy & Security → Automation).")
     return n
 
 
 def launch_terminal_app(sessions: list[Session]) -> int:
-    """Open one Terminal.app window per session."""
-    argv: list[str] = []
+    """Open one Terminal.app window per session, on its saved AeroSpace workspace."""
+    windows: list[tuple[list[str], int, str | None, int]] = []
     lines: list[str] = []
     for s in sessions:
         title = _truncate(display_title(s), 60)
-        argv += [_shell_line(s), title]
+        windows.append(([_shell_line(s), title], 1, s.aerospace_workspace, 1))
         lines.append(f"window {short_cwd(s.cwd)}  —  {title}")
-    n, err = _osascript_progress(_TERMINAL_LAUNCH, argv)
-    _report_launch("Terminal", lines, n, err,
+    n, err, notes = _launch_by_window("terminal", _TERMINAL_LAUNCH, windows)
+    _report_launch("Terminal", [line + note for line, note in zip(lines, notes)], n, err,
                    "Check Automation permission "
                    "(System Settings → Privacy & Security → Automation).")
     return n
@@ -1325,7 +1401,7 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
                 f"(--dry-run; i3 will tile them):\n")
     print(head)
     if any(s.skip_permissions for s in sessions):
-        print(f"  {paint('--dangerously-skip-permissions:', 'warn')} every session runs with its "
+        print(f"  {paint('●', 'alert')} {paint('--dangerously-skip-permissions:', 'warn')} every session runs with its "
               f"agent's permission checks off\n")
     for i, s in enumerate(sessions, 1):
         flag = " [INTERRUPTED]" if s.interrupted else ""
@@ -1371,6 +1447,8 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
                       f"{_truncate(m['snippet'], 140)}")
         if s.window_id:
             print(f"    saved in: {s.terminal} window {s.window_id}, tab {s.tab_index}")
+        if s.aerospace_workspace and target in ("ghostty", "terminal"):
+            print(f"    goes to : AeroSpace workspace {s.aerospace_workspace}")
         print(f"    title   : {title}")
         if target == "byobu":
             print(f"    slug    : {_pane_title(s)}")
@@ -1774,7 +1852,7 @@ tell application "Ghostty"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with x in terminals of t
-        set out to out & (id of w) & us & (index of t) & us & (working directory of x) & us & (name of x) & rs
+        set out to out & (id of w) & us & (index of t) & us & (working directory of x) & us & (name of x) & us & (id of x) & us & (name of w) & rs
       end repeat
     end repeat
   end repeat
@@ -1804,10 +1882,12 @@ return out
 
 
 def _ghostty_terminals() -> list[dict]:
-    """Every Ghostty terminal surface, in window/tab order (Ghostty 1.3+)."""
+    """Every Ghostty terminal surface, in window/tab order (Ghostty 1.3+), with
+    its own id and the title of its window, which is what AeroSpace sees."""
     return [
-        {"window_id": r[0], "tab_index": int(r[1]), "cwd": r[2], "title": r[3]}
-        for r in _split_records(_osascript(_GHOSTTY_LIST)) if len(r) == 4 and r[1].isdigit()
+        {"window_id": r[0], "tab_index": int(r[1]), "cwd": r[2], "title": r[3],
+         "terminal_id": r[4], "window_name": r[5]}
+        for r in _split_records(_osascript(_GHOSTTY_LIST)) if len(r) == 6 and r[1].isdigit()
     ]
 
 
@@ -1817,7 +1897,8 @@ def _terminal_app_tabs() -> list[dict]:
     macOS may since have given to a new window, so tabs with no processes
     are left out."""
     return [
-        {"window_id": r[0], "tab_index": int(r[1]), "tty": r[2], "title": r[3]}
+        {"window_id": r[0], "tab_index": int(r[1]), "tty": r[2], "title": r[3],
+         "window_name": r[3]}
         for r in _split_records(_osascript(_TERMINAL_LIST))
         if len(r) == 5 and r[1].isdigit() and r[4] != "0"
     ]
@@ -1865,6 +1946,57 @@ def _same_dir(a: str | None, b: str | None) -> bool:
     return bool(a and b) and os.path.realpath(a) == os.path.realpath(b)
 
 
+# AeroSpace, the tiling window manager, names each app by bundle id.
+_AEROSPACE_APPS = {"ghostty": "com.mitchellh.ghostty", "terminal": "com.apple.Terminal"}
+
+
+def _aerospace_windows(terminal: str) -> list[dict] | None:
+    """The terminal app's windows as AeroSpace sees them: id, workspace and
+    title. None when AeroSpace is not running here."""
+    if not IS_MACOS or terminal not in _AEROSPACE_APPS or not _have("aerospace"):
+        return None
+    try:
+        r = subprocess.run(["aerospace", "list-windows", "--monitor", "all",
+                            "--app-bundle-id", _AEROSPACE_APPS[terminal], "--json",
+                            "--format", "%{window-id} %{workspace} %{window-title}"],
+                           capture_output=True, text=True, timeout=5, check=False)
+        rows = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    return [{"id": w["window-id"], "workspace": w["workspace"], "title": w["window-title"]}
+            for w in rows if isinstance(w, dict) and "window-id" in w]
+
+
+def _match_aerospace(entries: list[dict], windows: dict[str, list[dict]]) -> None:
+    """Fill aerospace_workspace on placed entries in place. A terminal window's
+    title is the one AeroSpace reports, so windows are matched by title, after
+    the status symbol, which the agent animates; a title two windows share is
+    not used."""
+    for terminal, wins in windows.items():
+        by_title: dict[str, list[dict]] = {}
+        for w in wins:
+            by_title.setdefault(_bare_title(w["title"]), []).append(w)
+        for entry in entries:
+            name = entry.get("window_name")
+            if entry.get("terminal") != terminal or not name:
+                continue
+            hits = by_title.get(_bare_title(name), [])
+            if len(hits) == 1:
+                entry["aerospace_workspace"] = hits[0]["workspace"]
+
+
+def _aerospace_move(window_id: int, workspace: str) -> bool:
+    try:
+        return subprocess.run(["aerospace", "move-node-to-workspace", "--window-id",
+                               str(window_id), workspace],
+                              capture_output=True, text=True, timeout=5,
+                              check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _match_macos_windows(results: list[dict], procs: dict[int, Proc],
                          ghostty: list[dict], terminal: list[dict],
                          titles: dict[int, str] | None = None) -> None:
@@ -1883,6 +2015,10 @@ def _match_macos_windows(results: list[dict], procs: dict[int, Proc],
         entry["window_id"] = hit["window_id"]
         entry["tab_index"] = hit["tab_index"]
         entry["window_title"] = hit["title"]
+        if hit.get("terminal_id"):
+            entry["terminal_id"] = hit["terminal_id"]
+        if hit.get("window_name"):
+            entry["window_name"] = hit["window_name"]
 
     by_tty = {t["tty"]: t for t in terminal}
     titles = titles or {}
@@ -1916,6 +2052,35 @@ def _match_macos_windows(results: list[dict], procs: dict[int, Proc],
             place(entry, hit)
 
 
+def _agent_tool(p: Proc, recorded: set[int]) -> str | None:
+    """"claude" or "codex" when the process is that agent, else None. A
+    process with a pid record is a claude session whatever its name."""
+    if not p.argv:
+        return None
+    exe = os.path.basename(p.argv[0])
+    if exe in ("claude", "codex"):
+        return exe
+    if exe in ("node", "bash") and any("codex" in a for a in p.argv[1:3]):
+        return "codex"
+    if p.pid in recorded:
+        return "claude"
+    return None
+
+
+def _inside_agent(procs: dict[int, Proc], pid: int | None = None) -> bool:
+    """Whether a process (by default this one) runs inside an agent session:
+    one of its parents is an agent."""
+    recorded = set(_claude_pid_record_pids())
+    p = procs.get(os.getpid() if pid is None else pid)
+    for _ in range(40):
+        if not p or p.ppid in (0, p.pid):
+            return False
+        p = procs.get(p.ppid)
+        if p and _agent_tool(p, recorded):
+            return True
+    return False
+
+
 def snapshot_active(with_windows: bool = True) -> list[dict]:
     """Find running claude/codex processes and return their session info.
 
@@ -1931,21 +2096,11 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
     recorded = set(_claude_pid_record_pids())
     candidates: list[tuple[Proc, str]] = []
     for p in procs.values():
-        if p.uid != my_uid or not p.argv:
+        if p.uid != my_uid:
             continue
-        exe = os.path.basename(p.argv[0])
-        # identify tool
-        if exe == "claude":
-            tool = "claude"
-        elif exe == "codex":
-            tool = "codex"
-        elif exe in ("node", "bash") and any("codex" in a for a in p.argv[1:3]):
-            tool = "codex"
-        elif p.pid in recorded:
-            tool = "claude"
-        else:
-            continue
-        candidates.append((p, tool))
+        tool = _agent_tool(p, recorded)
+        if tool:
+            candidates.append((p, tool))
 
     cwds = _proc_cwds([p.pid for p, _ in candidates])
     for p, tool in sorted(candidates, key=lambda c: c[0].pid):
@@ -1980,6 +2135,7 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
                 "pid": p.pid,
                 "jsonl_path": jsonl_path,
                 "terminal": _host_terminal(p.pid, procs),
+                "skip_permissions": runs_without_checks(tool, p.argv),
                 "workspace": "?",
                 "window_title": "?",
             }
@@ -2003,6 +2159,8 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
             terminal=_terminal_app_tabs() if "terminal" in hosts else [],
             titles={pid: t for pid, t in titles.items() if t},
         )
+        windows = {t: _aerospace_windows(t) for t in hosts & set(_AEROSPACE_APPS)}
+        _match_aerospace(entries, {t: w for t, w in windows.items() if w})
     return entries
 
 
@@ -2018,6 +2176,43 @@ def drop_running(sessions: list[Session]) -> list[Session]:
     if skipped:
         print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
     return kept
+
+
+def mark_running(sessions: list[Session]) -> int:
+    """Give each session an agent runs now its process entry (Session.live),
+    with the terminal it runs in on macOS, so the picker can show it and
+    restart it in place. Returns how many run."""
+    by_key: dict[str, dict] = {}
+    for e in snapshot_active(with_windows=IS_MACOS):
+        by_key.setdefault(e["session_id"], e)
+        if e.get("jsonl_path"):
+            by_key.setdefault(Path(e["jsonl_path"]).stem, e)
+    for s in sessions:
+        s.live = by_key.get(s.session_id) or by_key.get(s.path.stem)
+    return sum(1 for s in sessions if s.live)
+
+
+def _running_in_list(args, sessions: list[Session],
+                     everything: list[Session] | None = None) -> list[Session]:
+    """With the picker, keep running sessions in the list and mark them, so
+    picking one restarts it in place. Without it, leave them out: every
+    session listed would be opened a second time.
+
+    everything is every session found before the filters: one that runs is
+    listed even when the filters dropped it, say after a week idle."""
+    if not args.pick:
+        return drop_running(sessions)
+    mark_running(everything if everything is not None else sessions)
+    listed = {id(s) for s in sessions}
+    extra = [s for s in everything or [] if s.live and id(s) not in listed]
+    if extra:
+        sessions = rank(sessions + extra)
+    n = sum(1 for s in sessions if s.live)
+    if n:
+        print(f"  {paint(n, 'bold')} of these run now, marked {paint('● running', 'ok')} in the "
+              f"picker; picking one restarts it in place"
+              + (f" ({len(extra)} listed only because they run)" if extra else ""))
+    return sessions
 
 
 def _placement_label(entry: dict) -> str:
@@ -2079,6 +2274,7 @@ def snapshot_to_sessions(entries: list[dict]) -> list[Session]:
             parsed.terminal = rec.get("terminal")
             parsed.window_id = rec.get("window_id")
             parsed.tab_index = rec.get("tab_index")
+            parsed.aerospace_workspace = rec.get("aerospace_workspace")
             sessions.append(parsed)
     return sessions
 
@@ -2208,8 +2404,53 @@ def cache_record(s: Session) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
-    """One picker row as (text, role) pieces; roles as in termui."""
+def _checks(off: bool) -> str:
+    return "off" if off else "on"
+
+
+def _live_badge(s: Session) -> list[tuple[str, str]]:
+    """The picker's running column, as (text, role) pieces.
+
+        ● running              bold: nothing would change
+        ● running, checks on   yellow: this run would turn the checks off
+        ● running, checks off  red ●, yellow words: running without checks
+
+    Green is left to ticked rows, so a running row never looks selected, and
+    red only colors the ●: red text falls below 4.5:1 on some themes."""
+    if not s.live:
+        return []
+    if s.live.get("skip_permissions"):
+        return [("●", "alert"), (" running, checks off", "warn")]
+    if s.skip_permissions:
+        return [("● running, checks on", "warn")]
+    return [("● running", "bold")]
+
+
+def _live_role(s: Session) -> str:
+    """One color for a running session's note: yellow when its checks are
+    off or this run would change them."""
+    return "warn" if s.live.get("skip_permissions") or s.skip_permissions else ""
+
+
+def _badge_len(s: Session) -> int:
+    return sum(len(t) for t, _ in _live_badge(s))
+
+
+def _live_note(s: Session) -> str:
+    """What picking a running session does, for the footer and details page."""
+    where = _where(s.live)
+    now_off = bool(s.live.get("skip_permissions"))
+    if not _restartable(s.live):
+        return f"running ({where}); restore cannot type into that terminal, so picking it does nothing"
+    if now_off == s.skip_permissions:
+        return f"running ({where}); picking it restarts it in place"
+    return (f"running ({where}) with permission checks {_checks(now_off)}; "
+            f"picking it restarts it in place with them {_checks(s.skip_permissions)}")
+
+
+def _row_segments(s: Session, width: int, live_w: int = 0) -> list[tuple[str, str]]:
+    """One picker row as (text, role) pieces; roles as in termui. live_w is
+    the running column's width, 0 when no session in the list runs."""
     age = f"{s.age_days:4.1f}d"
     tool = f"{s.tool:<6}"
     cwd = short_cwd(s.cwd) or "?"
@@ -2227,8 +2468,12 @@ def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
         ("!" if s.interrupted else " ", "warn"),
         (f" {age} ", ""),
         (tool, "accent"),
-        (f" {cwd}", ""),
     ]
+    if live_w:
+        segs.append((" ", ""))
+        segs.extend(_live_badge(s))
+        segs.append((" " * (live_w - _badge_len(s)), ""))
+    segs.append((f" {cwd}", ""))
     if branch:
         segs.append((f"  {branch}", "ok"))
     if pr_marker:
@@ -2324,6 +2569,14 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
     if s.window_title and s.window_title != "?":
         field("window", s.window_title)
 
+    if s.live:
+        heading("Running now")
+        field("process", f"pid {s.live.get('pid')}  ({_where(s.live)})")
+        now_off = bool(s.live.get("skip_permissions"))
+        field("checks", f"{_checks(now_off)} now; this run resumes with them "
+                        f"{_checks(s.skip_permissions)}", _live_role(s))
+        field("if picked", _live_note(s).split("; ", 1)[-1])
+
     if s.abstract or s.summary_error:
         heading("Summary")
         para(s.abstract)
@@ -2360,6 +2613,8 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
 def _picker_footer(cur: Session) -> tuple[list[tuple[str, str]], str]:
     """Footer for the highlighted session: location pieces, then the abstract."""
     loc: list[tuple[str, str]] = []
+    if cur.live:
+        loc.append((_live_note(cur), _live_role(cur)))
     if cur.cwd:
         loc.append((short_cwd(cur.cwd), "bold"))
     if cur.git_branch:
@@ -2386,7 +2641,9 @@ def _picker_footer(cur: Session) -> tuple[list[tuple[str, str]], str]:
 
 def tui_pick(sessions: list[Session]) -> list[Session] | None:
     """Return user-selected subset, or None if user quit. Requires a real TTY."""
-    return pick(sessions, title="restore-terminals", noun="session", row=_row_segments,
+    live_w = max((_badge_len(s) for s in sessions), default=0)
+    return pick(sessions, title="restore-terminals", noun="session",
+                row=lambda s, width: _row_segments(s, width, live_w),
                 footer=_picker_footer, details=_detail_lines, tagline=TAGLINE)
 
 
@@ -2522,6 +2779,237 @@ def _plan_and_launch(ap, args, sessions: list[Session]) -> None:
             print("  (dry-run; nothing was launched — add --execute to launch)\n")
 
 
+def _enrich_and_pick(args, ranked: list[Session]) -> list[Session] | None:
+    """Summaries and PRs from the cache (or made), then the picker when it is on.
+    None when the picker was cancelled."""
+    cache_path = Path(args.cache).expanduser()
+    cache = load_cache(cache_path)
+    hydrate_from_cache(ranked, cache)
+    enrich_sessions(
+        ranked,
+        cache=cache,
+        cache_path=cache_path,
+        summarize_enabled=args.summarize,
+        fetch_pr_enabled=args.fetch_pr,
+        refresh=args.refresh,
+        pr_ttl_hours=args.pr_ttl_hours,
+        summary_workers=args.summary_workers,
+    )
+    if not args.pick:
+        return ranked
+    picked = tui_pick(ranked)
+    if picked is None:
+        print("  (cancelled)")
+    return picked
+
+
+# ---------------------------------------------------------------------------
+# --restart: end running sessions and resume each in its own terminal
+# ---------------------------------------------------------------------------
+
+_GHOSTTY_RESUME = """
+on run argv
+  tell application "Ghostty"
+    set t to terminal id (item 1 of argv)
+    input text (item 2 of argv) to t
+    send key "enter" to t
+  end tell
+  return "ok"
+end run
+"""
+
+_TERMINAL_RESUME = """
+on run argv
+  tell application "Terminal"
+    do script (item 3 of argv) in tab ((item 2 of argv) as integer) of window id ((item 1 of argv) as integer)
+  end tell
+  return "ok"
+end run
+"""
+
+
+def _restartable(entry: dict) -> bool:
+    """A running session restore can resume where it is: a Ghostty terminal it
+    knows the id of, or a Terminal.app tab."""
+    if entry.get("terminal") == "ghostty":
+        return bool(entry.get("terminal_id"))
+    if entry.get("terminal") == "terminal":
+        return bool(entry.get("window_id")) and bool(entry.get("tab_index"))
+    return False
+
+
+def _wait_exit(pids: list[int], timeout: float) -> set[int]:
+    """Wait for the processes to exit; the ones still running at the end."""
+    alive = set(pids)
+    deadline = time.monotonic() + timeout
+    while alive and time.monotonic() < deadline:
+        for pid in list(alive):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive.discard(pid)
+            except PermissionError:
+                pass
+        if alive:
+            time.sleep(0.2)
+    return alive
+
+
+def _type_resume(entry: dict, s: Session) -> bool:
+    """Type the resume command into the terminal the session ran in."""
+    if entry["terminal"] == "ghostty":
+        return _osascript(_GHOSTTY_RESUME, entry["terminal_id"], _shell_line(s)) == "ok"
+    return _osascript(_TERMINAL_RESUME, str(entry["window_id"]), str(entry["tab_index"]),
+                      _shell_line(s)) == "ok"
+
+
+def _where(entry: dict) -> str:
+    ws = entry.get("aerospace_workspace")
+    return f"{entry.get('terminal')}{f', workspace {ws}' if ws else ''}"
+
+
+def restart_in_place(pairs: list[tuple[Session, dict]]) -> int:
+    """End each session's agent with SIGTERM, wait for it to exit, and type the
+    resume command into the shell left in its terminal. Then check that each
+    one runs again. Returns how many do."""
+    for _, e in pairs:
+        try:
+            os.kill(e["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    alive = _wait_exit([e["pid"] for _, e in pairs], timeout=15)
+    time.sleep(0.5)   # each shell prints its prompt
+    typed: list[tuple[Session, dict]] = []
+    for s, e in pairs:
+        line = f"{short_cwd(s.cwd)}  —  {_pane_title(s)}  ({_where(e)})"
+        if e["pid"] in alive:
+            print(f"  ✗ {line}: did not exit after SIGTERM; left running")
+        elif not _type_resume(e, s):
+            print(f"  ✗ {line}: ended, but could not type into its terminal")
+        else:
+            typed.append((s, e))
+    # each one should be running again within a few seconds
+    want = {s.session_id: (s, e) for s, e in typed}
+    running: set[str] = set()
+    deadline = time.monotonic() + 20
+    while want.keys() - running and time.monotonic() < deadline:
+        time.sleep(1)
+        for r in snapshot_active(with_windows=False):
+            running.add(r["session_id"])
+            if r.get("jsonl_path"):
+                running.add(Path(r["jsonl_path"]).stem)
+    back = 0
+    for sid, (s, e) in want.items():
+        line = f"{short_cwd(s.cwd)}  —  {_pane_title(s)}  ({_where(e)})"
+        if sid in running or s.path.stem in running:
+            print(f"  ✓ {line}")
+            back += 1
+        else:
+            print(f"  ? {line}: typed, but not running yet; look at its terminal")
+    return back
+
+
+def restart(args, tools: set[str]) -> int:
+    """--restart: pick running sessions, end them, and resume each where it was."""
+    if not IS_MACOS:
+        print("  --restart resumes each session in its own Ghostty or Terminal.app tab, "
+              "so it runs on macOS only.", file=sys.stderr)
+        return 2
+    if _inside_agent(_list_procs()):
+        print("  --restart ends agent sessions, and restore is running inside one, which "
+              "it would end too. Run it from a plain terminal.", file=sys.stderr)
+        return 2
+    entries = [e for e in snapshot_active() if e["tool"] in tools]
+    here = [e for e in entries if _restartable(e)]
+    left = [e for e in entries if not _restartable(e)]
+    by_path = {e["jsonl_path"]: e for e in here if e.get("jsonl_path")}
+    sessions = [s for s in snapshot_to_sessions(here) if str(s.path) in by_path]
+    for s in sessions:
+        s.live = by_path[str(s.path)]
+    if left:
+        print(f"  {paint('left alone', 'accent')} {paint(len(left), 'bold')} running "
+              f"session(s) not in a Ghostty or Terminal.app tab restore can type into:")
+        for e in left:
+            print(f"    {e['tool']:<6}  {short_cwd(e['cwd'])}  ({e.get('terminal') or 'no terminal'})")
+    if args.dangerously_skip_permissions:
+        # restarting these would bring them back as they run now
+        done = [s for s in sessions if s.live.get("skip_permissions")]
+        sessions = [s for s in sessions if not s.live.get("skip_permissions")]
+        if done:
+            print(f"  {paint('left alone', 'accent')} {paint(len(done), 'bold')} running "
+                  f"session(s) already without permission checks:")
+            for s in done:
+                print(f"    {s.tool:<6}  {short_cwd(s.cwd)}  —  {display_title(s)}")
+    if not sessions:
+        print("  no running sessions to restart.")
+        return 0
+    skip_permissions(sessions, args.dangerously_skip_permissions)
+    picked = _enrich_and_pick(args, sessions)
+    if not picked:
+        return 0
+    return _restart_picked(args, picked)
+
+
+def _restart_picked(args, picked: list[Session]) -> int:
+    """Print the plan for running sessions that were picked, and with
+    --execute, ask, save a snapshot, and restart each where it runs."""
+    for s in picked:
+        if not _restartable(s.live):
+            print(f"\n  {paint('left running', 'warn')}: {display_title(s)} ({_where(s.live)}); "
+                  f"restore cannot type into that terminal")
+    picked = [s for s in picked if _restartable(s.live)]
+    if not picked:
+        return 0
+    if args.execute:
+        print(f"\n  Will restart {len(picked)} session(s) in their own terminal:\n")
+    else:
+        print(f"\n  Would restart {len(picked)} session(s) in their own terminal  (--dry-run):\n")
+    if any(s.skip_permissions for s in picked):
+        print(f"  {paint('●', 'alert')} {paint('--dangerously-skip-permissions:', 'warn')} every session comes back "
+              f"with its agent's permission checks off\n")
+    for s in picked:
+        print(f"    {paint(display_title(s), 'bold')}  ({_where(s.live)})")
+        print(f"      {short_cwd(s.cwd)}")
+        now_off = bool(s.live.get("skip_permissions"))
+        if now_off != s.skip_permissions:
+            mark = paint('●', 'alert') + ' ' if s.skip_permissions else ''
+            print(f"      {mark}{paint('checks', 'warn')}: {_checks(now_off)} now, "
+                  f"{_checks(s.skip_permissions)} after the restart")
+        print(f"      cmd : {_shell_line(s)}")
+    if not args.execute:
+        print("\n  (dry-run; nothing was ended — add --execute to restart them)\n")
+        return 0
+    if _inside_agent(_list_procs()):
+        print("  restarting ends agent sessions, and restore is running inside one, which "
+              "it would end too. Run it from a plain terminal.", file=sys.stderr)
+        return 2
+    if not sys.stdin.isatty():
+        print("  restarting running sessions asks before ending anything; run it in a terminal.",
+              file=sys.stderr)
+        return 2
+    answer = input(f"\n  End {len(picked)} agent session(s) and resume them in place? "
+                   f"A turn in progress is lost. [y/N] ")
+    if answer.strip().lower() not in ("y", "yes"):
+        print("  nothing was ended.")
+        return 0
+    entries = snapshot_active()
+    path = save_snapshot(entries)
+    print(f"  saved {len(entries)} session(s) to {short_cwd(str(path))}; "
+          f"restore --load reopens any that do not come back")
+    back = restart_in_place([(s, s.live) for s in picked])
+    print(f"  done — {back}/{len(picked)} running again\n")
+    return 0 if back == len(picked) else 1
+
+
+def _launch_and_restart(ap, args, picked: list[Session]) -> int:
+    """Open the picked sessions that are not running; restart the running ones in place."""
+    new = [s for s in picked if not s.live]
+    running = [s for s in picked if s.live]
+    if new or not running:
+        _plan_and_launch(ap, args, new)
+    return _restart_picked(args, running) if running else 0
+
+
 def _backend_label(target: str) -> str:
     return {
         "byobu": "byobu/tmux pane(s)",
@@ -2545,6 +3033,9 @@ def main() -> int:
             "  restore --save                 # snapshot all running sessions now\n"
             "  restore --load                 # restore from last snapshot\n"
             "  restore --load --execute       # restore + launch\n"
+            "  restore --restart --dangerously-skip-permissions --execute\n"
+            "                                 # macOS: end running sessions, resume each in\n"
+            "                                 #   its own tab with permission checks off\n"
             "\n"
             "Search for sessions by content:\n"
             "  restore --find feature/branch  # find by branch name, ticket, any text\n"
@@ -2603,6 +3094,12 @@ def main() -> int:
                          "--dangerously-skip-permissions, codex "
                          "--dangerously-bypass-approvals-and-sandbox. Only where the agents "
                          "cannot do harm, such as a sandbox or a throwaway VM")
+    ap.add_argument("--restart", action="store_true",
+                    help="macOS: pick running sessions, end them, and resume each in the same "
+                         "Ghostty or Terminal.app tab, window and workspace. With "
+                         "--dangerously-skip-permissions they come back with permission checks "
+                         "off. Dry-run unless --execute, which asks first. Run it from a plain "
+                         "terminal, not inside an agent session")
     ap.add_argument("--save", action="store_true",
                     help="snapshot currently running sessions to ~/.ai/snapshots/")
     ap.add_argument("--load", nargs="?", const="latest", default=None, metavar="FILE",
@@ -2631,6 +3128,12 @@ def main() -> int:
     args.pick = (not args.no_pick) and sys.stdout.isatty() and sys.stdin.isatty()
 
     tools = {"claude", "codex"} if args.only == "all" else {args.only}
+
+    # --restart: end running sessions and resume each where it runs
+    if args.restart:
+        if args.save or args.load is not None or args.find:
+            ap.error("--restart works on running sessions; it does not take --save, --load or --find")
+        return restart(args, tools)
 
     # --save: snapshot currently running sessions and exit
     if args.save:
@@ -2661,7 +3164,7 @@ def main() -> int:
         if not ranked:
             print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
-        ranked = drop_running(ranked)
+        ranked = _running_in_list(args, ranked)
         if not ranked:
             print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
             return 0
@@ -2669,28 +3172,10 @@ def main() -> int:
         # fail on a layout no session can use before summaries, PRs and the picker
         _check_layout(ap, args, _target_groups(args.target, ranked))
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
-        cache_path = Path(args.cache).expanduser()
-        cache = load_cache(cache_path)
-        hydrate_from_cache(ranked, cache)
-        enrich_sessions(
-            ranked,
-            cache=cache,
-            cache_path=cache_path,
-            summarize_enabled=args.summarize,
-            fetch_pr_enabled=args.fetch_pr,
-            refresh=args.refresh,
-            pr_ttl_hours=args.pr_ttl_hours,
-            summary_workers=args.summary_workers,
-        )
-        to_show = ranked
-        if args.pick:
-            picked = tui_pick(ranked)
-            if picked is None:
-                print("  (cancelled)")
-                return 0
-            to_show = picked
-        _plan_and_launch(ap, args, to_show)
-        return 0
+        to_show = _enrich_and_pick(args, ranked)
+        if to_show is None:
+            return 0
+        return _launch_and_restart(ap, args, to_show)
 
     # --find mode: content search, then rank by relevance
     if args.find:
@@ -2737,7 +3222,8 @@ def main() -> int:
         ranked = rank(filtered)
         print_stats(all_found, filtered, ranked)
 
-    ranked = drop_running(ranked)
+    # a search lists what matches; otherwise every running session is listed
+    ranked = _running_in_list(args, ranked, None if args.find else all_found)
     skip_permissions(ranked, args.dangerously_skip_permissions)
     # fail on a layout no session can use before summaries, PRs and the picker
     _check_layout(ap, args, _target_groups(args.target, ranked))
@@ -2770,8 +3256,7 @@ def main() -> int:
         to_show = picked
         print(f"\n  {paint('selected', 'ok')} {paint(f'{len(to_show)}/{len(ranked)}', 'bold')} session(s)")
 
-    _plan_and_launch(ap, args, to_show)
-    return 0
+    return _launch_and_restart(ap, args, to_show)
 
 
 if __name__ == "__main__":

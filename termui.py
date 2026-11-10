@@ -10,15 +10,16 @@ terminal's own palette, so the output follows its light or dark theme:
     accent  cyan    labels, keys, the current-row marker
     ok      green   ticked items, results, good states
     warn    yellow  interrupted or failed items, search hits
-    heart   red     the tagline's ♥ only
+    heart   red     the tagline's ♥
+    alert   red     a symbol marking a risky state, never text
     bold    bold in the default colour (no colour)
     ""      plain
 
 Only the normal (0-7) colours are used: their contrast holds on light and
 dark themes, where the bright ones fall below 4.5:1 on white. Colour is
 never combined with bold, which some terminals render as the bright
-variant. Red is kept for the ♥: a symbol needs 3:1, which red clears on
-light, dark and Solarized themes, and text in red does not. NO_COLOR
+variant. Red is kept for symbols (the ♥, an alert's ●): a symbol needs 3:1,
+which red clears on light, dark and Solarized themes, and text in red does not. NO_COLOR
 (https://no-color.org) turns colour off.
 """
 
@@ -32,12 +33,12 @@ from typing import Callable, Optional, Sequence, Tuple, TypeVar
 T = TypeVar("T")
 
 ROLE_COLORS = {"accent": "COLOR_CYAN", "ok": "COLOR_GREEN", "warn": "COLOR_YELLOW",
-               "heart": "COLOR_RED"}
+               "heart": "COLOR_RED", "alert": "COLOR_RED"}
 TAGLINE = [("Proudly made in Dallas with ", ""), ("♥", "heart"), (" ", "")]
 
 # The same roles as ANSI codes for progress lines, plus bold (default
 # colour) for numbers.
-ANSI = {"accent": "36", "ok": "32", "warn": "33", "heart": "31", "bold": "1"}
+ANSI = {"accent": "36", "ok": "32", "warn": "33", "heart": "31", "alert": "31", "bold": "1"}
 
 
 def colors_enabled(env, has_colors: bool) -> bool:
