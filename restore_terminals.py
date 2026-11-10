@@ -81,6 +81,7 @@ class Session:
     terminal: str | None = None     # host terminal at snapshot time: ghostty, terminal, terminator, tmux, ...
     window_id: str | None = None    # macOS terminal window id at snapshot time
     tab_index: int | None = None    # 1-based tab within window_id at snapshot time
+    skip_permissions: bool = False  # resume with the agent's permission checks off
 
     @property
     def span_minutes(self) -> float:
@@ -801,11 +802,27 @@ def search_relevance(s: Session) -> float:
 # ---------------------------------------------------------------------------
 
 
+# Each agent's option for running with no permission prompts, for
+# --dangerously-skip-permissions.
+SKIP_PERMISSIONS_FLAG = {
+    "claude": "--dangerously-skip-permissions",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",
+}
+
+
+def skip_permissions(sessions: list[Session], on: bool) -> None:
+    """Mark the sessions to resume with permission checks off. Set before the
+    picker, so its details page shows the command that will run."""
+    for s in sessions:
+        s.skip_permissions = on
+
+
 def resume_cmd(s: Session) -> str:
+    skip = f" {SKIP_PERMISSIONS_FLAG[s.tool]}" if s.skip_permissions else ""
     if s.tool == "claude":
-        return f"claude --resume {s.session_id}"
-    # codex: resume accepts the rollout path
-    return f"codex resume {shlex.quote(str(s.path))}"
+        return f"claude --resume {s.session_id}{skip}"
+    # codex: resume accepts the rollout path; options go before it
+    return f"codex resume{skip} {shlex.quote(str(s.path))}"
 
 
 def terminator_argv(s: Session, title: str) -> list[str]:
@@ -1307,6 +1324,9 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
         head = (f"\n  Would open {len(sessions)} Terminator window(s)  "
                 f"(--dry-run; i3 will tile them):\n")
     print(head)
+    if any(s.skip_permissions for s in sessions):
+        print(f"  {paint('--dangerously-skip-permissions:', 'warn')} every session runs with its "
+              f"agent's permission checks off\n")
     for i, s in enumerate(sessions, 1):
         flag = " [INTERRUPTED]" if s.interrupted else ""
         title = _truncate(display_title(s), 60)
@@ -2578,6 +2598,11 @@ def main() -> int:
                          "'v' = stacked top/bottom")
     ap.add_argument("--byobu-session", default="restore",
                     help="byobu only: tmux session name to build into (default: restore)")
+    ap.add_argument("--dangerously-skip-permissions", action="store_true",
+                    help="resume every session with its agent's permission checks off: claude "
+                         "--dangerously-skip-permissions, codex "
+                         "--dangerously-bypass-approvals-and-sandbox. Only where the agents "
+                         "cannot do harm, such as a sandbox or a throwaway VM")
     ap.add_argument("--save", action="store_true",
                     help="snapshot currently running sessions to ~/.ai/snapshots/")
     ap.add_argument("--load", nargs="?", const="latest", default=None, metavar="FILE",
@@ -2640,6 +2665,7 @@ def main() -> int:
         if not ranked:
             print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
             return 0
+        skip_permissions(ranked, args.dangerously_skip_permissions)
         # fail on a layout no session can use before summaries, PRs and the picker
         _check_layout(ap, args, _target_groups(args.target, ranked))
         # skip the normal discover/filter path — go straight to cache+summarize+pick+launch
@@ -2712,6 +2738,7 @@ def main() -> int:
         print_stats(all_found, filtered, ranked)
 
     ranked = drop_running(ranked)
+    skip_permissions(ranked, args.dangerously_skip_permissions)
     # fail on a layout no session can use before summaries, PRs and the picker
     _check_layout(ap, args, _target_groups(args.target, ranked))
     cache_path = Path(args.cache).expanduser()

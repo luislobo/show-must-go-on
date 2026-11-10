@@ -757,6 +757,64 @@ class EarlyLayoutCheck(unittest.TestCase):
         picker.assert_not_called()
 
 
+class SkipPermissions(unittest.TestCase):
+    """--dangerously-skip-permissions resumes each agent with its own option for it."""
+
+    def test_off_by_default(self):
+        self.assertEqual(rt.resume_cmd(session(sid="abc")), "claude --resume abc")
+        s = session(sid="r1")
+        s.tool, s.path = "codex", Path("/x/r 1.jsonl")
+        self.assertEqual(rt.resume_cmd(s), "codex resume '/x/r 1.jsonl'")
+
+    def test_each_agent_gets_its_own_option(self):
+        c = session(sid="abc", skip_permissions=True)
+        self.assertEqual(rt.resume_cmd(c), "claude --resume abc --dangerously-skip-permissions")
+        x = session(sid="r1", skip_permissions=True)
+        x.tool, x.path = "codex", Path("/x/r 1.jsonl")
+        # before the rollout path, where an option always parses
+        self.assertEqual(rt.resume_cmd(x),
+                         "codex resume --dangerously-bypass-approvals-and-sandbox '/x/r 1.jsonl'")
+
+    def test_every_launcher_carries_it(self):
+        s = session(sid="abc", cwd="/opt/a", skip_permissions=True)
+        self.assertIn("claude --resume abc --dangerously-skip-permissions",
+                      rt.terminator_argv(s, "t")[-1])
+        self.assertTrue(rt._shell_line(s).endswith("--dangerously-skip-permissions"))
+
+    def run_main(self, argv, home):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["restore", *argv]), \
+             mock.patch.multiple(rt, CLAUDE_ROOT=home / "projects", CODEX_ROOT=home / "codex",
+                                 SNAPSHOTS_DIR=home / "snapshots", IS_MACOS=False), \
+             mock.patch.object(rt, "enrich_sessions"), \
+             mock.patch.object(sys, "stdout", out):
+            self.assertEqual(rt.main(), 0)
+        return out.getvalue()
+
+    def test_the_plan_shows_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(os.path.realpath(d))
+            work = home / "w"
+            work.mkdir()
+            proj = home / "projects" / rt._encode_cwd_to_project(str(work))
+            proj.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            with (proj / "s1.jsonl").open("w") as f:
+                for i in range(12):
+                    ts = (now - timedelta(minutes=60 - i * 5)).isoformat()
+                    role = "user" if i % 2 == 0 else "assistant"
+                    content = f"prompt {i}" if role == "user" else [{"type": "text", "text": "ok"}]
+                    f.write(json.dumps({"type": role, "timestamp": ts, "cwd": str(work),
+                                        "message": {"role": role, "content": content}}) + "\n")
+            plain = self.run_main(["--no-pick", "--no-gh", "--no-ai"], home)
+            skip = self.run_main(["--no-pick", "--no-gh", "--no-ai",
+                                  "--dangerously-skip-permissions"], home)
+        self.assertIn("claude --resume s1", plain)
+        self.assertNotIn("dangerously", plain)
+        self.assertIn("claude --resume s1 --dangerously-skip-permissions", skip)
+        self.assertIn("permission checks off", skip)
+
+
 class SnapshotCompat(unittest.TestCase):
     def test_linux_snapshot_without_new_fields_loads(self):
         with tempfile.TemporaryDirectory() as d:

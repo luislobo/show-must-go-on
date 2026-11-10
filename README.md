@@ -250,6 +250,15 @@ restore --find feature/my-branch --execute
 restore --find 'haproxy.*migration' 30
 ```
 
+### Resume without permission prompts
+
+```bash
+# Resume every session with its agent's permission checks off
+restore --load --dangerously-skip-permissions --execute
+```
+
+Each agent gets its own option for it: `claude --resume <id> --dangerously-skip-permissions` and `codex resume --dangerously-bypass-approvals-and-sandbox <rollout>`. The agents then run commands and edit files without asking, so use it only where they cannot do harm, such as a sandbox or a throwaway VM. It works with `--load`, `--find` and history alike, and the plan says when it is on. It is off unless you pass it, every time: a snapshot does not record it.
+
 ### Standalone search (no TUI, just results)
 
 ```bash
