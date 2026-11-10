@@ -30,6 +30,8 @@ restore --execute        # recover from session history on disk
 - **Live snapshot** (`--save`) — detects running claude/codex sessions (via `/proc` on Linux, `ps` and `lsof` on macOS), captures their session IDs, cwds, **i3 workspace names** or **Ghostty/Terminal.app window and tab**, and **window titles**
 - **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused. When Claude Code writes these records, a `claude` process without one (`claude agents`, `claude mcp …`) is not counted as a session
 - **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
+- **AeroSpace workspaces** (macOS) — with the [AeroSpace](https://github.com/nikitabobko/AeroSpace) tiling window manager running, `--save` records each Ghostty or Terminal.app window's workspace, and `--load` moves each window it opens back there
+- **Restart in place** (`--restart`, macOS) — ends the running sessions you pick and resumes each in the same Ghostty or Terminal.app tab, so window, tab, split and workspace stay as they were; with `--dangerously-skip-permissions` they come back with permission checks off
 - **Smart filtering** — configurable lookback window, minimum activity thresholds, dead-cwd detection
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
 - **Agent titles** — the name Claude Code gives a session, or the one you set with `/rename`, is shown first in the picker, the details page and the plan, with the AI topic beside it (once, when the two say the same); it is also the window title restore opens. Codex sessions show the AI topic only
@@ -215,6 +217,25 @@ restore --target=ghostty --layout=hybrid --max-splits=3 --execute
 restore --target=terminal --execute
 ```
 
+With AeroSpace running, `--save` also records each window's AeroSpace workspace, and `--load` moves each window it opens back to it; the plan shows `goes to : AeroSpace workspace 13`. AeroSpace reports a window's title, which for Ghostty and Terminal.app is the title of its selected tab, so windows are matched by title (after the status symbol the agent animates); a title two windows share is not used. Without AeroSpace nothing changes.
+
+### Restart running sessions in place (macOS)
+
+```bash
+# Pick running sessions and see what would happen: nothing is ended
+restore --restart
+
+# End them and resume each in the same tab, with permission checks off
+restore --restart --dangerously-skip-permissions --execute
+```
+
+`--restart` lists the running sessions in the picker (or all of them with `--no-pick`), then for each one sends its agent SIGTERM, waits for it to exit, and types the resume command into the shell left in its Ghostty terminal or Terminal.app tab. The window, tab, split and AeroSpace workspace stay where they were. It then checks that each session runs again and reports any that did not. Before ending anything it saves a snapshot, so `restore --load` reopens a session that does not come back.
+
+- **Run it from a plain terminal.** Run inside an agent session, it would end the session it runs in, so it refuses.
+- **`--execute` asks first**, and refuses without a terminal to ask in. A turn an agent is in the middle of is lost; the transcript up to it is not.
+- **Only sessions in a Ghostty terminal or a Terminal.app tab** are restarted. Others (in tmux, iTerm or no terminal) are listed and left running.
+- **A session that does not exit** within 15 seconds of SIGTERM is left running and reported.
+
 ### Remote/headless restore with byobu/tmux
 
 ```bash
@@ -257,7 +278,7 @@ restore --find 'haproxy.*migration' 30
 restore --load --dangerously-skip-permissions --execute
 ```
 
-Each agent gets its own option for it: `claude --resume <id> --dangerously-skip-permissions` and `codex resume --dangerously-bypass-approvals-and-sandbox <rollout>`. The agents then run commands and edit files without asking, so use it only where they cannot do harm, such as a sandbox or a throwaway VM. It works with `--load`, `--find` and history alike, and the plan says when it is on. It is off unless you pass it, every time: a snapshot does not record it.
+Each agent gets its own option for it: `claude --resume <id> --dangerously-skip-permissions` and `codex resume --dangerously-bypass-approvals-and-sandbox <rollout>`. The agents then run commands and edit files without asking, so use it only where they cannot do harm, such as a sandbox or a throwaway VM. It works with `--load`, `--find`, history and `--restart` alike, and the plan says when it is on. It is off unless you pass it, every time: a snapshot does not record it. To turn it on for sessions that are already running, use `restore --restart --dangerously-skip-permissions --execute`.
 
 ### Standalone search (no TUI, just results)
 
@@ -317,7 +338,7 @@ The current row has a `▶` in the gutter and bold text. Colours come from your 
 2. **Load** — reads the snapshot, checks which sessions are already running (skips those), parses the JSONL files for metadata, runs through the same summarize/pick/launch pipeline
 3. **Launch** — on Linux, spawns each Terminator window, then uses `i3-msg '[id=<wid>] move to workspace <name>'` to place it on the saved workspace. On macOS, opens the sessions in Ghostty or Terminal.app; `--layout=saved` puts Ghostty sessions back in their saved window and tab
 
-Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`, `pid`, `jsonl_path`, `workspace` and `window_title`, plus `terminal` (the host terminal: ghostty, terminal, terminator, tmux or iterm) and, on macOS, `window_id` and `tab_index`. Snapshots saved before the macOS fields existed still load.
+Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`, `pid`, `jsonl_path`, `workspace` and `window_title`, plus `terminal` (the host terminal: ghostty, terminal, terminator, tmux or iterm) and, on macOS, `window_id`, `tab_index`, `window_name` (the window's title), `terminal_id` (the Ghostty terminal's own id) and, with AeroSpace, `aerospace_workspace`. Snapshots saved before these fields existed still load.
 
 ### Terminator placement (Linux)
 

@@ -815,6 +815,188 @@ class SkipPermissions(unittest.TestCase):
         self.assertIn("permission checks off", skip)
 
 
+class AeroSpaceWorkspaces(unittest.TestCase):
+    """--save records each window's AeroSpace workspace; --load puts windows back on it."""
+
+    def test_ghostty_list_carries_terminal_and_window_names(self):
+        us, rs = rt._US, rt._RS
+        out = rs.join([us.join(["W1", "2", "/a", "✳ t", "T9", "◐ win"])]) + rs
+        with mock.patch.object(rt, "_osascript", return_value=out):
+            [t] = rt._ghostty_terminals()
+        self.assertEqual((t["tab_index"], t["terminal_id"], t["window_name"]), (2, "T9", "◐ win"))
+
+    def test_windows_match_by_title_without_the_status_symbol(self):
+        entries = [{"terminal": "ghostty", "window_name": "◐ dotfiles"},
+                   {"terminal": "ghostty", "window_name": "✳ twin"},
+                   {"terminal": "ghostty", "window_name": "✳ elsewhere"},
+                   {"terminal": "terminal", "window_name": "✳ dotfiles"}]
+        rt._match_aerospace(entries, {"ghostty": [
+            {"id": 1, "workspace": "19", "title": "✳ dotfiles"},     # the symbol animates
+            {"id": 2, "workspace": "3", "title": "✳ twin"},
+            {"id": 3, "workspace": "4", "title": "◑ twin"},           # same title twice: unused
+        ]})
+        self.assertEqual([e.get("aerospace_workspace") for e in entries], ["19", None, None, None])
+
+    def test_snapshot_keeps_the_workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "s.jsonl"
+            p.write_text("")
+            with mock.patch.object(rt, "parse_claude", return_value=session("s1")):
+                [s] = rt.snapshot_to_sessions([{"tool": "claude", "jsonl_path": str(p),
+                                                "aerospace_workspace": "13"}])
+        self.assertEqual(s.aerospace_workspace, "13")
+
+    def launch(self, sessions, layout, lists):
+        """launch_ghostty with AeroSpace answering from lists, one per call."""
+        runs, moves = [], []
+
+        def run(script, argv):
+            runs.append(argv)
+            return len(argv) // 3, None
+        answers = iter(lists)
+        with mock.patch.object(rt, "_osascript_progress", side_effect=run), \
+             mock.patch.object(rt, "_aerospace_windows", side_effect=lambda t: next(answers)), \
+             mock.patch.object(rt, "_aerospace_move", side_effect=lambda i, ws: moves.append((i, ws)) or True), \
+             mock.patch.object(rt.time, "sleep"), mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            n = rt.launch_ghostty(sessions, layout=layout, max_splits=4)
+        return n, runs, moves, out.getvalue()
+
+    def test_each_window_and_its_tabs_go_to_the_workspace(self):
+        a = session("a", terminal="ghostty", window_id="W1", tab_index=1, aerospace_workspace="13")
+        b = session("b", terminal="ghostty", window_id="W1", tab_index=2, aerospace_workspace="13")
+        c = session("c", terminal="ghostty", window_id="W2", tab_index=1, aerospace_workspace="19")
+        old = {"id": 1, "workspace": "1", "title": "x"}
+        tab1, tab2, other = ({"id": i, "workspace": "1", "title": "y"} for i in (10, 11, 12))
+        n, runs, moves, out = self.launch([a, b, c], "saved", [
+            [old],                        # before anything opens
+            [old, tab1], [old, tab1, tab2],   # the first window shows up, then its tab
+            [old, tab1, tab2, other],     # the second window
+        ])
+        self.assertEqual(n, 3)
+        self.assertEqual([r[0::3] for r in runs], [["window", "tab"], ["window"]])
+        self.assertEqual(moves, [(10, "13"), (11, "13"), (12, "19")])
+        self.assertIn("→ workspace 13", out)
+
+    def test_without_workspaces_everything_opens_in_one_run(self):
+        with mock.patch.object(rt, "_aerospace_windows") as aero:
+            n, runs, moves, _ = self.launch([session("a"), session("b")], "windows", [])
+        self.assertEqual((n, len(runs), moves), (2, 1, []))
+        aero.assert_not_called()
+
+
+class Restart(unittest.TestCase):
+    """--restart ends running sessions and resumes each in the terminal it ran in."""
+
+    def test_inside_an_agent(self):
+        procs = {1: proc(1, 0, "launchd"), 10: proc(10, 1, "zsh"), 20: proc(20, 10, "claude"),
+                 30: proc(30, 20, "bash -c python3"), 40: proc(40, 30, "python3 restore")}
+        with mock.patch.object(rt, "_claude_pid_record_pids", return_value=[]):
+            self.assertTrue(rt._inside_agent(procs, 40))
+            self.assertFalse(rt._inside_agent(procs, 10))
+            self.assertFalse(rt._inside_agent(procs, 20))   # the agent itself is not inside one
+
+    def test_what_can_be_restarted_in_place(self):
+        self.assertTrue(rt._restartable({"terminal": "ghostty", "terminal_id": "T1"}))
+        self.assertFalse(rt._restartable({"terminal": "ghostty"}))
+        self.assertTrue(rt._restartable({"terminal": "terminal", "window_id": "5", "tab_index": 2}))
+        self.assertFalse(rt._restartable({"terminal": "tmux"}))
+        self.assertFalse(rt._restartable({"terminal": None}))
+
+    def entry(self, sid, pid, **kw):
+        return {"tool": "claude", "session_id": sid, "pid": pid, "cwd": "/w/a",
+                "jsonl_path": f"/x/{sid}.jsonl", **kw}
+
+    def run_restart(self, argv, entries, answer="y", tty=True):
+        sessions = [session(e["session_id"]) for e in entries if rt._restartable(e)]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["restore", "--restart", "--no-gh", "--no-ai", *argv]), \
+             mock.patch.object(rt, "IS_MACOS", True), \
+             mock.patch.object(rt, "_inside_agent", return_value=False), \
+             mock.patch.object(rt, "snapshot_active", return_value=entries), \
+             mock.patch.object(rt, "snapshot_to_sessions", return_value=sessions), \
+             mock.patch.object(rt, "enrich_sessions"), \
+             mock.patch.object(rt, "save_snapshot", return_value=Path("/s.json")) as save, \
+             mock.patch.object(rt, "restart_in_place", side_effect=lambda pairs: len(pairs)) as again, \
+             mock.patch.object(sys.stdin, "isatty", return_value=tty), \
+             mock.patch("builtins.input", return_value=answer), \
+             mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            code = rt.main()
+        return code, out.getvalue() + err.getvalue(), save, again
+
+    def test_dry_run_ends_nothing(self):
+        entries = [self.entry("a", 11, terminal="ghostty", terminal_id="T1", aerospace_workspace="13"),
+                   self.entry("b", 12, terminal="tmux")]
+        code, out, save, again = self.run_restart(["--no-pick", "--dangerously-skip-permissions"], entries)
+        self.assertEqual(code, 0)
+        self.assertIn("left alone", out)
+        self.assertIn("(ghostty, workspace 13)", out)
+        self.assertIn("claude --resume a --dangerously-skip-permissions", out)
+        save.assert_not_called()
+        again.assert_not_called()
+
+    def test_execute_asks_first(self):
+        entries = [self.entry("a", 11, terminal="ghostty", terminal_id="T1")]
+        code, out, save, again = self.run_restart(["--no-pick", "--execute"], entries, answer="n")
+        self.assertIn("nothing was ended", out)
+        again.assert_not_called()
+        code, out, save, again = self.run_restart(["--no-pick", "--execute"], entries, tty=False)
+        self.assertEqual(code, 2)
+        again.assert_not_called()
+        code, out, save, again = self.run_restart(["--no-pick", "--execute"], entries, answer="y")
+        self.assertEqual(code, 0)
+        save.assert_called_once()
+        [(s, e)] = again.call_args.args[0]
+        self.assertEqual((s.session_id, e["terminal_id"]), ("a", "T1"))
+
+    def test_refused_inside_an_agent_and_with_load(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["restore", "--restart"]), \
+             mock.patch.object(rt, "IS_MACOS", True), \
+             mock.patch.object(rt, "_inside_agent", return_value=True), \
+             mock.patch.object(rt, "snapshot_active") as snap, mock.patch.object(sys, "stderr", err):
+            self.assertEqual(rt.main(), 2)
+        snap.assert_not_called()
+        self.assertIn("plain terminal", err.getvalue())
+        with mock.patch.object(sys, "argv", ["restore", "--restart", "--load"]), \
+             mock.patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit):
+            rt.main()
+
+    def test_in_place_ends_types_and_checks(self):
+        s1 = session("a", cwd="/w/a", skip_permissions=True)
+        s2 = session("b", cwd="/w/b")
+        e1 = self.entry("a", 11, terminal="ghostty", terminal_id="T1")
+        e2 = self.entry("b", 12, terminal="terminal", window_id="5", tab_index=2)
+        killed, typed = [], []
+
+        def kill(pid, sig):
+            if sig == rt.signal.SIGTERM:
+                killed.append(pid)
+            else:
+                raise ProcessLookupError
+        with mock.patch.object(rt.os, "kill", side_effect=kill), \
+             mock.patch.object(rt, "_osascript", side_effect=lambda script, *a: typed.append(a) or "ok"), \
+             mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "a"}, {"session_id": "b"}]), \
+             mock.patch.object(rt.time, "sleep"), mock.patch.object(sys, "stdout", io.StringIO()):
+            back = rt.restart_in_place([(s1, e1), (s2, e2)])
+        self.assertEqual(back, 2)
+        self.assertEqual(killed, [11, 12])
+        self.assertEqual(typed, [("T1", "cd -- /w/a && claude --resume a --dangerously-skip-permissions"),
+                                 ("5", "2", "cd -- /w/b && claude --resume b")])
+
+    def test_a_session_that_does_not_exit_is_left_running(self):
+        s1 = session("a")
+        e1 = self.entry("a", 11, terminal="ghostty", terminal_id="T1")
+        with mock.patch.object(rt.os, "kill"), \
+             mock.patch.object(rt, "_wait_exit", return_value={11}), \
+             mock.patch.object(rt, "_osascript") as osa, \
+             mock.patch.object(rt, "snapshot_active", return_value=[]), \
+             mock.patch.object(rt.time, "sleep"), mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            back = rt.restart_in_place([(s1, e1)])
+        self.assertEqual(back, 0)
+        osa.assert_not_called()
+        self.assertIn("did not exit", out.getvalue())
+
+
 class SnapshotCompat(unittest.TestCase):
     def test_linux_snapshot_without_new_fields_loads(self):
         with tempfile.TemporaryDirectory() as d:
