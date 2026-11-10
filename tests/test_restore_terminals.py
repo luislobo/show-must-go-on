@@ -985,6 +985,20 @@ class Restart(unittest.TestCase):
         self.assertEqual(typed, [("T1", "cd -- /w/a && claude --resume a --dangerously-skip-permissions"),
                                  ("5", "2", "cd -- /w/b && claude --resume b")])
 
+    def test_already_without_checks_is_left_alone(self):
+        entries = [self.entry("a", 11, terminal="ghostty", terminal_id="T1", skip_permissions=True),
+                   self.entry("b", 12, terminal="ghostty", terminal_id="T2")]
+        code, out, _, _ = self.run_restart(["--no-pick", "--dangerously-skip-permissions"], entries)
+        self.assertEqual(code, 0)
+        self.assertIn("already without permission checks", out)
+        self.assertIn("Would restart 1 session(s)", out)
+        self.assertIn("claude --resume b --dangerously-skip-permissions", out)
+        self.assertNotIn("claude --resume a", out)
+        # without the option every running session can be picked
+        code, out, _, _ = self.run_restart(["--no-pick"], entries)
+        self.assertIn("Would restart 2 session(s)", out)
+        self.assertIn("checks: off now, on after the restart", out)
+
     def test_a_session_that_does_not_exit_is_left_running(self):
         s1 = session("a")
         e1 = self.entry("a", 11, terminal="ghostty", terminal_id="T1")
@@ -1057,11 +1071,11 @@ class RunningSessions(unittest.TestCase):
                 mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(rt.drop_running([s]), [])
 
-    def test_picker_never_sees_a_running_session(self):
+    def test_picker_shows_running_sessions_marked(self):
         ss = [session("a"), session("b")]
         shown = []
         def pick(items):   # returns None: cancelled, so nothing launches
-            shown.extend(s.session_id for s in items)
+            shown.extend((s.session_id, bool(s.live)) for s in items)
         with mock.patch.object(rt, "discover", return_value=ss), \
                 mock.patch.object(rt, "apply_filters", side_effect=lambda found, **kw: found), \
                 mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "a"}]), \
@@ -1075,7 +1089,8 @@ class RunningSessions(unittest.TestCase):
                 mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
                 mock.patch.object(out, "isatty", return_value=True, create=True):
             rt.main()
-        self.assertEqual(shown, ["b"])
+        self.assertEqual(sorted(shown), [("a", True), ("b", False)])
+        self.assertIn("of these run now", out.getvalue())
 
 
 class SnapshotLiveProcess(unittest.TestCase):
@@ -1115,6 +1130,111 @@ class SnapshotLiveProcess(unittest.TestCase):
         self.assertEqual(entry["session_id"], "fake-sid")
         self.assertEqual(entry["cwd"], str(work))
         self.assertEqual(entry["jsonl_path"], str(projects / "fake-sid.jsonl"))
+
+
+class RunningInPicker(unittest.TestCase):
+    """The picker lists running sessions, says what they run with, and
+    restarts the ones picked in place."""
+
+    def test_permission_checks_read_from_the_command_line(self):
+        on = rt.runs_without_checks
+        self.assertTrue(on("claude", ["claude", "--resume", "x", "--dangerously-skip-permissions"]))
+        self.assertTrue(on("claude", ["claude", "--permission-mode", "bypassPermissions"]))
+        self.assertTrue(on("claude", ["claude", "--permission-mode=bypassPermissions"]))
+        self.assertFalse(on("claude", ["claude", "--permission-mode", "plan"]))
+        self.assertFalse(on("claude", ["claude", "--resume", "x"]))
+        self.assertFalse(on("claude", ["claude", "--allow-dangerously-skip-permissions"]))
+        self.assertTrue(on("codex", ["codex", "resume", "--dangerously-bypass-approvals-and-sandbox", "/r"]))
+        self.assertTrue(on("codex", ["codex", "--yolo"]))
+        self.assertFalse(on("codex", ["codex", "resume", "/r"]))
+
+    def live(self, s, skip_now=False, **kw):
+        s.live = {"pid": 7, "terminal": "ghostty", "terminal_id": "T1",
+                  "skip_permissions": skip_now, **kw}
+        return s
+
+    def test_badge_flags_other_settings(self):
+        self.assertEqual(rt._live_badge(session("a")), [])
+        self.assertEqual(rt._live_badge(self.live(session("a"))), [("● running", "bold")])
+        s = self.live(session("b", skip_permissions=True))
+        self.assertEqual(rt._live_badge(s), [("● running, checks on", "warn")])
+        for run_off in (False, True):   # checks off is marked whatever this run does
+            s = self.live(session("c", skip_permissions=run_off), skip_now=True)
+            self.assertEqual(rt._live_badge(s), [("●", "alert"), (" running, checks off", "warn")])
+        self.assertIn("restarts it in place with them off",
+                      rt._live_note(self.live(session("d", skip_permissions=True))))
+        self.assertIn("cannot type into", rt._live_note(self.live(session("e"), terminal="tmux")))
+
+    def test_running_rows_never_look_ticked_and_red_is_only_a_symbol(self):
+        rows = [self.live(session("a")), self.live(session("b", skip_permissions=True)),
+                self.live(session("c"), skip_now=True)]
+        for s in rows:
+            segs = rt._live_badge(s)
+            self.assertNotIn("ok", [r for _, r in segs])   # green means ticked
+            self.assertTrue(all(t == "●" for t, r in segs if r == "alert"))
+
+    def test_running_column_keeps_rows_aligned(self):
+        rows = [session("a"), self.live(session("b")), self.live(session("c", skip_permissions=True)),
+                self.live(session("d"), skip_now=True)]
+        w = max(rt._badge_len(s) for s in rows)
+        cwd_at = ["".join(t for t, _ in rt._row_segments(s, 120, w)).index(" /w/a") for s in rows]
+        self.assertEqual(len(set(cwd_at)), 1)
+        self.assertNotIn("running", rt._row_text(rows[1], 120))   # no column without live_w
+
+    def test_details_and_footer_say_what_picking_does(self):
+        s = self.live(session("a", skip_permissions=True))
+        text = "\n".join("".join(t for t, _ in line) for line in rt._detail_lines(s, 100))
+        self.assertIn("Running now", text)
+        self.assertIn("on now; this run resumes with them off", text)
+        loc, _ = rt._picker_footer(s)
+        self.assertIn("picking it restarts it in place", loc[0][0])
+
+    def test_picked_running_sessions_restart_and_the_rest_open(self):
+        new, running = session("a"), self.live(session("b"))
+        args = types.SimpleNamespace()
+        with mock.patch.object(rt, "_plan_and_launch") as launch, \
+             mock.patch.object(rt, "_restart_picked", return_value=0) as again:
+            self.assertEqual(rt._launch_and_restart(None, args, [new, running]), 0)
+        self.assertEqual(launch.call_args.args[2], [new])
+        self.assertEqual(again.call_args.args[1], [running])
+        with mock.patch.object(rt, "_plan_and_launch") as launch, \
+             mock.patch.object(rt, "_restart_picked", return_value=0):
+            rt._launch_and_restart(None, args, [running])
+        launch.assert_not_called()
+
+    def test_restart_picked(self):
+        args = types.SimpleNamespace(execute=False)
+        tmux = self.live(session("t"), terminal="tmux")
+        s = self.live(session("a", skip_permissions=True))
+        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(rt._restart_picked(args, [tmux, s]), 0)
+        self.assertIn("left running", out.getvalue())
+        self.assertIn("Would restart 1 session(s)", out.getvalue())
+        self.assertIn("checks: on now, off after the restart", out.getvalue())
+        # with --execute, never from inside an agent: it would end restore too
+        args.execute = True
+        with mock.patch.object(rt, "_inside_agent", return_value=True), \
+             mock.patch.object(rt, "restart_in_place") as again, \
+             mock.patch.object(sys, "stdout", io.StringIO()), \
+             mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(rt._restart_picked(args, [s]), 2)
+        again.assert_not_called()
+        self.assertIn("plain terminal", err.getvalue())
+
+    def test_a_running_session_the_filters_dropped_is_listed(self):
+        old, new, idle = session("old"), session("new"), session("idle")
+        with mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "old"}]), \
+             mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            shown = rt._running_in_list(types.SimpleNamespace(pick=True), [new], [old, new, idle])
+        self.assertEqual(sorted(s.session_id for s in shown), ["new", "old"])
+        self.assertIn("1 listed only because they run", out.getvalue())
+
+    def test_without_the_picker_running_sessions_are_left_out(self):
+        ss = [session("a"), session("b")]
+        with mock.patch.object(rt, "snapshot_active", return_value=[{"session_id": "a"}]), \
+             mock.patch.object(sys, "stdout", io.StringIO()):
+            kept = rt._running_in_list(types.SimpleNamespace(pick=False), ss)
+        self.assertEqual([s.session_id for s in kept], ["b"])
 
 
 if __name__ == "__main__":

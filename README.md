@@ -29,9 +29,9 @@ restore --execute        # recover from session history on disk
 - **Session discovery** — scans `~/.claude/projects/` and `~/.codex/sessions/` for all session history
 - **Live snapshot** (`--save`) — detects running claude/codex sessions (via `/proc` on Linux, `ps` and `lsof` on macOS), captures their session IDs, cwds, **i3 workspace names** or **Ghostty/Terminal.app window and tab**, and **window titles**
 - **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused. When Claude Code writes these records, a `claude` process without one (`claude agents`, `claude mcp …`) is not counted as a session
-- **Snapshot restore** (`--load`) — reopens sessions from a snapshot, skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
+- **Snapshot restore** (`--load`) — reopens sessions from a snapshot, marks or skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
 - **AeroSpace workspaces** (macOS) — with the [AeroSpace](https://github.com/nikitabobko/AeroSpace) tiling window manager running, `--save` records each Ghostty or Terminal.app window's workspace, and `--load` moves each window it opens back there
-- **Restart in place** (`--restart`, macOS) — ends the running sessions you pick and resumes each in the same Ghostty or Terminal.app tab, so window, tab, split and workspace stay as they were; with `--dangerously-skip-permissions` they come back with permission checks off
+- **Restart in place** (`--restart`, macOS) — ends the running sessions you pick and resumes each in the same Ghostty or Terminal.app tab, so window, tab, split and workspace stay as they were; with `--dangerously-skip-permissions` they come back with permission checks off, and sessions that already run that way are left alone
 - **Smart filtering** — configurable lookback window, minimum activity thresholds, dead-cwd detection
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
 - **Agent titles** — the name Claude Code gives a session, or the one you set with `/rename`, is shown first in the picker, the details page and the plan, with the AI topic beside it (once, when the two say the same); it is also the window title restore opens. Codex sessions show the AI topic only
@@ -46,7 +46,7 @@ restore --execute        # recover from session history on disk
 - **Ghostty backend** (macOS) — `--target=ghostty` opens one Ghostty window per session through Ghostty's AppleScript support; splits, tabs, or the saved windows and tabs on request
 - **Terminal.app backend** (macOS) — `--target=terminal` opens one Terminal.app window per session
 - **Byobu/tmux backend** — `--target=byobu` rebuilds sessions into panes/windows for SSH or non-GUI machines
-- **Duplicate detection** — sessions that are already running are left out of the picker and the plan in every mode (`--load`, the normal picker, `--find`), so a session is never resumed twice; a second copy would write to the same transcript
+- **Running sessions in the picker** — a session an agent runs now is listed with `● running`, even when the day and activity filters would leave it out, and picking it restarts it in place rather than opening a second copy, which would write to the same transcript. `● running, checks on`, in yellow, marks one that still asks for permission when this run has `--dangerously-skip-permissions`, and `● running, checks off`, with a red ●, one that runs without permission checks. A running row is never green, the color of a ticked row. Without the picker (`--no-pick`) running sessions are left out of the plan
 - **Git metadata** — resolves each session's working directory to its git remote and current branch
 - **GitHub PR metadata** — when `gh` is installed and authenticated, shows PR number, state, title, and URL for matching branches
 - **Fast search prefilter** — when `rg` is installed, `--find` narrows candidate JSONL files before Python parsing
@@ -166,8 +166,8 @@ restore --save
 # After reboot: reopen everything (i3 workspaces on Linux, one window per session on macOS)
 restore --load --execute
 
-# If all sessions are already running, --load does nothing
-restore --load --execute
+# Without the picker, sessions that are already running are skipped
+restore --load --no-pick --execute
 #=> "skipped 10 already-running session(s)"
 ```
 
@@ -230,6 +230,8 @@ restore --restart --dangerously-skip-permissions --execute
 ```
 
 `--restart` lists the running sessions in the picker (or all of them with `--no-pick`), then for each one sends its agent SIGTERM, waits for it to exit, and types the resume command into the shell left in its Ghostty terminal or Terminal.app tab. The window, tab, split and AeroSpace workspace stay where they were. It then checks that each session runs again and reports any that did not. Before ending anything it saves a snapshot, so `restore --load` reopens a session that does not come back.
+
+The normal picker and `--load` list running sessions too, marked `● running`, and picking one does the same restart; the plan lists those under "Would restart". Each running session's row shows its permission setting where it matters: `● running` (bold) when nothing would change, `● running, checks on` (yellow) when it still asks for permission and the run has `--dangerously-skip-permissions`, and `● running, checks off` (red ●, yellow words) whenever it runs without permission checks. Red colors only the ●: red text falls below 4.5:1 on some themes, a symbol needs 3:1. The setting is read from the agent's command line (`--dangerously-skip-permissions` or `--permission-mode bypassPermissions` for Claude Code, `--dangerously-bypass-approvals-and-sandbox` or `--yolo` for Codex); a mode changed inside the session with Shift+Tab is not seen. With `--restart --dangerously-skip-permissions`, sessions that already run without checks are left out of the picker and listed as left alone.
 
 - **Run it from a plain terminal.** Run inside an agent session, it would end the session it runs in, so it refuses.
 - **`--execute` asks first**, and refuses without a terminal to ask in. A turn an agent is in the middle of is lost; the transcript up to it is not.
@@ -323,7 +325,7 @@ The current row has a `▶` in the gutter and bold text. Colours come from your 
 1. **Scan** — walks `~/.claude/projects/*/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`
 2. **Parse** — extracts timestamps, message counts, user prompts, cwd, and interrupted status from each JSONL file
 3. **Filter** — removes sessions outside the lookback window, below activity thresholds, or with dead cwds
-4. **Rank** — by last activity (normal mode) or by relevance score (search mode), leaving out sessions that are already running
+4. **Rank** — by last activity (normal mode) or by relevance score (search mode). With the picker, running sessions are marked and every running one is listed; without it they are left out
 5. **Summarize** — feeds project context (README.md, CLAUDE.md, etc.) + last-hour transcript to `claude -p`, caches the result
 6. **Pick** — curses TUI for interactive selection
 7. **Launch** — opens each session with the chosen `--target`:
@@ -335,10 +337,10 @@ The current row has a `▶` in the gutter and bold text. Colours come from your 
 ### Snapshot mode (--save / --load)
 
 1. **Save** — lists running `claude`/`codex` processes (`/proc` on Linux, `ps` + `lsof` on macOS), resolves each to its session ID (via `~/.claude/sessions/<pid>.json`, the `--session-id` or `--resume` argument, the process's open files, or, only for Claude Code versions that write no pid records, the newest transcript for its folder), and records where it runs: the i3 workspace and window title via `i3-msg -t get_tree` + `wmctrl -lp` on Linux, or the Ghostty / Terminal.app window and tab via AppleScript on macOS
-2. **Load** — reads the snapshot, checks which sessions are already running (skips those), parses the JSONL files for metadata, runs through the same summarize/pick/launch pipeline
+2. **Load** — reads the snapshot, checks which sessions are already running (marks them in the picker, or skips them with `--no-pick`), parses the JSONL files for metadata, runs through the same summarize/pick/launch pipeline
 3. **Launch** — on Linux, spawns each Terminator window, then uses `i3-msg '[id=<wid>] move to workspace <name>'` to place it on the saved workspace. On macOS, opens the sessions in Ghostty or Terminal.app; `--layout=saved` puts Ghostty sessions back in their saved window and tab
 
-Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`, `pid`, `jsonl_path`, `workspace` and `window_title`, plus `terminal` (the host terminal: ghostty, terminal, terminator, tmux or iterm) and, on macOS, `window_id`, `tab_index`, `window_name` (the window's title), `terminal_id` (the Ghostty terminal's own id) and, with AeroSpace, `aerospace_workspace`. Snapshots saved before these fields existed still load.
+Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`, `pid`, `jsonl_path`, `workspace` and `window_title`, plus `skip_permissions` (whether the agent was started with permission checks off; `--load` does not act on it), `terminal` (the host terminal: ghostty, terminal, terminator, tmux or iterm) and, on macOS, `window_id`, `tab_index`, `window_name` (the window's title), `terminal_id` (the Ghostty terminal's own id) and, with AeroSpace, `aerospace_workspace`. Snapshots saved before these fields existed still load.
 
 ### Terminator placement (Linux)
 
@@ -476,7 +478,7 @@ chosen = pick(
 )
 ```
 
-`row`, `footer` and `details` return `(text, role)` pieces; the roles are `accent`, `ok`, `warn`, `heart`, `bold` and `""`. `pick()` returns the ticked items, the highlighted one when none is ticked, or `None` when the user quits.
+`row`, `footer` and `details` return `(text, role)` pieces; the roles are `accent`, `ok`, `warn`, `heart` and `alert` (red, for a symbol only), `bold` and `""`. `pick()` returns the ticked items, the highlighted one when none is ticked, or `None` when the user quits.
 
 ## License
 

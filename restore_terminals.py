@@ -85,6 +85,7 @@ class Session:
     tab_index: int | None = None    # 1-based tab within window_id at snapshot time
     skip_permissions: bool = False  # resume with the agent's permission checks off
     aerospace_workspace: str | None = None  # macOS AeroSpace workspace at snapshot time
+    live: dict | None = None        # its snapshot_active() entry while an agent runs it
 
     @property
     def span_minutes(self) -> float:
@@ -813,6 +814,23 @@ SKIP_PERMISSIONS_FLAG = {
 }
 
 
+def runs_without_checks(tool: str, argv: list[str]) -> bool:
+    """Whether a running agent's command line turned its permission checks off.
+    Only the command line is seen: a mode changed inside the session (Shift+Tab
+    in Claude Code) or set in the agent's settings is not."""
+    args = argv[1:]
+    if SKIP_PERMISSIONS_FLAG.get(tool) in args:
+        return True
+    if tool == "codex":
+        return "--yolo" in args
+    for i, a in enumerate(args):
+        if a == "--permission-mode=bypassPermissions":
+            return True
+        if a == "--permission-mode" and args[i + 1:i + 2] == ["bypassPermissions"]:
+            return True
+    return False
+
+
 def skip_permissions(sessions: list[Session], on: bool) -> None:
     """Mark the sessions to resume with permission checks off. Set before the
     picker, so its details page shows the command that will run."""
@@ -1383,7 +1401,7 @@ def print_plan(sessions: list[Session], use_summary: bool, target: str = "termin
                 f"(--dry-run; i3 will tile them):\n")
     print(head)
     if any(s.skip_permissions for s in sessions):
-        print(f"  {paint('--dangerously-skip-permissions:', 'warn')} every session runs with its "
+        print(f"  {paint('●', 'alert')} {paint('--dangerously-skip-permissions:', 'warn')} every session runs with its "
               f"agent's permission checks off\n")
     for i, s in enumerate(sessions, 1):
         flag = " [INTERRUPTED]" if s.interrupted else ""
@@ -2117,6 +2135,7 @@ def snapshot_active(with_windows: bool = True) -> list[dict]:
                 "pid": p.pid,
                 "jsonl_path": jsonl_path,
                 "terminal": _host_terminal(p.pid, procs),
+                "skip_permissions": runs_without_checks(tool, p.argv),
                 "workspace": "?",
                 "window_title": "?",
             }
@@ -2157,6 +2176,43 @@ def drop_running(sessions: list[Session]) -> list[Session]:
     if skipped:
         print(f"  {paint('skipped', 'accent')} {paint(skipped, 'bold')} already-running session(s)")
     return kept
+
+
+def mark_running(sessions: list[Session]) -> int:
+    """Give each session an agent runs now its process entry (Session.live),
+    with the terminal it runs in on macOS, so the picker can show it and
+    restart it in place. Returns how many run."""
+    by_key: dict[str, dict] = {}
+    for e in snapshot_active(with_windows=IS_MACOS):
+        by_key.setdefault(e["session_id"], e)
+        if e.get("jsonl_path"):
+            by_key.setdefault(Path(e["jsonl_path"]).stem, e)
+    for s in sessions:
+        s.live = by_key.get(s.session_id) or by_key.get(s.path.stem)
+    return sum(1 for s in sessions if s.live)
+
+
+def _running_in_list(args, sessions: list[Session],
+                     everything: list[Session] | None = None) -> list[Session]:
+    """With the picker, keep running sessions in the list and mark them, so
+    picking one restarts it in place. Without it, leave them out: every
+    session listed would be opened a second time.
+
+    everything is every session found before the filters: one that runs is
+    listed even when the filters dropped it, say after a week idle."""
+    if not args.pick:
+        return drop_running(sessions)
+    mark_running(everything if everything is not None else sessions)
+    listed = {id(s) for s in sessions}
+    extra = [s for s in everything or [] if s.live and id(s) not in listed]
+    if extra:
+        sessions = rank(sessions + extra)
+    n = sum(1 for s in sessions if s.live)
+    if n:
+        print(f"  {paint(n, 'bold')} of these run now, marked {paint('● running', 'ok')} in the "
+              f"picker; picking one restarts it in place"
+              + (f" ({len(extra)} listed only because they run)" if extra else ""))
+    return sessions
 
 
 def _placement_label(entry: dict) -> str:
@@ -2348,8 +2404,53 @@ def cache_record(s: Session) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
-    """One picker row as (text, role) pieces; roles as in termui."""
+def _checks(off: bool) -> str:
+    return "off" if off else "on"
+
+
+def _live_badge(s: Session) -> list[tuple[str, str]]:
+    """The picker's running column, as (text, role) pieces.
+
+        ● running              bold: nothing would change
+        ● running, checks on   yellow: this run would turn the checks off
+        ● running, checks off  red ●, yellow words: running without checks
+
+    Green is left to ticked rows, so a running row never looks selected, and
+    red only colors the ●: red text falls below 4.5:1 on some themes."""
+    if not s.live:
+        return []
+    if s.live.get("skip_permissions"):
+        return [("●", "alert"), (" running, checks off", "warn")]
+    if s.skip_permissions:
+        return [("● running, checks on", "warn")]
+    return [("● running", "bold")]
+
+
+def _live_role(s: Session) -> str:
+    """One color for a running session's note: yellow when its checks are
+    off or this run would change them."""
+    return "warn" if s.live.get("skip_permissions") or s.skip_permissions else ""
+
+
+def _badge_len(s: Session) -> int:
+    return sum(len(t) for t, _ in _live_badge(s))
+
+
+def _live_note(s: Session) -> str:
+    """What picking a running session does, for the footer and details page."""
+    where = _where(s.live)
+    now_off = bool(s.live.get("skip_permissions"))
+    if not _restartable(s.live):
+        return f"running ({where}); restore cannot type into that terminal, so picking it does nothing"
+    if now_off == s.skip_permissions:
+        return f"running ({where}); picking it restarts it in place"
+    return (f"running ({where}) with permission checks {_checks(now_off)}; "
+            f"picking it restarts it in place with them {_checks(s.skip_permissions)}")
+
+
+def _row_segments(s: Session, width: int, live_w: int = 0) -> list[tuple[str, str]]:
+    """One picker row as (text, role) pieces; roles as in termui. live_w is
+    the running column's width, 0 when no session in the list runs."""
     age = f"{s.age_days:4.1f}d"
     tool = f"{s.tool:<6}"
     cwd = short_cwd(s.cwd) or "?"
@@ -2367,8 +2468,12 @@ def _row_segments(s: Session, width: int) -> list[tuple[str, str]]:
         ("!" if s.interrupted else " ", "warn"),
         (f" {age} ", ""),
         (tool, "accent"),
-        (f" {cwd}", ""),
     ]
+    if live_w:
+        segs.append((" ", ""))
+        segs.extend(_live_badge(s))
+        segs.append((" " * (live_w - _badge_len(s)), ""))
+    segs.append((f" {cwd}", ""))
     if branch:
         segs.append((f"  {branch}", "ok"))
     if pr_marker:
@@ -2464,6 +2569,14 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
     if s.window_title and s.window_title != "?":
         field("window", s.window_title)
 
+    if s.live:
+        heading("Running now")
+        field("process", f"pid {s.live.get('pid')}  ({_where(s.live)})")
+        now_off = bool(s.live.get("skip_permissions"))
+        field("checks", f"{_checks(now_off)} now; this run resumes with them "
+                        f"{_checks(s.skip_permissions)}", _live_role(s))
+        field("if picked", _live_note(s).split("; ", 1)[-1])
+
     if s.abstract or s.summary_error:
         heading("Summary")
         para(s.abstract)
@@ -2500,6 +2613,8 @@ def _detail_lines(s: Session, width: int) -> list[list[tuple[str, str]]]:
 def _picker_footer(cur: Session) -> tuple[list[tuple[str, str]], str]:
     """Footer for the highlighted session: location pieces, then the abstract."""
     loc: list[tuple[str, str]] = []
+    if cur.live:
+        loc.append((_live_note(cur), _live_role(cur)))
     if cur.cwd:
         loc.append((short_cwd(cur.cwd), "bold"))
     if cur.git_branch:
@@ -2526,7 +2641,9 @@ def _picker_footer(cur: Session) -> tuple[list[tuple[str, str]], str]:
 
 def tui_pick(sessions: list[Session]) -> list[Session] | None:
     """Return user-selected subset, or None if user quit. Requires a real TTY."""
-    return pick(sessions, title="restore-terminals", noun="session", row=_row_segments,
+    live_w = max((_badge_len(s) for s in sessions), default=0)
+    return pick(sessions, title="restore-terminals", noun="session",
+                row=lambda s, width: _row_segments(s, width, live_w),
                 footer=_picker_footer, details=_detail_lines, tagline=TAGLINE)
 
 
@@ -2807,11 +2924,22 @@ def restart(args, tools: set[str]) -> int:
     left = [e for e in entries if not _restartable(e)]
     by_path = {e["jsonl_path"]: e for e in here if e.get("jsonl_path")}
     sessions = [s for s in snapshot_to_sessions(here) if str(s.path) in by_path]
+    for s in sessions:
+        s.live = by_path[str(s.path)]
     if left:
         print(f"  {paint('left alone', 'accent')} {paint(len(left), 'bold')} running "
               f"session(s) not in a Ghostty or Terminal.app tab restore can type into:")
         for e in left:
             print(f"    {e['tool']:<6}  {short_cwd(e['cwd'])}  ({e.get('terminal') or 'no terminal'})")
+    if args.dangerously_skip_permissions:
+        # restarting these would bring them back as they run now
+        done = [s for s in sessions if s.live.get("skip_permissions")]
+        sessions = [s for s in sessions if not s.live.get("skip_permissions")]
+        if done:
+            print(f"  {paint('left alone', 'accent')} {paint(len(done), 'bold')} running "
+                  f"session(s) already without permission checks:")
+            for s in done:
+                print(f"    {s.tool:<6}  {short_cwd(s.cwd)}  —  {display_title(s)}")
     if not sessions:
         print("  no running sessions to restart.")
         return 0
@@ -2819,24 +2947,44 @@ def restart(args, tools: set[str]) -> int:
     picked = _enrich_and_pick(args, sessions)
     if not picked:
         return 0
+    return _restart_picked(args, picked)
 
+
+def _restart_picked(args, picked: list[Session]) -> int:
+    """Print the plan for running sessions that were picked, and with
+    --execute, ask, save a snapshot, and restart each where it runs."""
+    for s in picked:
+        if not _restartable(s.live):
+            print(f"\n  {paint('left running', 'warn')}: {display_title(s)} ({_where(s.live)}); "
+                  f"restore cannot type into that terminal")
+    picked = [s for s in picked if _restartable(s.live)]
+    if not picked:
+        return 0
     if args.execute:
         print(f"\n  Will restart {len(picked)} session(s) in their own terminal:\n")
     else:
         print(f"\n  Would restart {len(picked)} session(s) in their own terminal  (--dry-run):\n")
     if any(s.skip_permissions for s in picked):
-        print(f"  {paint('--dangerously-skip-permissions:', 'warn')} every session comes back "
+        print(f"  {paint('●', 'alert')} {paint('--dangerously-skip-permissions:', 'warn')} every session comes back "
               f"with its agent's permission checks off\n")
     for s in picked:
-        e = by_path[str(s.path)]
-        print(f"    {paint(display_title(s), 'bold')}  ({_where(e)})")
+        print(f"    {paint(display_title(s), 'bold')}  ({_where(s.live)})")
         print(f"      {short_cwd(s.cwd)}")
+        now_off = bool(s.live.get("skip_permissions"))
+        if now_off != s.skip_permissions:
+            mark = paint('●', 'alert') + ' ' if s.skip_permissions else ''
+            print(f"      {mark}{paint('checks', 'warn')}: {_checks(now_off)} now, "
+                  f"{_checks(s.skip_permissions)} after the restart")
         print(f"      cmd : {_shell_line(s)}")
     if not args.execute:
         print("\n  (dry-run; nothing was ended — add --execute to restart them)\n")
         return 0
+    if _inside_agent(_list_procs()):
+        print("  restarting ends agent sessions, and restore is running inside one, which "
+              "it would end too. Run it from a plain terminal.", file=sys.stderr)
+        return 2
     if not sys.stdin.isatty():
-        print("  --restart --execute asks before ending anything; run it in a terminal.",
+        print("  restarting running sessions asks before ending anything; run it in a terminal.",
               file=sys.stderr)
         return 2
     answer = input(f"\n  End {len(picked)} agent session(s) and resume them in place? "
@@ -2844,12 +2992,22 @@ def restart(args, tools: set[str]) -> int:
     if answer.strip().lower() not in ("y", "yes"):
         print("  nothing was ended.")
         return 0
+    entries = snapshot_active()
     path = save_snapshot(entries)
     print(f"  saved {len(entries)} session(s) to {short_cwd(str(path))}; "
           f"restore --load reopens any that do not come back")
-    back = restart_in_place([(s, by_path[str(s.path)]) for s in picked])
+    back = restart_in_place([(s, s.live) for s in picked])
     print(f"  done — {back}/{len(picked)} running again\n")
     return 0 if back == len(picked) else 1
+
+
+def _launch_and_restart(ap, args, picked: list[Session]) -> int:
+    """Open the picked sessions that are not running; restart the running ones in place."""
+    new = [s for s in picked if not s.live]
+    running = [s for s in picked if s.live]
+    if new or not running:
+        _plan_and_launch(ap, args, new)
+    return _restart_picked(args, running) if running else 0
 
 
 def _backend_label(target: str) -> str:
@@ -3006,7 +3164,7 @@ def main() -> int:
         if not ranked:
             print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
             return 1
-        ranked = drop_running(ranked)
+        ranked = _running_in_list(args, ranked)
         if not ranked:
             print(f"  {paint('all sessions are already running', 'ok')} — nothing to restore.")
             return 0
@@ -3017,8 +3175,7 @@ def main() -> int:
         to_show = _enrich_and_pick(args, ranked)
         if to_show is None:
             return 0
-        _plan_and_launch(ap, args, to_show)
-        return 0
+        return _launch_and_restart(ap, args, to_show)
 
     # --find mode: content search, then rank by relevance
     if args.find:
@@ -3065,7 +3222,8 @@ def main() -> int:
         ranked = rank(filtered)
         print_stats(all_found, filtered, ranked)
 
-    ranked = drop_running(ranked)
+    # a search lists what matches; otherwise every running session is listed
+    ranked = _running_in_list(args, ranked, None if args.find else all_found)
     skip_permissions(ranked, args.dangerously_skip_permissions)
     # fail on a layout no session can use before summaries, PRs and the picker
     _check_layout(ap, args, _target_groups(args.target, ranked))
@@ -3098,8 +3256,7 @@ def main() -> int:
         to_show = picked
         print(f"\n  {paint('selected', 'ok')} {paint(f'{len(to_show)}/{len(ranked)}', 'bold')} session(s)")
 
-    _plan_and_launch(ap, args, to_show)
-    return 0
+    return _launch_and_restart(ap, args, to_show)
 
 
 if __name__ == "__main__":
