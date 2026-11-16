@@ -38,7 +38,7 @@ restore --execute        # recover from session history on disk
 - **Persistent cache** — summaries are saved to `~/.ai/sessions.jsonl`; subsequent runs reuse them unless the session has new activity
 - **Content search** — `--find` searches all session transcripts for a branch name, repo, Jira ticket, or any regex
 - **Relevance ranking** — search results ranked by match count, recency, user-message weight, and git branch match
-- **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q), and a details page per session on `→`
+- **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q), and a details page per session on `→`. Each row starts with what the session is about, in a column half the row wide so titles line up, then its age, tool, running state, folder, branch and PR
 - **Colour that follows your theme** — the picker and the progress lines use the terminal's own palette, normal ANSI colours only, plain when piped; `NO_COLOR` turns it off
 - **Reusable terminal UI** — `termui.py` (colours, progress paint, wrapping, the picker) is one stdlib-only file another project can copy
 - **i3 workspace-aware** (Linux) — saves and restores the exact i3 workspace (including custom names like `" 1 "`) for each session
@@ -316,7 +316,7 @@ The details page shows everything restore knows about the session: its id, statu
 | `space` | Toggle this session's checkbox |
 | `←` / `h` / `q` / `ESC` | Back to the list |
 
-The current row has a `▶` in the gutter and bold text. Colours come from your terminal's own palette, so they follow its light or dark theme: cyan for the tool and the key hints, green for ticked rows, branches and open PRs, and yellow for interrupted sessions (`!`) and search hits. Only the normal ANSI colours are used, never the bright ones, which are hard to read on light backgrounds. The progress lines printed while restore scans, summarizes and searches use the same colours, with the numbers in bold; they stay plain when the output is piped or redirected. `find-session` uses them too, and highlights the search term in yellow inside each snippet. Set `NO_COLOR=1` to turn colour off.
+The current row is a bar across the screen in reverse video, your theme's text and background colors swapped, with a `▶` in the gutter: it stands out on any theme and keeps the body text's contrast, and no other color is drawn on it. Colours come from your terminal's own palette, so they follow its light or dark theme: cyan for the tool and the key hints, green for ticked rows, branches and open PRs, yellow for interrupted sessions (`!`), search hits and running sessions whose permission setting matters, and red only for the ● of a session running without permission checks. Only the normal ANSI colours are used, never the bright ones, which are hard to read on light backgrounds. The progress lines printed while restore scans, summarizes and searches use the same colours, with the numbers in bold; they stay plain when the output is piped or redirected. `find-session` uses them too, and highlights the search term in yellow inside each snippet. Set `NO_COLOR=1` to turn colour off.
 
 ## How it works
 

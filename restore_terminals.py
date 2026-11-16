@@ -2209,7 +2209,7 @@ def _running_in_list(args, sessions: list[Session],
         sessions = rank(sessions + extra)
     n = sum(1 for s in sessions if s.live)
     if n:
-        print(f"  {paint(n, 'bold')} of these run now, marked {paint('● running', 'ok')} in the "
+        print(f"  {paint(n, 'bold')} of these run now, marked {paint('● running', 'bold')} in the "
               f"picker; picking one restarts it in place"
               + (f" ({len(extra)} listed only because they run)" if extra else ""))
     return sessions
@@ -2448,55 +2448,63 @@ def _live_note(s: Session) -> str:
             f"picking it restarts it in place with them {_checks(s.skip_permissions)}")
 
 
+def _title_segments(s: Session, room: int) -> list[tuple[str, str]]:
+    """What the session is about, in at most room characters: the agent's
+    title in bold, then restore's topic. When both do not fit, the topic gives
+    way first, down to 12 characters; past that the agent's title is cut too,
+    keeping at least half the room."""
+    if not s.agent_title:
+        label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
+        return [(_truncate(label, room), "")]
+    second = _second_title(s)
+    room_for_first = room
+    if second:
+        room_for_first = max(10, room // 2, room - 3 - min(len(second), 12))
+    first = _truncate(s.agent_title, room_for_first)
+    segs = [(first, "bold")]
+    left = room - len(first) - 3
+    if second and left >= 8:
+        segs.append((f" · {_truncate(second, left)}", ""))
+    return segs
+
+
 def _row_segments(s: Session, width: int, live_w: int = 0) -> list[tuple[str, str]]:
-    """One picker row as (text, role) pieces; roles as in termui. live_w is
-    the running column's width, 0 when no session in the list runs."""
-    age = f"{s.age_days:4.1f}d"
-    tool = f"{s.tool:<6}"
-    cwd = short_cwd(s.cwd) or "?"
-    branch = _truncate(s.git_branch, 25) if s.git_branch else ""
-    pr_marker = ""
+    """One picker row as (text, role) pieces; roles as in termui.
+
+    What the session is about comes first, in a column half the row wide, so
+    titles line up; then age, tool, the running column, folder, branch, PR and
+    search hits, clipped to what is left. live_w is the running column's
+    width, 0 when no session in the list runs."""
+    title_w = max(20, width // 2)
+    title = _title_segments(s, title_w)
+    segs = [("!" if s.interrupted else " ", "warn"), (" ", "")]
+    segs += title
+    segs.append((" " * (title_w - sum(len(t) for t, _ in title)) + "  ", ""))
+
+    rest = [(f"{s.age_days:4.1f}d ", ""), (f"{s.tool:<6}", "accent")]
+    if live_w:
+        rest.append((" ", ""))
+        rest.extend(_live_badge(s))
+        rest.append((" " * (live_w - _badge_len(s)), ""))
+    rest.append((f" {short_cwd(s.cwd) or '?'}", ""))
+    if s.git_branch:
+        rest.append((f"  {_truncate(s.git_branch, 25)}", "ok"))
     if s.pr_number:
         # short PR badge: #123 (o)pen / (m)erged / (c)losed — keeps row tight
-        st = (s.pr_state or "")[:1]
-        pr_marker = f" #{s.pr_number}{st}"
-    label = s.topic or _truncate(s.first_user_prompt, 80) or "(no prompt)"
-    second = _second_title(s)
+        rest.append((f" #{s.pr_number}{(s.pr_state or '')[:1]}",
+                     "ok" if s.pr_state == "open" else ""))
     n_hits = len(s.search_matches)
-    hits = f" ({n_hits} hit{'' if n_hits == 1 else 's'})" if n_hits else ""
-    segs = [
-        ("!" if s.interrupted else " ", "warn"),
-        (f" {age} ", ""),
-        (tool, "accent"),
-    ]
-    if live_w:
-        segs.append((" ", ""))
-        segs.extend(_live_badge(s))
-        segs.append((" " * (live_w - _badge_len(s)), ""))
-    segs.append((f" {cwd}", ""))
-    if branch:
-        segs.append((f"  {branch}", "ok"))
-    if pr_marker:
-        segs.append((pr_marker, "ok" if s.pr_state == "open" else ""))
-    if hits:
-        segs.append((hits, "warn"))
-    used = sum(len(t) for t, _ in segs)
-    remaining = max(10, width - used - 7)
-    if not s.agent_title:
-        segs.append((f"  {_truncate(label, remaining)}", ""))
-        return segs
-    # the agent's title first; restore's topic after it, in what room is left.
-    # When both do not fit, the topic gives way first, down to 12 characters;
-    # past that the agent's title is cut too, keeping at least half the room.
-    room_for_first = remaining
-    if second:
-        room_for_first = max(10, remaining // 2, remaining - 3 - min(len(second), 12))
-    first = _truncate(s.agent_title, room_for_first)
-    segs.append(("  ", ""))
-    segs.append((first, "bold"))
-    room = remaining - len(first) - 3
-    if second and room >= 8:
-        segs.append((f" · {_truncate(second, room)}", ""))
+    if n_hits:
+        rest.append((f" ({n_hits} hit{'' if n_hits == 1 else 's'})", "warn"))
+
+    room = width - sum(len(t) for t, _ in segs)
+    for text, role in rest:
+        if room <= 0:
+            break
+        if len(text) > room:
+            text = text[:room - 1] + "…"
+        segs.append((text, role))
+        room -= len(text)
     return segs
 
 
