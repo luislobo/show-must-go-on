@@ -569,8 +569,9 @@ class PickerRows(unittest.TestCase):
         self.assertEqual(roles["#7o"], "ok")
         self.assertEqual(roles["(1 hit)"], "warn")
         self.assertTrue(set(r for _, r in segs) <= set(termui.ROLE_COLORS) | {""})
+        # what it is about first, in a column half the row wide, then the rest
         self.assertRegex(rt._row_text(s, 120),
-                         r"^! +\d+\.\dd claude ~/Dev  main #7o \(1 hit\)  Fix the loader$")
+                         r"^! Fix the loader {46}  +\d+\.\dd claude ~/Dev  main #7o \(1 hit\)$")
 
     def test_hit_count_is_pluralised(self):
         s = session()
@@ -589,21 +590,32 @@ class PickerRows(unittest.TestCase):
         s = session(cwd="/w/a", agent_title="loader v2", topic="Fix the loader retries")
         segs = rt._row_segments(s, 120)
         self.assertIn(("loader v2", "bold"), segs)
-        self.assertTrue(rt._row_text(s, 120).endswith("  loader v2 · Fix the loader retries"))
+        self.assertTrue(rt._row_text(s, 120).startswith("  loader v2 · Fix the loader retries  "))
 
     def test_same_title_twice_is_shown_once(self):
         s = session(cwd="/w/a", agent_title="Fix the loader", topic="fix the loader ")
-        self.assertTrue(rt._row_text(s, 120).endswith("  Fix the loader"))
+        self.assertTrue(rt._row_text(s, 120).startswith("  Fix the loader  "))
+        self.assertNotIn("·", rt._row_text(s, 120))
 
     def test_long_agent_title_is_kept_whole_when_the_row_has_room(self):
         s = session(cwd="/w/a", agent_title="Webhook retries flooding slow endpoints",
                     topic="Webhook retry backoff fix")
-        self.assertTrue(rt._row_text(s, 100).endswith(
-            "  Webhook retries flooding slow endpoints · Webhook retry backoff fix"))
+        self.assertTrue(rt._row_text(s, 140).startswith(
+            "  Webhook retries flooding slow endpoints · Webhook retry backoff fix  "))
         # short of room, the topic is cut before the agent's title
-        text = rt._row_text(s, 85)
-        self.assertIn("  Webhook retries flooding slow endpoints · Webhook", text)
-        self.assertTrue(text.endswith("…"), text)
+        text = rt._row_text(s, 110)
+        self.assertTrue(text.startswith("  Webhook retries flooding slow endpoints · Webhook "), text)
+        self.assertIn("…", text[:60])
+
+    def test_titles_line_up_and_the_rest_is_clipped(self):
+        rows = [session("a", cwd="/w/a", topic="short"),
+                session("b", cwd="/w/a", agent_title="a much longer agent title", topic="topic",
+                        git_branch="feature/" + "x" * 40, pr_number=12, pr_state="open")]
+        for width in (60, 100, 160):
+            texts = [rt._row_text(s, width) for s in rows]
+            self.assertEqual(len({t.index(" claude") for t in texts}), 1, texts)
+            self.assertTrue(all(len(t) <= width for t in texts), texts)
+            self.assertTrue(texts[0].startswith("  short "))
 
     def test_both_titles_fit_the_width(self):
         s = session(cwd="/w/a", agent_title="a" * 90, topic="b" * 90)

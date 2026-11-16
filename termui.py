@@ -15,12 +15,16 @@ terminal's own palette, so the output follows its light or dark theme:
     bold    bold in the default colour (no colour)
     ""      plain
 
+The current row in the picker is drawn in reverse video, one bar with no
+other color on it, so it stands out on any theme and keeps the body text's
+contrast.
+
 Only the normal (0-7) colours are used: their contrast holds on light and
 dark themes, where the bright ones fall below 4.5:1 on white. Colour is
-never combined with bold, which some terminals render as the bright
-variant. Red is kept for symbols (the ♥, an alert's ●): a symbol needs 3:1,
-which red clears on light, dark and Solarized themes, and text in red does not. NO_COLOR
-(https://no-color.org) turns colour off.
+never combined with bold, which some terminals render as the bright variant.
+Red is kept for symbols (the ♥, an alert's ●): a symbol needs 3:1, which red
+clears on light, dark and Solarized themes, and text in red does not.
+NO_COLOR (https://no-color.org) turns colour off.
 """
 
 from __future__ import annotations
@@ -121,14 +125,23 @@ def pick(
                     curses.init_pair(n, getattr(curses, color), bg)
                     role_attr[role] = curses.color_pair(n)
 
-        def put(y: int, segs: list[tuple[str, str]], bold: bool = False) -> None:
-            """Draw (text, role) pieces left to right, clipped to the screen width."""
+        def put(y: int, segs: list[tuple[str, str]], bold: bool = False,
+                current: bool = False) -> None:
+            """Draw (text, role) pieces left to right, clipped to the screen width.
+            current draws them as one bar across the screen in reverse video:
+            the theme's own text and background swapped, so its contrast is
+            the body text's, and with no color of its own on it."""
             x = 0
             limit = w - 1  # the bottom-right cell cannot be written
+            if current:
+                used = sum(len(t) for t, _ in segs)
+                segs = segs + [(" " * max(0, limit - used), "")]
             for text, role in segs:
                 if x >= limit:
                     break
-                if role == "bold":
+                if current:
+                    attr = curses.A_REVERSE
+                elif role == "bold":
                     attr = curses.A_BOLD
                 elif role:
                     attr = role_attr[role]
@@ -210,13 +223,13 @@ def pick(
                            ("a", "all"), ("n", "none"), ("i", "invert"),
                            ("enter", "confirm"), ("q", "quit"))
             put(0, header, bold=True)
-            # rows: a marker in the gutter and bold text for the current row
+            # rows: the current one is a reverse-video bar with a marker in the gutter
             for i in range(top, min(len(items), top + body_h)):
                 cur_row = i == idx
                 segs = [("▶ " if cur_row else "  ", "accent"),
                         ("[x]" if selected[i] else "[ ]", "ok" if selected[i] else ""),
                         (" ", "")]
-                put(1 + (i - top), segs + row(items[i], w - 7), bold=cur_row)
+                put(1 + (i - top), segs + row(items[i], w - 7), current=cur_row)
             # footer: line 1 = location pieces, line 2 = description
             loc_segs, desc_line = footer(items[idx]) if footer else ([], "")
             put(h - 2, with_tagline(loc_segs))
