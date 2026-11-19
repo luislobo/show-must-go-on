@@ -1251,3 +1251,29 @@ class RunningInPicker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Version(unittest.TestCase):
+    def test_outside_a_clone_it_is_the_number_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(rt.version_line(Path(d)), f"restore {rt.VERSION}")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_in_a_clone_it_names_the_branch_and_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+            for cmd in (["init", "-q", "-b", "topic"], ["commit", "-q", "--allow-empty", "-m", "x"]):
+                subprocess.run(["git", "-C", d, *cmd], check=True, env=env)
+            head = subprocess.run(["git", "-C", d, "rev-parse", "--short", "HEAD"],
+                                  capture_output=True, text=True).stdout.strip()
+            self.assertEqual(rt.version_line(Path(d)), f"restore {rt.VERSION} (topic {head})")
+            Path(d, "f").write_text("x")
+            subprocess.run(["git", "-C", d, "add", "f"], check=True)
+            self.assertTrue(rt.version_line(Path(d)).endswith("-dirty)"))
+
+    def test_the_flag_prints_it_and_exits(self):
+        out = subprocess.run([sys.executable, str(ROOT / "restore_terminals.py"), "--version"],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0)
+        self.assertTrue(out.stdout.startswith(f"restore {rt.VERSION}"), out.stdout)

@@ -42,6 +42,7 @@ CODEX_ROOT = HOME / ".codex" / "sessions"
 DEFAULT_CACHE = HOME / ".ai" / "sessions.jsonl"
 SNAPSHOTS_DIR = HOME / ".ai" / "snapshots"
 SLUG_MAX_LEN = 25
+VERSION = "0.5.0"
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -3018,6 +3019,32 @@ def _launch_and_restart(ap, args, picked: list[Session]) -> int:
     return _restart_picked(args, running) if running else 0
 
 
+def version_line(repo: Path | None = None) -> str:
+    """'restore 0.5.0', plus the branch and commit when run from a git clone,
+    so it says which code a symlinked restore runs: 'restore 0.5.0 (development b83d4be)'."""
+    repo = repo or Path(__file__).resolve().parent
+    if not (repo / ".git").exists():
+        return f"restore {VERSION}"
+    def git(*cmd: str) -> str:
+        try:
+            r = subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True,
+                               text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return r.stdout.strip() if r.returncode == 0 else ""
+    where = " ".join(x for x in (git("rev-parse", "--abbrev-ref", "HEAD"),
+                                 git("describe", "--always", "--dirty")) if x)
+    return f"restore {VERSION} ({where})" if where else f"restore {VERSION}"
+
+
+class _VersionAction(argparse.Action):
+    """--version; asks git only when given, not on every run."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(version_line())
+        parser.exit()
+
+
 def _backend_label(target: str) -> str:
     return {
         "byobu": "byobu/tmux pane(s)",
@@ -3066,6 +3093,8 @@ def main() -> int:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    ap.add_argument("--version", action=_VersionAction, nargs=0,
+                    help="print the version, and the branch and commit when run from a clone")
     ap.add_argument("days", nargs="?", type=int, default=7,
                     help="lookback window in days (default: 7)")
     ap.add_argument("--find", metavar="PATTERN",

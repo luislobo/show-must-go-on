@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bin_dir="${1:-$HOME/bin}"
+bin_dir="${1:-$HOME/.local/bin}"
 
 mkdir -p "$bin_dir"
 
