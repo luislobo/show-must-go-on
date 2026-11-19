@@ -29,6 +29,7 @@ restore --execute        # recover from session history on disk
 - **Session discovery** — scans `~/.claude/projects/` and `~/.codex/sessions/` for all session history
 - **Live snapshot** (`--save`) — detects running claude/codex sessions (via `/proc` on Linux, `ps` and `lsof` on macOS), captures their session IDs, cwds, **i3 workspace names** or **Ghostty/Terminal.app window and tab**, and **window titles**
 - **Exact Claude session IDs** — reads Claude Code's per-process record (`~/.claude/sessions/<pid>.json`) when present, so several sessions in one folder, and sessions after `/clear`, resolve correctly; a record left behind by a crash or reboot is ignored when its pid is reused. When Claude Code writes these records, a `claude` process without one (`claude agents`, `claude mcp …`) is not counted as a session
+- **Automatic snapshots** (`--autosave`) — a launchd job on macOS or a systemd user timer on Linux runs `restore --save --auto` every 10 minutes; it writes a snapshot only when where the sessions run changed, and deletes automatic snapshots after 14 days
 - **Snapshot restore** (`--load`) — reopens sessions from a snapshot, marks or skips any that are already running, places each window on its original i3 workspace, or (with `--layout=saved`) back in its Ghostty window and tab
 - **AeroSpace workspaces** (macOS) — with the [AeroSpace](https://github.com/nikitabobko/AeroSpace) tiling window manager running, `--save` records each Ghostty or Terminal.app window's workspace, and `--load` moves each window it opens back there
 - **Restart in place** (`--restart`, macOS) — ends the running sessions you pick and resumes each in the same Ghostty or Terminal.app tab, so window, tab, split and workspace stay as they were; with `--dangerously-skip-permissions` they come back with permission checks off, and sessions that already run that way are left alone
@@ -160,8 +161,11 @@ rsync -a ~/.ai/snapshots/ user@new-host:~/.ai/snapshots/
 ### Save + restore (recommended workflow)
 
 ```bash
-# Save a snapshot of all running sessions (run before reboot, or cron it)
+# Save a snapshot of all running sessions now
 restore --save
+
+# Or save one every 10 minutes, so a crash or a forced reboot finds a recent one
+restore --autosave --execute
 
 # After reboot: reopen everything (i3 workspaces on Linux, one window per session on macOS)
 restore --load --execute
@@ -170,6 +174,25 @@ restore --load --execute
 restore --load --no-pick --execute
 #=> "skipped 10 already-running session(s)"
 ```
+
+### Automatic snapshots
+
+`restore --autosave` shows what it would set up; `--execute` sets it up:
+
+```bash
+restore --autosave --execute          # every 10 minutes
+restore --autosave 5 --execute        # every 5 minutes
+restore --autosave status             # on or off, the newest snapshot, the last lines of the log
+restore --autosave off --execute      # stop; the snapshots stay
+```
+
+On macOS it writes `~/Library/LaunchAgents/show-must-go-on-autosave.plist` and loads it with `launchctl`; on Linux it writes `show-must-go-on-autosave.service` and `.timer` to `~/.config/systemd/user/` and enables the timer. The job runs `restore --save --auto` from the clone `restore` links to, with the `PATH` of the shell you ran `--autosave` in (and on Linux its `DISPLAY` and `XAUTHORITY`, which `wmctrl` and `i3-msg` need). Run `--autosave` again after moving the clone or changing `PATH`, and on Linux after your X display changes.
+
+`--save --auto` stays quiet unless it saves. It saves only when the set of sessions or where one runs (its window, tab, workspace, folder or permission setting) changed since `latest.json`; a new pid or window title alone does not count. With nothing running, as right after a reboot, it saves nothing, so `latest.json` keeps the sessions from before. Each save adds a line to `~/.ai/autosave.log`. Automatic snapshots are named `<time>-auto.json` and are deleted after 14 days; snapshots saved by hand are never deleted.
+
+After a reboot you may reopen a few sessions before the next automatic save, which then becomes `latest.json` with only those. So `restore --load`, given no file, also lists the sessions in the last snapshot taken before this boot that `latest.json` does not have, and says how many it added. `restore --load FILE` reads that file alone.
+
+Each snapshot is written to a temporary file and renamed into place, and `latest.json` is switched the same way, so a crash during a save leaves the previous snapshot intact.
 
 ### Recover from history (no prior snapshot)
 
@@ -340,7 +363,7 @@ The current row is a bar across the screen in reverse video, your theme's text a
 2. **Load** — reads the snapshot, checks which sessions are already running (marks them in the picker, or skips them with `--no-pick`), parses the JSONL files for metadata, runs through the same summarize/pick/launch pipeline
 3. **Launch** — on Linux, spawns each Terminator window, then uses `i3-msg '[id=<wid>] move to workspace <name>'` to place it on the saved workspace. On macOS, opens the sessions in Ghostty or Terminal.app; `--layout=saved` puts Ghostty sessions back in their saved window and tab
 
-Snapshots are JSON files with one entry per session: `tool`, `session_id`, `cwd`, `pid`, `jsonl_path`, `workspace` and `window_title`, plus `skip_permissions` (whether the agent was started with permission checks off; `--load` does not act on it), `terminal` (the host terminal: ghostty, terminal, terminator, tmux or iterm) and, on macOS, `window_id`, `tab_index`, `window_name` (the window's title), `terminal_id` (the Ghostty terminal's own id) and, with AeroSpace, `aerospace_workspace`. Snapshots saved before these fields existed still load.
+Snapshots are JSON files with `format` (1), `timestamp`, `auto` (whether `--save --auto` wrote it) and `sessions`, one entry per session: `tool`, `session_id`, `cwd`, `pid`, `jsonl_path`, `workspace` and `window_title`, plus `skip_permissions` (whether the agent was started with permission checks off; `--load` does not act on it), `terminal` (the host terminal: ghostty, terminal, terminator, tmux or iterm) and, on macOS, `window_id`, `tab_index`, `window_name` (the window's title), `terminal_id` (the Ghostty terminal's own id) and, with AeroSpace, `aerospace_workspace`. Snapshots saved before these fields existed still load.
 
 ### Terminator placement (Linux)
 
@@ -394,6 +417,7 @@ With `--target=byobu`, restore builds a tmux session instead of GUI windows:
 ~/.ai/sessions.jsonl          # Summary cache (written by restore)
 ~/.ai/snapshots/              # Saved snapshots from --save
 ~/.ai/snapshots/latest.json   # Symlink to most recent snapshot
+~/.ai/autosave.log            # One line per automatic save
 ~/bin/restore                 # Symlink to restore_terminals.py (or the directory given to install.sh)
 ~/bin/find-session            # Symlink to find_session.py
 ```

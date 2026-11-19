@@ -1251,3 +1251,200 @@ class RunningInPicker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Snapshots(unittest.TestCase):
+    """Writing, reading and pruning snapshot files, and --load after a reboot."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        patcher = mock.patch.object(rt, "SNAPSHOTS_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    @staticmethod
+    def entry(sid, **kw):
+        return {"tool": "claude", "session_id": sid, "cwd": f"/w/{sid}", "pid": 100,
+                "terminal": "ghostty", "window_id": "w1", "tab_index": 1,
+                "window_title": "✳ working", **kw}
+
+    def write(self, name, sids, at, auto=False):
+        """A snapshot file taken at Unix time `at`."""
+        f = self.dir / name
+        f.write_text(json.dumps({"sessions": [self.entry(s) for s in sids], "auto": auto}))
+        os.utime(f, (at, at))
+        return f
+
+    def point_latest(self, f):
+        (self.dir / "latest.json").unlink(missing_ok=True)
+        (self.dir / "latest.json").symlink_to(f.name)
+
+    def test_save_writes_the_format_and_moves_latest_in_one_rename(self):
+        first = rt.save_snapshot([self.entry("s1")])
+        second = rt.save_snapshot([self.entry("s2")], auto=True)
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.stem.endswith("-auto") or "-auto-" in second.stem)
+        data = json.loads(second.read_text())
+        self.assertEqual((data["format"], data["auto"]), (rt.SNAPSHOT_FORMAT, True))
+        self.assertEqual(os.readlink(self.dir / "latest.json"), second.name)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir() if p.name.startswith(".")), [])
+
+    def test_two_saves_in_one_second_keep_both(self):
+        paths = {rt.save_snapshot([self.entry(f"s{i}")]) for i in range(3)}
+        self.assertEqual(len(paths), 3)
+
+    def test_an_unreadable_snapshot_loads_as_empty(self):
+        bad = self.dir / "bad.json"
+        bad.write_text('{"sessions": [')
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(rt.load_snapshot(bad), [])
+        self.assertIn("not a readable snapshot", err.getvalue())
+
+    def test_a_newer_format_is_read_with_a_warning(self):
+        f = self.dir / "new.json"
+        f.write_text(json.dumps({"format": rt.SNAPSHOT_FORMAT + 1, "sessions": [self.entry("s1")]}))
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(len(rt.load_snapshot(f)), 1)
+        self.assertIn("newer restore", err.getvalue())
+
+    def test_load_adds_what_the_last_snapshot_before_the_boot_had(self):
+        boot = time.time() - 3600
+        before = self.write("before.json", ["s1", "s2", "s3"], boot - 600)
+        after = self.write("after-auto.json", ["s1"], boot + 600, auto=True)
+        self.point_latest(after)
+        entries, prev = rt.load_latest(boot)
+        self.assertEqual([e["session_id"] for e in entries], ["s1", "s2", "s3"])
+        self.assertEqual(prev, before)
+
+    def test_load_is_latest_alone_when_latest_predates_the_boot(self):
+        boot = time.time() - 3600
+        self.write("older.json", ["s9"], boot - 7200)
+        latest = self.write("before.json", ["s1"], boot - 600)
+        self.point_latest(latest)
+        entries, prev = rt.load_latest(boot)
+        self.assertEqual(([e["session_id"] for e in entries], prev), (["s1"], None))
+
+    def test_load_is_latest_alone_when_the_boot_time_is_unknown(self):
+        self.write("before.json", ["s1", "s2"], time.time() - 7200)
+        self.point_latest(self.write("after.json", ["s1"], time.time()))
+        with mock.patch.object(rt, "boot_time", return_value=None):
+            entries, prev = rt.load_latest()
+        self.assertEqual((len(entries), prev), (1, None))
+
+    def test_auto_save_skips_when_only_pids_and_titles_changed(self):
+        self.point_latest(self.write("a.json", ["s1"], time.time() - 60))
+        moved = [self.entry("s1", pid=200, window_title="⠂ thinking")]
+        with mock.patch.object(rt, "snapshot_active", return_value=moved), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rt.auto_save()
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(len(list(self.dir.glob("*-auto*.json"))), 0)
+
+    def test_auto_save_saves_when_a_session_moved_or_appeared(self):
+        self.point_latest(self.write("a.json", ["s1"], time.time() - 60))
+        for active in ([self.entry("s1", tab_index=2)], [self.entry("s1"), self.entry("s2")]):
+            with mock.patch.object(rt, "snapshot_active", return_value=active), \
+                 mock.patch.object(rt, "boot_time", return_value=None), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                rt.auto_save()
+            self.assertIn(f"saved {len(active)} session(s)", out.getvalue())
+        self.assertEqual(len(list(self.dir.glob("*-auto*.json"))), 2)
+
+    def test_auto_save_keeps_latest_when_nothing_runs(self):
+        latest = self.write("a.json", ["s1", "s2"], time.time() - 60)
+        self.point_latest(latest)
+        with mock.patch.object(rt, "snapshot_active", return_value=[]):
+            rt.auto_save()
+        self.assertEqual((self.dir / "latest.json").resolve(), latest.resolve())
+
+    def test_prune_deletes_only_old_automatic_snapshots(self):
+        now, old = time.time(), time.time() - (rt.AUTO_KEEP_DAYS + 1) * 86400
+        boot = now - 3600
+        old_auto = self.write("1-auto.json", ["s1"], old - 60, auto=True)
+        old_manual = self.write("2.json", ["s1"], old - 30)
+        last_before_boot = self.write("3-auto.json", ["s1"], old, auto=True)
+        new_auto = self.write("4-auto.json", ["s1"], now, auto=True)
+        self.point_latest(new_auto)
+        self.assertEqual(rt.prune_auto_snapshots(boot=boot), 1)
+        self.assertFalse(old_auto.exists())
+        self.assertTrue(all(f.exists() for f in (old_manual, last_before_boot, new_auto)))
+
+
+class AutosaveSchedule(unittest.TestCase):
+    """restore --autosave: the launchd job and systemd timer it writes."""
+
+    def test_launchd_job_runs_save_auto_on_the_interval_with_this_path(self):
+        import plistlib
+        job = plistlib.loads(rt.launchd_plist(15, {"PATH": "/opt/homebrew/bin:/usr/bin"}))
+        self.assertEqual(job["ProgramArguments"][1:], ["--save", "--auto"])
+        self.assertTrue(job["ProgramArguments"][0].endswith("restore_terminals.py"))
+        self.assertEqual(job["StartInterval"], 900)
+        self.assertEqual(job["EnvironmentVariables"]["PATH"], "/opt/homebrew/bin:/usr/bin")
+        self.assertEqual(job["StandardOutPath"], str(rt.AUTOSAVE_LOG))
+
+    def test_systemd_units_quote_paths_and_carry_the_display(self):
+        with mock.patch.object(rt, "autosave_command",
+                               return_value=["/home/a b/restore_terminals.py", "--save", "--auto"]):
+            units = rt.systemd_units(10, {"PATH": "/usr/bin", "DISPLAY": ":0"})
+        service = units[f"{rt.AUTOSAVE_NAME}.service"]
+        timer = units[f"{rt.AUTOSAVE_NAME}.timer"]
+        self.assertIn('ExecStart="/home/a b/restore_terminals.py" "--save" "--auto"', service)
+        self.assertIn('Environment="DISPLAY=:0"', service)
+        self.assertIn("OnUnitActiveSec=10min", timer)
+        self.assertIn("WantedBy=timers.target", timer)
+
+    def run_autosave(self, value, execute, mac=True):
+        args = types.SimpleNamespace(autosave=value, execute=execute)
+        calls = []
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(rt, "IS_MACOS", mac), \
+             mock.patch.object(rt, "LAUNCH_AGENT", Path(d) / "LaunchAgents" / "job.plist"), \
+             mock.patch.object(rt, "SYSTEMD_USER", Path(d) / "systemd"), \
+             mock.patch.object(rt, "AUTOSAVE_LOG", Path(d) / "autosave.log"), \
+             mock.patch.object(rt, "_run", side_effect=lambda c: calls.append(c) or
+                               subprocess.CompletedProcess(c, 0, "", "")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = rt.autosave(args)
+            files = sorted(str(p.relative_to(d)) for p in Path(d).rglob("*") if p.is_file())
+        return code, calls, files, out.getvalue()
+
+    def test_without_execute_it_changes_nothing(self):
+        code, calls, files, out = self.run_autosave("10", execute=False)
+        self.assertEqual((code, calls, files), (0, [], []))
+        self.assertIn("dry-run", out)
+        self.assertIn("--save --auto", out)
+
+    def test_on_macos_it_unloads_writes_then_loads(self):
+        code, calls, files, _ = self.run_autosave("5", execute=True)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[1] for c in calls], ["bootout", "bootstrap"])
+        self.assertEqual(files, ["LaunchAgents/job.plist"])
+
+    def test_off_unloads_and_deletes_the_job(self):
+        code, calls, files, _ = self.run_autosave("off", execute=True)
+        self.assertEqual((code, [c[1] for c in calls], files), (0, ["bootout"], []))
+
+    def test_on_linux_it_enables_a_user_timer(self):
+        if not Path("/proc").is_dir():
+            with mock.patch.object(rt.Path, "is_dir", return_value=True):
+                code, calls, files, _ = self.run_autosave("10", execute=True, mac=False)
+        else:
+            code, calls, files, _ = self.run_autosave("10", execute=True, mac=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[-1], ["systemctl", "--user", "enable", "--now",
+                                     f"{rt.AUTOSAVE_NAME}.timer"])
+        self.assertEqual(files, [f"systemd/{rt.AUTOSAVE_NAME}.service",
+                                 f"systemd/{rt.AUTOSAVE_NAME}.timer"])
+
+    def test_it_takes_minutes_off_or_status(self):
+        for bad in ("0", "ten", "-5"):
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(rt.autosave(types.SimpleNamespace(autosave=bad, execute=True)), 2)
+
+    def test_auto_needs_save(self):
+        out = subprocess.run([sys.executable, str(ROOT / "restore_terminals.py"), "--auto"],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("--auto works with --save", out.stderr)
