@@ -15,6 +15,10 @@ terminal's own palette, so the output follows its light or dark theme:
     bold    bold in the default colour (no colour)
     ""      plain
 
+Given search(item), / or f in the picker opens a filter line: the list
+keeps the items whose text holds every typed word, ignoring case; enter
+keeps the filter and esc clears it.
+
 The current row in the picker is drawn in reverse video, one bar with no
 other color on it, so it stands out on any theme and keeps the body text's
 contrast.
@@ -78,6 +82,12 @@ def wrap(text: Optional[str], width: int, max_lines: int = 0) -> list[str]:
     return lines
 
 
+def matches(text: str, query: str) -> bool:
+    """Whether every word of the query appears in the text, ignoring case."""
+    text = text.lower()
+    return all(word in text for word in query.lower().split())
+
+
 def pick(
     items: Sequence[T],
     *,
@@ -87,6 +97,7 @@ def pick(
     footer: Optional[Callable[[T], Tuple[list[tuple[str, str]], str]]] = None,
     details: Optional[Callable[[T, int], list[list[tuple[str, str]]]]] = None,
     tagline: Optional[list[tuple[str, str]]] = None,
+    search: Optional[Callable[[T], str]] = None,
 ) -> Optional[list[T]]:
     """Multi-select picker. Returns the ticked items (or the highlighted one when
     none is ticked), or None when the user quits. Requires a real TTY.
@@ -96,6 +107,12 @@ def pick(
     footer(item)          (location pieces, description) for the highlighted item
     details(item, width)  the lines of its details page; → opens it when given
     tagline               pieces right-aligned on the footer line when they fit
+    search(item)          the text / or f filters on when given: the list keeps the
+                          items whose text has every typed word, ignoring case
+
+    While filtering, a/n/i tick, untick or invert the items shown, and enter
+    returns every ticked item, shown or not. esc clears the filter; it quits
+    only when there is none.
     """
     if not items:
         return []
@@ -106,6 +123,7 @@ def pick(
         return list(items)
 
     selected = [False] * len(items)
+    texts = [search(it) for it in items] if search else []
 
     def run(stdscr):
         curses.curs_set(0)
@@ -169,19 +187,33 @@ def pick(
                 segs += [("   ", ""), (f"[{key}]", "accent"), (f" {what}", "")]
             return segs
 
-        idx = 0
+        query = ""       # the filter; "" shows every item
+        typing = False   # keys go to the filter line
+        shown = list(range(len(items)))   # indexes of the items the filter keeps
+        idx = 0          # position in `shown` of the highlighted item
         top = 0
-        detail = False   # showing the details page for items[idx]
+        detail = False   # showing the details page for the highlighted item
         dtop = 0         # first visible line of the details page
+
+        def refilter(new: str) -> None:
+            """Apply a new filter, keeping the highlighted item when it still matches."""
+            nonlocal query, shown, idx, top
+            keep = shown[idx] if shown else None
+            query = new
+            shown = [i for i in range(len(items)) if not query or matches(texts[i], query)]
+            idx = shown.index(keep) if keep in shown else 0
+            top = 0
+
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             if detail:
-                lines = details(items[idx], w - 1)
+                cur = shown[idx]
+                lines = details(items[cur], w - 1)
                 body_h = max(1, h - 2)
                 dtop = max(0, min(dtop, len(lines) - body_h))
-                mark = [("[x] selected", "ok")] if selected[idx] else [("[ ] not selected", "")]
-                put(0, [(f" {noun} {idx + 1}/{len(items)} — ", "")] + mark +
+                mark = [("[x] selected", "ok")] if selected[cur] else [("[ ] not selected", "")]
+                put(0, [(f" {noun} {idx + 1}/{len(shown)} — ", "")] + mark +
                     keys(("←", "back"), ("space", "toggle"), ("j/k", "scroll")), bold=True)
                 for line_no, line in enumerate(lines[dtop:dtop + body_h], 1):
                     put(line_no, line)
@@ -206,10 +238,12 @@ def pick(
                 elif c in (curses.KEY_END, ord("G")):
                     dtop = len(lines)
                 elif c == ord(" "):
-                    selected[idx] = not selected[idx]
+                    selected[cur] = not selected[cur]
                 continue
-            # header (1) + 2-line footer (2) + 1 buffer = 4 lines reserved
-            body_h = max(1, h - 4)
+            # header (1) + filter line when there is one + 2-line footer (2) + 1 buffer
+            filtering = typing or bool(query)
+            body_y = 2 if filtering else 1
+            body_h = max(1, h - 3 - body_y)
             # scroll
             if idx < top:
                 top = idx
@@ -219,55 +253,86 @@ def pick(
             count_sel = sum(selected)
             header = [(f" {title} — ", ""),
                       (f"{count_sel}/{len(items)} selected", "ok" if count_sel else "")]
-            header += keys(("space", "toggle"), *([("→", "details")] if details else []),
-                           ("a", "all"), ("n", "none"), ("i", "invert"),
-                           ("enter", "confirm"), ("q", "quit"))
+            if typing:
+                header += keys(("enter", "keep filter"), ("esc", "clear filter"))
+            else:
+                header += keys(("space", "toggle"), *([("→", "details")] if details else []),
+                               *([("/", "filter")] if search else []),
+                               ("a", "all"), ("n", "none"), ("i", "invert"),
+                               ("enter", "confirm"), ("q", "quit"))
             put(0, header, bold=True)
+            if filtering:
+                put(1, [(" / ", "accent"), (query, "bold"), ("▏" if typing else "", "accent"),
+                        (f"   {len(shown)} of {len(items)}", "")])
             # rows: the current one is a reverse-video bar with a marker in the gutter
-            for i in range(top, min(len(items), top + body_h)):
-                cur_row = i == idx
+            for pos in range(top, min(len(shown), top + body_h)):
+                i = shown[pos]
+                cur_row = pos == idx
                 segs = [("▶ " if cur_row else "  ", "accent"),
                         ("[x]" if selected[i] else "[ ]", "ok" if selected[i] else ""),
                         (" ", "")]
-                put(1 + (i - top), segs + row(items[i], w - 7), current=cur_row)
+                put(body_y + (pos - top), segs + row(items[i], w - 7), current=cur_row)
+            if not shown:
+                put(body_y, [(f"   no {noun} matches every word of “{query}”", "warn")])
             # footer: line 1 = location pieces, line 2 = description
-            loc_segs, desc_line = footer(items[idx]) if footer else ([], "")
+            loc_segs, desc_line = footer(items[shown[idx]]) if footer and shown else ([], "")
             put(h - 2, with_tagline(loc_segs))
             put(h - 1, [(clip(desc_line, w - 1), "")])
             stdscr.refresh()
             c = stdscr.getch()
+            if typing:
+                if c == 27:                                  # esc: drop the filter
+                    typing = False
+                    refilter("")
+                elif c in (10, 13, curses.KEY_ENTER):        # enter: keep it, back to the keys
+                    typing = False
+                elif c in (curses.KEY_BACKSPACE, 127, 8):
+                    refilter(query[:-1])
+                elif c == curses.KEY_DOWN:
+                    idx = min(max(0, len(shown) - 1), idx + 1)
+                elif c == curses.KEY_UP:
+                    idx = max(0, idx - 1)
+                elif 32 <= c < 127:                          # printable ASCII; arrows and other keys are > 255
+                    refilter(query + chr(c))
+                continue
+            if c == 27 and query:                            # esc clears the filter first
+                refilter("")
+                continue
             if c in (ord("q"), 27):  # q or ESC
                 return None
-            if details and c in (curses.KEY_RIGHT, ord("l")):
+            if search and c in (ord("/"), ord("f")):
+                typing = True
+            elif details and shown and c in (curses.KEY_RIGHT, ord("l")):
                 detail, dtop = True, 0
             elif c in (curses.KEY_DOWN, ord("j")):
-                idx = min(len(items) - 1, idx + 1)
+                idx = min(max(0, len(shown) - 1), idx + 1)
             elif c in (curses.KEY_UP, ord("k")):
                 idx = max(0, idx - 1)
             elif c == curses.KEY_NPAGE:
-                idx = min(len(items) - 1, idx + body_h)
+                idx = min(max(0, len(shown) - 1), idx + body_h)
             elif c == curses.KEY_PPAGE:
                 idx = max(0, idx - body_h)
             elif c in (curses.KEY_HOME, ord("g")):
                 idx = 0
             elif c in (curses.KEY_END, ord("G")):
-                idx = len(items) - 1
-            elif c == ord(" "):
-                selected[idx] = not selected[idx]
+                idx = max(0, len(shown) - 1)
+            elif c == ord(" ") and shown:
+                selected[shown[idx]] = not selected[shown[idx]]
             elif c == ord("a"):
-                for i in range(len(selected)):
+                for i in shown:
                     selected[i] = True
             elif c == ord("n"):
-                for i in range(len(selected)):
+                for i in shown:
                     selected[i] = False
             elif c == ord("i"):
-                for i in range(len(selected)):
+                for i in shown:
                     selected[i] = not selected[i]
             elif c in (10, 13, curses.KEY_ENTER):
                 picked = [it for it, keep in zip(items, selected) if keep]
-                if not picked:
-                    picked = [items[idx]]
-                return picked
+                if picked:
+                    return picked
+                if shown:
+                    return [items[shown[idx]]]
 
     try:
         return curses.wrapper(run)

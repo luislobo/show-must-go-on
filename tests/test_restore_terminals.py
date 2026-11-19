@@ -1251,3 +1251,48 @@ class RunningInPicker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchWords(unittest.TestCase):
+    """restore dotfiles: words after restore search, a number is days."""
+
+    class Parser:
+        def error(self, msg):
+            raise SystemExit(msg)
+
+    def words(self, *words, find=None, save=False, load=None):
+        args = types.SimpleNamespace(words=list(words), find=find, save=save, load=load)
+        rt._words_to_args(self.Parser(), args)
+        return args.days, args.find
+
+    def test_a_word_searches_and_a_number_is_days(self):
+        self.assertEqual(self.words(), (7, None))
+        self.assertEqual(self.words("14"), (14, None))
+        self.assertEqual(self.words("dotfiles"), (7, "dotfiles"))
+        self.assertEqual(self.words("dotfiles", "30"), (30, "dotfiles"))
+        self.assertEqual(self.words("checkout", "redesign"), (7, "checkout redesign"))
+        self.assertEqual(self.words("14", find="22302"), (14, "22302"))
+
+    def test_what_it_refuses(self):
+        for kw, words in (({}, ("14", "30")), ({"find": "x"}, ("dotfiles",)),
+                          ({"save": True}, ("dotfiles",)), ({"load": "latest"}, ("dotfiles",))):
+            with self.assertRaises(SystemExit):
+                self.words(*words, **kw)
+
+    def test_restore_word_runs_the_search(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home}
+            out = subprocess.run([sys.executable, str(ROOT / "restore_terminals.py"), "dotfiles",
+                                  "--no-pick", "--no-ai", "--no-gh"],
+                                 capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("/dotfiles/i", out.stdout)
+
+    def test_picker_filter_text_has_what_the_row_shows(self):
+        s = session("s1", cwd=str(Path.home() / "dotfiles"), agent_title="Shell startup",
+                    topic="zsh timing", git_branch="fix/slow-start", pr_number=12,
+                    pr_title="Lazy load mise")
+        text = rt._search_text(s)
+        for word in ("Shell startup", "zsh timing", "~/dotfiles", "fix/slow-start", "#12",
+                     "Lazy load mise", "claude"):
+            self.assertIn(word, text)

@@ -36,7 +36,8 @@ restore --execute        # recover from session history on disk
 - **AI summaries** — calls `claude -p` to generate a topic label + abstract per session, grounded in the project's README/CLAUDE.md and the last hour of transcript
 - **Agent titles** — the name Claude Code gives a session, or the one you set with `/rename`, is shown first in the picker, the details page and the plan, with the AI topic beside it (once, when the two say the same); it is also the window title restore opens. Codex sessions show the AI topic only
 - **Persistent cache** — summaries are saved to `~/.ai/sessions.jsonl`; subsequent runs reuse them unless the session has new activity
-- **Content search** — `--find` searches all session transcripts for a branch name, repo, Jira ticket, or any regex
+- **Content search** — `restore WORD` or `--find` searches all session transcripts for a branch name, repo, Jira ticket, or any regex
+- **Filter in the picker** — `/` or `f` narrows the list as you type, on the title, summary, folder, branch and PR
 - **Relevance ranking** — search results ranked by match count, recency, user-message weight, and git branch match
 - **Curses TUI picker** — keyboard-driven session selector with previews (j/k, space, enter, a/n/i/q), and a details page per session on `→`. Each row starts with what the session is about, in a column half the row wide so titles line up, then its age, tool, running state, folder, branch and PR
 - **Colour that follows your theme** — the picker and the progress lines use the terminal's own palette, normal ANSI colours only, plain when piped; `NO_COLOR` turns it off
@@ -257,6 +258,9 @@ restore --target=byobu --layout=hybrid --max-splits=6 --execute
 ### Search sessions
 
 ```bash
+# Words after restore are a search: the sessions that mention dotfiles
+restore dotfiles
+
 # Find sessions that mention a branch
 restore --find feature/my-branch
 
@@ -271,7 +275,12 @@ restore --find feature/my-branch --execute
 
 # Search with a wider time window
 restore --find 'haproxy.*migration' 30
+restore haproxy migration 30
 ```
+
+A word after `restore` searches as `--find` does, and a number is the lookback in days, so `restore dotfiles 30` searches the last 30 days. Several words are searched as one phrase. A number is always days, so a ticket or PR number needs `--find 22302`.
+
+In the picker, `/` or `f` filters the list as you type, on what the rows show: the agent's title, the summary, the folder, the branch and the PR. Every word must appear, in any order and ignoring case. It filters the list already loaded, so it is instant but does not read transcripts; `restore WORD` does.
 
 ### Resume without permission prompts
 
@@ -297,12 +306,15 @@ find-session DSBF-491 14
 | `space` | Toggle checkbox |
 | `→` / `l` | Open the details page for the highlighted session |
 | `enter` | Confirm selection (if nothing checked, picks current item) |
-| `a` | Select all |
-| `n` | Select none |
-| `i` | Invert selection |
+| `/` / `f` | Filter the list as you type; `enter` keeps the filter, `ESC` clears it |
+| `a` | Select all (with a filter, all the rows shown) |
+| `n` | Select none (with a filter, of the rows shown) |
+| `i` | Invert selection (with a filter, of the rows shown) |
 | `PgUp` / `PgDn` | Scroll |
 | `g` / `G` | Jump to top/bottom |
-| `q` / `ESC` | Cancel |
+| `q` / `ESC` | Cancel (`ESC` clears a filter first) |
+
+While filtering, the line under the header shows the words and how many sessions match, and `enter` returns every ticked session, shown or not.
 
 The footer shows the AI abstract (or first match snippet in search mode) for the highlighted session.
 
@@ -436,7 +448,7 @@ demo/render.sh demo/out && cp demo/out/show-must-go-on-demo.gif docs/
 python3 -m unittest discover tests
 ```
 
-The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping and the tagline. `tests/test_find_session.py` covers `find-session`'s output, in colour and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
+The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping, the tagline and the picker's filter, which it drives with a fake curses screen. `tests/test_find_session.py` covers `find-session`'s output, in colour and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
 
 ```bash
 docker run --rm -v "$PWD":/repo:ro python:3.10-slim \

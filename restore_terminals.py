@@ -2647,12 +2647,21 @@ def _picker_footer(cur: Session) -> tuple[list[tuple[str, str]], str]:
     return loc_segs, desc_line
 
 
+def _search_text(s: Session) -> str:
+    """What / filters on in the picker: what its row and footer show, the
+    agent's title, the summary, the folder, the branch and the PR."""
+    pr = f"#{s.pr_number} {s.pr_title or ''}" if s.pr_number else ""
+    return " ".join(x for x in (s.agent_title, s.topic, s.abstract, s.cwd,
+                                short_cwd(s.cwd) if s.cwd else "", s.git_branch, pr, s.tool) if x)
+
+
 def tui_pick(sessions: list[Session]) -> list[Session] | None:
     """Return user-selected subset, or None if user quit. Requires a real TTY."""
     live_w = max((_badge_len(s) for s in sessions), default=0)
     return pick(sessions, title="restore-terminals", noun="session",
                 row=lambda s, width: _row_segments(s, width, live_w),
-                footer=_picker_footer, details=_detail_lines, tagline=TAGLINE)
+                footer=_picker_footer, details=_detail_lines, tagline=TAGLINE,
+                search=_search_text)
 
 
 # ---------------------------------------------------------------------------
@@ -3026,6 +3035,22 @@ def _backend_label(target: str) -> str:
     }.get(target, "Terminator window(s)")
 
 
+def _words_to_args(ap, args) -> None:
+    """The positional words: a number is args.days, the other words args.find.
+    A number is always days, so searching for one (a ticket, a PR) needs --find."""
+    days = [w for w in args.words if w.isdigit()]
+    text = [w for w in args.words if not w.isdigit()]
+    if len(days) > 1:
+        ap.error(f"one number of days, not {' and '.join(days)}; search for a number with --find")
+    args.days = int(days[0]) if days else 7
+    if text:
+        if args.find:
+            ap.error("give the search as --find or as words, not both")
+        if args.save or args.load is not None:
+            ap.error("--save and --load read running sessions or a snapshot; they take no search")
+        args.find = " ".join(text)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="restore",
@@ -3046,7 +3071,10 @@ def main() -> int:
             "                                 #   its own tab with permission checks off\n"
             "\n"
             "Search for sessions by content:\n"
+            "  restore dotfiles               # sessions that mention dotfiles, as --find does\n"
             "  restore --find feature/branch  # find by branch name, ticket, any text\n"
+            "  restore --find 22302           # a number needs --find; alone it is days\n"
+            "  (in the picker, / or f filters the list as you type)\n"
             "\n"
             "Remote / SSH (byobu / tmux panes instead of GUI windows):\n"
             "  restore --target=byobu --execute            # build a 'restore' tmux session\n"
@@ -3066,8 +3094,9 @@ def main() -> int:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("days", nargs="?", type=int, default=7,
-                    help="lookback window in days (default: 7)")
+    ap.add_argument("words", nargs="*", metavar="DAYS|TEXT",
+                    help="a number is the lookback window in days (default: 7); any other "
+                         "words are a search, as with --find: restore dotfiles")
     ap.add_argument("--find", metavar="PATTERN",
                     help="search sessions by content (branch, repo, ticket, any text)")
     ap.add_argument("--refresh", action="store_true",
@@ -3127,6 +3156,7 @@ def main() -> int:
     ap.add_argument("--summary-workers", type=int, default=3, help=argparse.SUPPRESS)
     ap.add_argument("--cache", default=str(DEFAULT_CACHE), help=argparse.SUPPRESS)
     args = ap.parse_args()
+    _words_to_args(ap, args)
     if args.layout in ("tabs", "saved") and args.target not in ("auto", "ghostty"):
         ap.error(f"--layout={args.layout} needs --target=ghostty")
 
