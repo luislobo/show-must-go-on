@@ -25,6 +25,7 @@ import pty
 import random
 import select
 import struct
+import subprocess
 import sys
 import termios
 import time
@@ -37,6 +38,9 @@ REPO = Path(__file__).resolve().parent.parent
 # arrows arrive as ESC O C / ESC O D, as a real terminal would send them
 RIGHT, LEFT, ENTER = "\x1bOC", "\x1bOD", "\r"
 
+# The demo session that runs during the recording, so the picker marks it running
+RUNNING_PROJECT = "docs-site"
+
 # What the narrator says over the title card and the end card
 TITLE_LINE = ("show-must-go-on finds the Claude Code and Codex sessions you had open, "
               "and reopens them after a reboot.")
@@ -44,19 +48,19 @@ END_LINE = "Proudly made in Dallas."
 
 # Words the voice reads wrongly, and how to spell them for it
 SPOKEN = {"show-must-go-on": "show must go on", "tmux": "tee mux", "Codex": "codex",
-          "--execute": "execute", "--find": "find", "Ghostty": "Ghosty",
-          "summarises": "summarizes"}
+          "--execute": "execute", "--find": "find", "Ghostty": "Ghosty"}
 
 # (action, argument, pause after in seconds). A `say` step starts a narration
 # line; the next one waits until it has been spoken.
 SCRIPT = [
     ("wait_for", "$ ", 0.8),
     ("type", "restore", 0.3),
-    ("say", "restore reads every session on disk, and summarises the recent ones.", 0.0),
+    ("say", "restore reads every session on disk, and summarizes the recent ones.", 0.0),
     ("key", ENTER, 0.0),
     ("wait_for", "selected", 0.6),     # the picker is up
-    ("say", ("The picker lists them, newest first: the folder, the branch and its pull "
-             "request, then the agent's own title in bold, with restore's summary beside it."), 1.6),
+    ("say", ("The picker lists them, newest first: the agent's own title in bold, with "
+             "restore's summary beside it, then the age, the folder, the branch and its pull "
+             "request. A session that still runs is marked running."), 1.6),
     ("key", "j", 0.7),
     ("key", " ", 0.8),                 # tick the second session
     ("key", "j", 0.6),
@@ -72,7 +76,8 @@ SCRIPT = [
     ("key", "j", 0.35), ("key", "j", 0.35), ("key", "j", 2.0),
     ("key", LEFT, 1.2),
     ("say", ("Enter shows the plan. With --execute, restore opens each session in Ghostty, "
-             "Terminal, Terminator or tmux, and skips any that are already running."), 0.0),
+             "Terminal, Terminator or tmux; on macOS it restarts one that still runs in "
+             "place, rather than opening it twice."), 0.0),
     ("key", ENTER, 0.0),
     ("wait_for", "dry-run", 3.5),
     ("say", ("restore --find searches every transcript, here for backoff, "
@@ -149,10 +154,36 @@ def spoken(text: str) -> str:
     return text
 
 
+def start_running(home: Path, project: str) -> subprocess.Popen:
+    """Stand in for a running Claude Code session in `project`: a process named
+    claude, in the project folder, with the record Claude Code writes for each
+    running process (~/.claude/sessions/<pid>.json) naming the session."""
+    sid = None
+    for f in sorted((home / ".claude" / "projects").rglob("*.jsonl")):
+        for line in f.open():
+            d = json.loads(line)
+            if Path(d.get("cwd") or "/").name == project and d.get("sessionId"):
+                sid = d["sessionId"]
+                break
+        if sid:
+            break
+    if not sid:
+        raise SystemExit(f"no claude session for {project} in {home}")
+    cwd = home / "code" / project
+    proc = subprocess.Popen(["claude", "86400"], executable="/bin/sleep", cwd=cwd,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+    records = home / ".claude" / "sessions"
+    records.mkdir(parents=True, exist_ok=True)
+    (records / f"{proc.pid}.json").write_text(json.dumps({
+        "pid": proc.pid, "sessionId": sid, "cwd": str(cwd),
+        "startedAt": int(time.time() * 1000)}))
+    return proc
+
+
 def main(home: Path, out: Path, narration: Path | None = None) -> None:
     env = {
         "HOME": str(home),
-        "PATH": f"{REPO / 'demo' / 'bin'}:{Path.home() / '.local' / 'bin'}:/usr/bin:/bin:/opt/homebrew/bin",
+        "PATH": f"{REPO / 'demo' / 'bin'}:{Path.home() / '.local' / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
         "TERM": "xterm-256color",
         "TERM_PROGRAM": "ghostty",     # restore's auto target: Ghostty
         "LANG": "en_US.UTF-8",
@@ -176,6 +207,7 @@ def main(home: Path, out: Path, narration: Path | None = None) -> None:
     emit(TITLE_CARD, max(3.8, 0.4 + title_seconds + gap))
     emit(SHOW_CURSOR + "\x1b[2J\x1b[H", 0.0)
 
+    running = start_running(home, RUNNING_PROJECT)
     pid, fd = pty.fork()
     if pid == 0:
         fcntl.ioctl(sys.stdout.fileno(), termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
@@ -236,6 +268,8 @@ def main(home: Path, out: Path, narration: Path | None = None) -> None:
     pump(0.5)
     os.close(fd)
     os.waitpid(pid, 0)
+    running.kill()
+    running.wait()
 
     t_end = t0 + time.monotonic() - start
     events.append((t_end, END_CARD))
