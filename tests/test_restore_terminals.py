@@ -415,8 +415,14 @@ class MacLaunchers(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("osacompile"), "macOS only")
     def test_launch_scripts_compile(self):
+        # Ghostty's terms come from its scripting dictionary, so its scripts
+        # compile only where it is installed (not on a CI runner)
+        ghostty = any(Path(d, "Ghostty.app").exists()
+                      for d in ("/Applications", Path.home() / "Applications"))
+        names = ["_TERMINAL_LAUNCH", "_TERMINAL_LIST"]
+        names += ["_GHOSTTY_LAUNCH", "_GHOSTTY_LIST"] if ghostty else []
         with tempfile.TemporaryDirectory() as d:
-            for name in ("_GHOSTTY_LAUNCH", "_TERMINAL_LAUNCH", "_GHOSTTY_LIST", "_TERMINAL_LIST"):
+            for name in names:
                 src = Path(d) / f"{name}.applescript"
                 src.write_text(getattr(rt, name))
                 r = subprocess.run(["osacompile", "-o", str(Path(d) / f"{name}.scpt"), str(src)],
