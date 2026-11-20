@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bin_dir="${1:-$HOME/bin}"
+bin_dir="${1:-$HOME/.local/bin}"
 
 mkdir -p "$bin_dir"
 
@@ -19,6 +19,13 @@ case ":$PATH:" in
     printf '  export PATH="%s:$PATH"\n\n' "$bin_dir"
     ;;
 esac
+
+# install.sh used to link into ~/bin; links left there can shadow these
+for old in "$HOME/bin/restore" "$HOME/bin/find-session"; do
+  if [ -L "$old" ] && [ "$(dirname "$old")" != "$bin_dir" ]; then
+    printf 'Note: %s is a link from an earlier install; remove it with: rm %s\n' "$old" "$old"
+  fi
+done
 
 printf 'Installed:\n'
 printf '  %s/restore -> %s/restore_terminals.py\n' "$bin_dir" "$repo_dir"

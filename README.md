@@ -109,25 +109,25 @@ brew install --cask ghostty     # only for --target=ghostty
 git clone https://github.com/luislobo/show-must-go-on.git
 cd show-must-go-on
 
-# Install command symlinks into ~/bin
+# Install command symlinks into ~/.local/bin
 ./install.sh
 
-# If ~/bin is not already on PATH, add it to your shell profile
-export PATH="$HOME/bin:$PATH"
+# If ~/.local/bin is not already on PATH, add it to your shell profile
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`install.sh` takes the target directory as its only argument, so you can link into a directory that is already on `PATH`, such as `~/.local/bin`:
+`install.sh` takes the target directory as its only argument, so you can link into another directory on `PATH`, such as `~/bin`:
 
 ```bash
-./install.sh ~/.local/bin
+./install.sh ~/bin
 ```
 
 Manual install is just two symlinks:
 
 ```bash
-mkdir -p ~/bin
-ln -sfn "$(pwd)/restore_terminals.py" ~/bin/restore
-ln -sfn "$(pwd)/find_session.py" ~/bin/find-session
+mkdir -p ~/.local/bin
+ln -sfn "$(pwd)/restore_terminals.py" ~/.local/bin/restore
+ln -sfn "$(pwd)/find_session.py" ~/.local/bin/find-session
 ```
 
 That's it. No `pip install`, no virtualenv, no build step. Link the scripts rather than copying them: `restore` imports `termui.py` from beside its real file, and Python follows the symlink to find it.
@@ -135,6 +135,7 @@ That's it. No `pip install`, no virtualenv, no build step. Link the scripts rath
 ### Verify installation
 
 ```bash
+restore --version     # e.g. restore 0.5.0 (development b83d4be)
 restore --help
 find-session --help
 python3 -m py_compile restore_terminals.py find_session.py termui.py
@@ -394,8 +395,8 @@ With `--target=byobu`, restore builds a tmux session instead of GUI windows:
 ~/.ai/sessions.jsonl          # Summary cache (written by restore)
 ~/.ai/snapshots/              # Saved snapshots from --save
 ~/.ai/snapshots/latest.json   # Symlink to most recent snapshot
-~/bin/restore                 # Symlink to restore_terminals.py (or the directory given to install.sh)
-~/bin/find-session            # Symlink to find_session.py
+~/.local/bin/restore          # Symlink to restore_terminals.py (or the directory given to install.sh)
+~/.local/bin/find-session     # Symlink to find_session.py
 ```
 
 In the repo, `termui.py` sits beside the two scripts:
@@ -436,7 +437,7 @@ demo/render.sh demo/out && cp demo/out/show-must-go-on-demo.gif docs/
 python3 -m unittest discover tests
 ```
 
-The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping and the tagline. `tests/test_find_session.py` covers `find-session`'s output, in colour and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
+GitHub Actions runs them on every push to `development` and `main` and on every pull request, on Ubuntu and macOS with Python 3.9 and 3.13 (`.github/workflows/tests.yml`). The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the color switches, `paint()`, wrapping and the tagline. `tests/test_find_session.py` covers `find-session`'s output, in color and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
 
 ```bash
 docker run --rm -v "$PWD":/repo:ro python:3.10-slim \
