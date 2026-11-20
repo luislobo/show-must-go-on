@@ -278,9 +278,9 @@ restore --find 'haproxy.*migration' 30
 restore haproxy migration 30
 ```
 
-A word after `restore` searches as `--find` does, and a number is the lookback in days, so `restore dotfiles 30` searches the last 30 days. Several words are searched as one phrase. A number is always days, so a ticket or PR number needs `--find 22302`.
+A word after `restore` searches as `--find` does, and a number is the lookback in days, so `restore dotfiles 30` searches the last 30 days; they can go before or after options. Several words are searched as one phrase, and like `--find` it is a regular expression, so quote characters such as `+` or `(` with a backslash. A number is always days, so a ticket or PR number needs `--find 22302`. A word right after `--load` is the snapshot file to read, not a search.
 
-In the picker, `/` or `f` filters the list as you type, on what the rows show: the agent's title, the summary, the folder, the branch and the PR. Every word must appear, in any order and ignoring case. It filters the list already loaded, so it is instant but does not read transcripts; `restore WORD` does.
+In the picker, `/` or `f` filters the list as you type, on what the rows show: the agent's title, the summary, the folder (as `~/…` and in full), the branch, the PR and the tool. Every word must appear, in any order and ignoring case, and letters beyond ASCII (ñ, á) can be typed. Ticked sessions the filter hides are still returned on `enter`; the filter line says how many there are. It filters the list already loaded, so it is instant but does not read transcripts; `restore WORD` does.
 
 ### Resume without permission prompts
 

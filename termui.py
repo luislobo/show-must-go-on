@@ -262,8 +262,11 @@ def pick(
                                ("enter", "confirm"), ("q", "quit"))
             put(0, header, bold=True)
             if filtering:
+                # ticked rows the filter hides are still returned on enter; say so
+                hidden = count_sel - sum(1 for i in shown if selected[i])
                 put(1, [(" / ", "accent"), (query, "bold"), ("▏" if typing else "", "accent"),
-                        (f"   {len(shown)} of {len(items)}", "")])
+                        (f"   {len(shown)} of {len(items)}", ""),
+                        (f"   {hidden} ticked, hidden" if hidden else "", "warn")])
             # rows: the current one is a reverse-video bar with a marker in the gutter
             for pos in range(top, min(len(shown), top + body_h)):
                 i = shown[pos]
@@ -279,8 +282,11 @@ def pick(
             put(h - 2, with_tagline(loc_segs))
             put(h - 1, [(clip(desc_line, w - 1), "")])
             stdscr.refresh()
-            c = stdscr.getch()
             if typing:
+                # get_wch returns a whole character (ñ, á) as a str and other
+                # keys as an int; getch would split ñ into two bytes
+                k = stdscr.get_wch() if hasattr(stdscr, "get_wch") else stdscr.getch()
+                c = k if isinstance(k, int) else ord(k) if len(k) == 1 else -1
                 if c == 27:                                  # esc: drop the filter
                     typing = False
                     refilter("")
@@ -292,9 +298,10 @@ def pick(
                     idx = min(max(0, len(shown) - 1), idx + 1)
                 elif c == curses.KEY_UP:
                     idx = max(0, idx - 1)
-                elif 32 <= c < 127:                          # printable ASCII; arrows and other keys are > 255
-                    refilter(query + chr(c))
+                elif isinstance(k, str) and k.isprintable():
+                    refilter(query + k)
                 continue
+            c = stdscr.getch()
             if c == 27 and query:                            # esc clears the filter first
                 refilter("")
                 continue

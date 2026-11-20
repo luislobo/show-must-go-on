@@ -3038,8 +3038,9 @@ def _backend_label(target: str) -> str:
 def _words_to_args(ap, args) -> None:
     """The positional words: a number is args.days, the other words args.find.
     A number is always days, so searching for one (a ticket, a PR) needs --find."""
-    days = [w for w in args.words if w.isdigit()]
-    text = [w for w in args.words if not w.isdigit()]
+    # isdecimal, not isdigit: "²" is a digit that int() cannot read
+    days = [w for w in args.words if w.isdecimal()]
+    text = [w for w in args.words if not w.isdecimal()]
     if len(days) > 1:
         ap.error(f"one number of days, not {' and '.join(days)}; search for a number with --find")
     args.days = int(days[0]) if days else 7
@@ -3048,6 +3049,8 @@ def _words_to_args(ap, args) -> None:
             ap.error("give the search as --find or as words, not both")
         if args.save or args.load is not None:
             ap.error("--save and --load read running sessions or a snapshot; they take no search")
+        if args.restart:
+            ap.error("--restart works on running sessions; it takes no search words")
         args.find = " ".join(text)
 
 
@@ -3140,7 +3143,8 @@ def main() -> int:
     ap.add_argument("--save", action="store_true",
                     help="snapshot currently running sessions to ~/.ai/snapshots/")
     ap.add_argument("--load", nargs="?", const="latest", default=None, metavar="FILE",
-                    help="restore from a snapshot (default: latest)")
+                    help="restore from a snapshot (default: latest). A word right after "
+                         "--load is read as FILE, not as a search")
 
     # Power-user knobs. Hidden from --help to keep the surface small.
     ap.add_argument("--min-messages", type=int, default=5, help=argparse.SUPPRESS)
@@ -3155,7 +3159,8 @@ def main() -> int:
     ap.add_argument("--summary-limit", type=int, default=20, help=argparse.SUPPRESS)
     ap.add_argument("--summary-workers", type=int, default=3, help=argparse.SUPPRESS)
     ap.add_argument("--cache", default=str(DEFAULT_CACHE), help=argparse.SUPPRESS)
-    args = ap.parse_args()
+    # intermixed: words may sit on both sides of options (restore dotfiles --no-pick 30)
+    args = ap.parse_intermixed_args()
     _words_to_args(ap, args)
     if args.layout in ("tabs", "saved") and args.target not in ("auto", "ghostty"):
         ap.error(f"--layout={args.layout} needs --target=ghostty")
