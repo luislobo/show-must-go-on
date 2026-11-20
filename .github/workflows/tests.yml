@@ -13,9 +13,11 @@ on:
 permissions:
   contents: read
 
+# a new push to a PR cancels its older run; every commit on development and
+# main keeps its own result
 concurrency:
   group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unittest:

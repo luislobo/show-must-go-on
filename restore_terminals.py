@@ -3025,15 +3025,21 @@ def version_line(repo: Path | None = None) -> str:
     repo = repo or Path(__file__).resolve().parent
     if not (repo / ".git").exists():
         return f"restore {VERSION}"
-    def git(*cmd: str) -> str:
+    # read-only: GIT_OPTIONAL_LOCKS=0 keeps status from refreshing the index,
+    # so it neither writes to the clone nor fails while another git holds the lock
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    def git(*cmd: str) -> str | None:
         try:
             r = subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True,
-                               text=True, timeout=5)
+                               text=True, timeout=5, env=env)
         except (OSError, subprocess.TimeoutExpired):
-            return ""
-        return r.stdout.strip() if r.returncode == 0 else ""
-    where = " ".join(x for x in (git("rev-parse", "--abbrev-ref", "HEAD"),
-                                 git("describe", "--always", "--dirty")) if x)
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+    commit = git("rev-parse", "--short", "HEAD")
+    if commit and git("status", "--porcelain", "--untracked-files=no"):
+        commit += "-dirty"
+    # no branch on a detached checkout (a tag, a commit, CI's merge ref)
+    where = " ".join(x for x in (_git_info(str(repo)).get("branch"), commit) if x)
     return f"restore {VERSION} ({where})" if where else f"restore {VERSION}"
 
 

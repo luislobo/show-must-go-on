@@ -437,7 +437,7 @@ demo/render.sh demo/out && cp demo/out/show-must-go-on-demo.gif docs/
 python3 -m unittest discover tests
 ```
 
-GitHub Actions runs them on every push to `development` and `main` and on every pull request, on Ubuntu and macOS with Python 3.9 and 3.13 (`.github/workflows/tests.yml`). The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the colour switches, `paint()`, wrapping and the tagline. `tests/test_find_session.py` covers `find-session`'s output, in colour and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
+GitHub Actions runs them on every push to `development` and `main` and on every pull request, on Ubuntu and macOS with Python 3.9 and 3.13 (`.github/workflows/tests.yml`). The tests use only the standard library. `tests/test_restore_terminals.py` covers process discovery, Claude session lookup, host-terminal detection, macOS window matching, the Ghostty layouts, target selection, the picker rows and the details page; `tests/test_termui.py` covers the color switches, `paint()`, wrapping and the tagline. `tests/test_find_session.py` covers `find-session`'s output, in color and piped. One test starts a real process named `claude` and checks that `--save`'s discovery finds it, so running the suite on each OS covers `/proc` on Linux and `ps`/`lsof` on macOS. To run the Linux side from a Mac:
 
 ```bash
 docker run --rm -v "$PWD":/repo:ro python:3.10-slim \

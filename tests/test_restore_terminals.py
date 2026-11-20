@@ -28,6 +28,17 @@ sys.modules["restore_terminals"] = rt  # dataclasses look the module up while bu
 _spec.loader.exec_module(rt)
 
 
+def ghostty_installed() -> bool:
+    """Ghostty found by its bundle id (Spotlight), or in the usual folders."""
+    try:
+        found = subprocess.run(["mdfind", "kMDItemCFBundleIdentifier == 'com.mitchellh.ghostty'"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        found = ""
+    return bool(found) or any(Path(d, "Ghostty.app").exists()
+                              for d in ("/Applications", Path.home() / "Applications"))
+
+
 def session(sid="s1", cwd="/w/a", **kw):
     now = datetime.now(timezone.utc)
     return rt.Session(tool="claude", session_id=sid, path=Path(f"/x/{sid}.jsonl"),
@@ -413,14 +424,7 @@ class MacLaunchers(unittest.TestCase):
         self.assertNotIn("✓", out)
         self.assertIn("Ghostty opened 0/2: osascript failed", err)
 
-    @unittest.skipUnless(shutil.which("osacompile"), "macOS only")
-    def test_launch_scripts_compile(self):
-        # Ghostty's terms come from its scripting dictionary, so its scripts
-        # compile only where it is installed (not on a CI runner)
-        ghostty = any(Path(d, "Ghostty.app").exists()
-                      for d in ("/Applications", Path.home() / "Applications"))
-        names = ["_TERMINAL_LAUNCH", "_TERMINAL_LIST"]
-        names += ["_GHOSTTY_LAUNCH", "_GHOSTTY_LIST"] if ghostty else []
+    def compile_scripts(self, *names):
         with tempfile.TemporaryDirectory() as d:
             for name in names:
                 src = Path(d) / f"{name}.applescript"
@@ -428,6 +432,18 @@ class MacLaunchers(unittest.TestCase):
                 r = subprocess.run(["osacompile", "-o", str(Path(d) / f"{name}.scpt"), str(src)],
                                    capture_output=True, text=True)
                 self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
+
+    @unittest.skipUnless(shutil.which("osacompile"), "macOS only")
+    def test_terminal_scripts_compile(self):
+        self.compile_scripts("_TERMINAL_LAUNCH", "_TERMINAL_LIST")
+
+    @unittest.skipUnless(shutil.which("osacompile"), "macOS only")
+    def test_ghostty_scripts_compile(self):
+        # Ghostty's terms come from its scripting dictionary, so its scripts
+        # compile only where it is installed; CI runners have no Ghostty
+        if not ghostty_installed():
+            self.skipTest("Ghostty is not installed")
+        self.compile_scripts("_GHOSTTY_LAUNCH", "_GHOSTTY_LIST")
 
 
 class ResolveTarget(unittest.TestCase):
@@ -1255,31 +1271,68 @@ class RunningInPicker(unittest.TestCase):
         self.assertEqual([s.session_id for s in kept], ["b"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Version(unittest.TestCase):
     def test_outside_a_clone_it_is_the_number_alone(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(rt.version_line(Path(d)), f"restore {rt.VERSION}")
 
+    # a git that ignores your config and any repo the suite runs inside (a hook sets GIT_DIR)
+    GIT_ENV = {**{k: v for k, v in os.environ.items()
+                  if k not in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE")},
+               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+    def git(self, d, *cmd):
+        return subprocess.run(["git", "-C", d, *cmd], check=True, capture_output=True,
+                              text=True, env=self.GIT_ENV).stdout.strip()
+
+    def version(self, d):
+        rt._git_cache.clear()
+        with mock.patch.dict(os.environ, self.GIT_ENV, clear=True):
+            return rt.version_line(Path(d))
+
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_in_a_clone_it_names_the_branch_and_commit(self):
         with tempfile.TemporaryDirectory() as d:
-            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
-            for cmd in (["init", "-q", "-b", "topic"], ["commit", "-q", "--allow-empty", "-m", "x"]):
-                subprocess.run(["git", "-C", d, *cmd], check=True, env=env)
-            head = subprocess.run(["git", "-C", d, "rev-parse", "--short", "HEAD"],
-                                  capture_output=True, text=True).stdout.strip()
-            self.assertEqual(rt.version_line(Path(d)), f"restore {rt.VERSION} (topic {head})")
+            self.git(d, "init", "-q", "-b", "topic")
+            self.git(d, "commit", "-q", "--allow-empty", "-m", "x")
+            head = self.git(d, "rev-parse", "--short", "HEAD")
+            self.assertEqual(self.version(d), f"restore {rt.VERSION} (topic {head})")
             Path(d, "f").write_text("x")
-            subprocess.run(["git", "-C", d, "add", "f"], check=True)
-            self.assertTrue(rt.version_line(Path(d)).endswith("-dirty)"))
+            self.assertEqual(self.version(d), f"restore {rt.VERSION} (topic {head})",
+                             "an untracked file is not a change")
+            self.git(d, "add", "f")
+            self.assertEqual(self.version(d), f"restore {rt.VERSION} (topic {head}-dirty)")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_a_detached_checkout_has_no_branch(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.git(d, "init", "-q", "-b", "topic")
+            self.git(d, "commit", "-q", "--allow-empty", "-m", "x")
+            head = self.git(d, "rev-parse", "--short", "HEAD")
+            self.git(d, "checkout", "-q", "--detach")
+            self.assertEqual(self.version(d), f"restore {rt.VERSION} ({head})")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_it_does_not_write_to_the_clone(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.git(d, "init", "-q", "-b", "topic")
+            Path(d, "f").write_text("x")
+            self.git(d, "add", "f")
+            self.git(d, "commit", "-q", "-m", "x")
+            os.utime(Path(d, "f"))          # a stale stat that a refresh would rewrite
+            index = Path(d, ".git", "index")
+            before = index.stat().st_mtime_ns
+            self.version(d)
+            self.assertEqual(index.stat().st_mtime_ns, before)
 
     def test_the_flag_prints_it_and_exits(self):
         out = subprocess.run([sys.executable, str(ROOT / "restore_terminals.py"), "--version"],
                              capture_output=True, text=True)
         self.assertEqual(out.returncode, 0)
         self.assertTrue(out.stdout.startswith(f"restore {rt.VERSION}"), out.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
