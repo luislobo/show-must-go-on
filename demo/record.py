@@ -24,6 +24,7 @@ import os
 import pty
 import random
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -76,8 +77,8 @@ SCRIPT = [
     ("key", "j", 0.35), ("key", "j", 0.35), ("key", "j", 2.0),
     ("key", LEFT, 1.2),
     ("say", ("Enter shows the plan. With --execute, restore opens each session in Ghostty, "
-             "Terminal, Terminator or tmux; on macOS it restarts one that still runs in "
-             "place, rather than opening it twice."), 0.0),
+             "Terminal, Terminator or tmux; one that still runs in Ghostty or Terminal "
+             "it restarts in place, rather than opening it twice."), 0.0),
     ("key", ENTER, 0.0),
     ("wait_for", "dry-run", 3.5),
     ("say", ("restore --find searches every transcript, here for backoff, "
@@ -161,7 +162,12 @@ def start_running(home: Path, project: str) -> subprocess.Popen:
     sid = None
     for f in sorted((home / ".claude" / "projects").rglob("*.jsonl")):
         for line in f.open():
-            d = json.loads(line)
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
             if Path(d.get("cwd") or "/").name == project and d.get("sessionId"):
                 sid = d["sessionId"]
                 break
@@ -170,8 +176,10 @@ def start_running(home: Path, project: str) -> subprocess.Popen:
     if not sid:
         raise SystemExit(f"no claude session for {project} in {home}")
     cwd = home / "code" / project
-    proc = subprocess.Popen(["claude", "86400"], executable="/bin/sleep", cwd=cwd,
-                            stdin=subprocess.DEVNULL, start_new_session=True)
+    # lives 5 minutes at most (a recording takes about 70 s), so even a recorder
+    # killed outright leaves no long-lived process named claude behind
+    proc = subprocess.Popen(["claude", "300"], executable="/bin/sleep", cwd=cwd,
+                            stdin=subprocess.DEVNULL)
     records = home / ".claude" / "sessions"
     records.mkdir(parents=True, exist_ok=True)
     (records / f"{proc.pid}.json").write_text(json.dumps({
@@ -208,68 +216,79 @@ def main(home: Path, out: Path, narration: Path | None = None) -> None:
     emit(SHOW_CURSOR + "\x1b[2J\x1b[H", 0.0)
 
     running = start_running(home, RUNNING_PROJECT)
-    pid, fd = pty.fork()
-    if pid == 0:
-        fcntl.ioctl(sys.stdout.fileno(), termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
-        os.chdir(home / "code")
-        os.execve("/bin/zsh", ["zsh", "-f", "-i"], env)
+    pid = 0
+    try:
+        pid, fd = pty.fork()
+        if pid == 0:
+            fcntl.ioctl(sys.stdout.fileno(), termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+            os.chdir(home / "code")
+            os.execve("/bin/zsh", ["zsh", "-f", "-i"], env)
 
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    start = time.monotonic()
-    screen_since_mark = ""
-
-    def pump(seconds: float) -> None:
-        """Read output for `seconds`, recording each chunk with its time."""
-        nonlocal screen_since_mark
-        end = time.monotonic() + seconds
-        while True:
-            left = end - time.monotonic()
-            if left <= 0:
-                return
-            r, _, _ = select.select([fd], [], [], min(left, 0.05))
-            if r:
-                try:
-                    data = os.read(fd, 65536)
-                except OSError:
-                    return
-                if not data:
-                    return
-                text = decoder.decode(data)
-                if text:
-                    events.append((t0 + time.monotonic() - start, text))
-                    screen_since_mark += text
-
-    speaking_until = 0.0     # monotonic time the current line ends
-    for action, arg, after in SCRIPT:
-        if action == "say":
-            seconds = narrator.speak(arg)
-            if seconds:
-                pump(max(0.0, speaking_until + gap - time.monotonic()))
-                narrator.place(t0 + time.monotonic() - start)
-                speaking_until = time.monotonic() + seconds
-        elif action == "wait_for":
-            deadline = time.monotonic() + 30
-            while arg not in screen_since_mark:
-                if time.monotonic() > deadline:
-                    tail = screen_since_mark[-1500:]
-                    raise SystemExit(f"timed out waiting for {arg!r}; last output:\n{tail!r}")
-                pump(0.05)
-        elif action == "type":
-            for ch in arg:
-                os.write(fd, ch.encode())
-                pump(random.uniform(0.05, 0.11))
-        elif action == "key":
-            os.write(fd, arg.encode())
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        start = time.monotonic()
         screen_since_mark = ""
-        pump(after)
 
-    pump(max(0.0, speaking_until + gap - time.monotonic()))
-    os.write(fd, b"exit\r")
-    pump(0.5)
-    os.close(fd)
-    os.waitpid(pid, 0)
-    running.kill()
-    running.wait()
+        def pump(seconds: float) -> None:
+            """Read output for `seconds`, recording each chunk with its time."""
+            nonlocal screen_since_mark
+            end = time.monotonic() + seconds
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return
+                r, _, _ = select.select([fd], [], [], min(left, 0.05))
+                if r:
+                    try:
+                        data = os.read(fd, 65536)
+                    except OSError:
+                        return
+                    if not data:
+                        return
+                    text = decoder.decode(data)
+                    if text:
+                        events.append((t0 + time.monotonic() - start, text))
+                        screen_since_mark += text
+
+        speaking_until = 0.0     # monotonic time the current line ends
+        for action, arg, after in SCRIPT:
+            if action == "say":
+                seconds = narrator.speak(arg)
+                if seconds:
+                    pump(max(0.0, speaking_until + gap - time.monotonic()))
+                    narrator.place(t0 + time.monotonic() - start)
+                    speaking_until = time.monotonic() + seconds
+            elif action == "wait_for":
+                deadline = time.monotonic() + 30
+                while arg not in screen_since_mark:
+                    if time.monotonic() > deadline:
+                        tail = screen_since_mark[-1500:]
+                        raise SystemExit(f"timed out waiting for {arg!r}; last output:\n{tail!r}")
+                    pump(0.05)
+            elif action == "type":
+                for ch in arg:
+                    os.write(fd, ch.encode())
+                    pump(random.uniform(0.05, 0.11))
+            elif action == "key":
+                os.write(fd, arg.encode())
+            screen_since_mark = ""
+            pump(after)
+
+        pump(max(0.0, speaking_until + gap - time.monotonic()))
+        os.write(fd, b"exit\r")
+        pump(0.5)
+        os.close(fd)
+        os.waitpid(pid, 0)
+        pid = 0
+    finally:
+        # also on a timeout, an error or Ctrl-C: end the shell and the stand-in
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+        running.kill()
+        running.wait()
 
     t_end = t0 + time.monotonic() - start
     events.append((t_end, END_CARD))
