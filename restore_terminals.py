@@ -23,6 +23,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -2227,6 +2228,8 @@ def _placement_label(entry: dict) -> str:
 
 SNAPSHOT_FORMAT = 1        # "format" in a snapshot file; files from before it have none
 AUTO_KEEP_DAYS = 14        # automatic snapshots older than this are deleted
+EARLIER_BOOT_DAYS = 7      # --load also offers the sessions of earlier boots this recent
+LOG_MAX_BYTES = 512 * 1024 # the autosave log is cut back to its last half past this
 # Where a session runs. A change in any of these is worth a new automatic
 # snapshot; a new pid or window title is not (titles change as the agent works).
 _PLACEMENT_KEYS = ("tool", "session_id", "cwd", "jsonl_path", "terminal", "skip_permissions",
@@ -2234,40 +2237,70 @@ _PLACEMENT_KEYS = ("tool", "session_id", "cwd", "jsonl_path", "terminal", "skip_
 
 
 def _write_atomic(path: Path, text: str) -> None:
-    """Write beside the target and rename over it, so a crash mid-write leaves
-    the old file or the new one, never half of one."""
-    tmp = path.with_name(f".{path.name}.tmp")
-    with tmp.open("w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Write to a temporary file beside the target and rename it over the
+    target, so a crash mid-write leaves the old file or the new one, never half
+    of one. The temporary name is unique, so two writers never share it."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def _point_latest(path: Path) -> None:
     """Point latest.json at `path`, replacing the old link in one rename."""
-    tmp = path.parent / ".latest.json.tmp"
+    tmp = path.parent / f".latest.{os.getpid()}.tmp"
     try:
         tmp.unlink(missing_ok=True)
         tmp.symlink_to(path.name)
         os.replace(tmp, path.parent / "latest.json")
     except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+def boot_time() -> float | None:
+    """When this machine started, as a Unix time; None when it cannot tell."""
+    if IS_MACOS:
+        try:   # by full path: a launchd job's PATH may lack /usr/sbin
+            out = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        m = re.search(r"sec = (\d+)", out)
+        return float(m.group(1)) if m else None
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
         pass
+    return None
 
 
 def save_snapshot(entries: list[dict], auto: bool = False) -> Path:
     """Write ~/.ai/snapshots/<local time>.json (<local time>-auto.json for an
-    automatic save), point latest.json at it, and return its path."""
+    automatic save), point latest.json at it, and return its path. It records
+    the boot it was taken in, which --load uses after a restart."""
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     stem = now.astimezone().strftime("%Y-%m-%d_%H%M%S") + ("-auto" if auto else "")
-    path, n = SNAPSHOTS_DIR / f"{stem}.json", 1
-    while path.exists():
-        n += 1
-        path = SNAPSHOTS_DIR / f"{stem}-{n}.json"
+    n = 1
+    while True:   # claim the name first, so two saves in one second never share it
+        path = SNAPSHOTS_DIR / (f"{stem}.json" if n == 1 else f"{stem}-{n}.json")
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            break
+        except FileExistsError:
+            n += 1
     _write_atomic(path, json.dumps({
         "format": SNAPSHOT_FORMAT,
         "timestamp": now.isoformat(),
+        "boot": boot_time(),
         "auto": auto,
         "sessions": entries,
     }, indent=2))
@@ -2275,70 +2308,108 @@ def save_snapshot(entries: list[dict], auto: bool = False) -> Path:
     return path
 
 
+def read_snapshot(path: Path, quiet: bool = False) -> dict | None:
+    """A snapshot file as {"time", "boot", "sessions"}, or None when it is
+    missing or unreadable, with a message naming it unless quiet. time is its
+    timestamp (the file's mtime for one without), so a copy that changed the
+    mtime keeps its place; sessions keeps only the entries that are objects."""
+    try:
+        text = path.read_text()
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if not text.strip():
+        return None    # a name a save in progress has claimed
+    def bad(why: str) -> None:
+        if not quiet:
+            print(f"  {short_cwd(str(path))}: not a readable snapshot ({why})", file=sys.stderr)
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        return bad(str(e))
+    if not isinstance(data, dict):
+        return bad("not a JSON object")
+    fmt = data.get("format", 0)
+    if not isinstance(fmt, int) or isinstance(fmt, bool):
+        return bad(f"format {fmt!r}")
+    sessions = data.get("sessions") or []
+    if not isinstance(sessions, list):
+        return bad("its sessions are not a list")
+    if fmt > SNAPSHOT_FORMAT and not quiet:
+        print(f"  {short_cwd(str(path))} was written by a newer restore "
+              f"(format {fmt}); reading what this one knows", file=sys.stderr)
+    when = mtime
+    if isinstance(data.get("timestamp"), str):
+        try:
+            when = datetime.fromisoformat(data["timestamp"]).timestamp()
+        except ValueError:
+            pass
+    boot = data.get("boot")
+    return {"time": when,
+            "boot": float(boot) if isinstance(boot, (int, float)) and not isinstance(boot, bool) else None,
+            "sessions": [e for e in sessions if isinstance(e, dict)]}
+
+
 def load_snapshot(path: Path | None = None) -> list[dict]:
     """The sessions in a snapshot file (default: latest); [] when it is missing or unreadable."""
-    if path is None:
-        path = SNAPSHOTS_DIR / "latest.json"
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError) as e:
-        print(f"  {short_cwd(str(path))}: not a readable snapshot ({e})", file=sys.stderr)
-        return []
-    if not isinstance(data, dict):
-        return []
-    if (data.get("format") or 0) > SNAPSHOT_FORMAT:
-        print(f"  {short_cwd(str(path))} was written by a newer restore "
-              f"(format {data['format']}); reading what this one knows", file=sys.stderr)
-    return data.get("sessions") or []
+    snap = read_snapshot(path or SNAPSHOTS_DIR / "latest.json")
+    return snap["sessions"] if snap else []
 
 
-def snapshot_files() -> list[Path]:
-    """Every snapshot file, oldest first. Each is written once, so its mtime is when it was taken."""
+def snapshot_index() -> list[tuple[Path, dict]]:
+    """Every readable snapshot file with its contents, oldest first by its timestamp."""
     if not SNAPSHOTS_DIR.is_dir():
         return []
-    files = [f for f in SNAPSHOTS_DIR.glob("*.json") if not f.is_symlink()]
-    return sorted(files, key=lambda f: f.stat().st_mtime)
+    found = []
+    for f in SNAPSHOTS_DIR.glob("*.json"):
+        if not f.is_symlink():
+            snap = read_snapshot(f, quiet=True)
+            if snap:
+                found.append((f, snap))
+    return sorted(found, key=lambda fs: fs[1]["time"])
 
 
-def boot_time() -> float | None:
-    """When this machine started, as a Unix time; None when it cannot tell."""
-    if IS_MACOS:
-        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
-                             text=True).stdout
-        m = re.search(r"sec = (\d+)", out)
-        return float(m.group(1)) if m else None
-    try:
-        for line in Path("/proc/stat").read_text().splitlines():
-            if line.startswith("btime "):
-                return float(line.split()[1])
-    except OSError:
-        pass
-    return None
-
-
-def _last_before_boot(boot: float | None) -> Path | None:
+def _earlier_boot_snapshots(index: list[tuple[Path, dict]], boot: float | None,
+                            now: float | None = None) -> list[tuple[Path, dict]]:
+    """The last snapshot taken in each boot before `boot`, newest first: the
+    boot just before this one always, earlier ones when taken within
+    EARLIER_BOOT_DAYS. Snapshots from before boots were recorded count as one."""
     if boot is None:
-        return None
-    before = [f for f in snapshot_files() if f.stat().st_mtime < boot]
-    return before[-1] if before else None
+        return []
+    now = time.time() if now is None else now
+    last_of: dict = {}
+    for path, snap in index:        # oldest first, so each boot keeps its last
+        if snap["time"] < boot:
+            last_of[snap["boot"]] = (path, snap)
+    found = sorted(last_of.values(), key=lambda ps: ps[1]["time"], reverse=True)
+    return [ps for i, ps in enumerate(found)
+            if i == 0 or now - ps[1]["time"] <= EARLIER_BOOT_DAYS * 86400]
 
 
-def load_latest(boot: float | None = None) -> tuple[list[dict], Path | None]:
-    """latest.json's sessions, plus those in the last snapshot taken before
-    this boot that latest does not list, and that snapshot's path when it
-    added any. After a reboot, a save (by hand or automatic) records only the
-    sessions reopened so far; without this the rest would drop out of --load."""
+def load_latest(boot: float | None = None,
+                now: float | None = None) -> tuple[list[dict], list[tuple[Path, int]]]:
+    """latest.json's sessions, plus those it lacks from the last snapshot of
+    each earlier boot (see _earlier_boot_snapshots), and which files added how
+    many. After a restart, saves (by hand or automatic) record only the
+    sessions reopened so far, and a second restart can come before the rest
+    are; without this they would drop out of --load."""
     latest = SNAPSHOTS_DIR / "latest.json"
     entries = load_snapshot(latest)
+    if not entries:
+        return entries, []
     boot = boot_time() if boot is None else boot
-    prev = _last_before_boot(boot)
-    if not entries or prev is None or prev.resolve() == latest.resolve():
-        return entries, None
     have = {e.get("session_id") for e in entries}
-    extra = [e for e in load_snapshot(prev) if e.get("session_id") not in have]
-    return entries + extra, (prev if extra else None)
+    target = latest.resolve()
+    added: list[tuple[Path, int]] = []
+    for path, snap in _earlier_boot_snapshots(snapshot_index(), boot, now):
+        if path.resolve() == target:
+            continue
+        extra = [e for e in snap["sessions"] if e.get("session_id") not in have]
+        if extra:
+            have.update(e.get("session_id") for e in extra)
+            entries = entries + extra
+            added.append((path, len(extra)))
+    return entries, added
 
 
 def _placements(entries: list[dict]) -> set[tuple]:
@@ -2347,27 +2418,55 @@ def _placements(entries: list[dict]) -> set[tuple]:
 
 def prune_auto_snapshots(keep_days: int = AUTO_KEEP_DAYS, boot: float | None = None) -> int:
     """Delete automatic snapshots older than keep_days; returns how many.
-    Snapshots saved by hand stay, and so do latest.json's and the last one
-    before this boot, which load_latest reads."""
-    files = snapshot_files()
-    prev = _last_before_boot(boot)
-    keep = {(SNAPSHOTS_DIR / "latest.json").resolve(), prev.resolve() if prev else None}
+    Snapshots saved by hand stay, and so do latest.json's and those
+    load_latest reads from earlier boots."""
+    index = snapshot_index()
+    keep = {(SNAPSHOTS_DIR / "latest.json").resolve()}
+    keep |= {p.resolve() for p, _ in _earlier_boot_snapshots(index, boot)}
     cutoff = time.time() - keep_days * 86400
     gone = 0
-    for f in files:
-        if "-auto" in f.stem and f.stat().st_mtime < cutoff and f.resolve() not in keep:
-            f.unlink(missing_ok=True)
+    for path, snap in index:
+        if "-auto" in path.stem and snap["time"] < cutoff and path.resolve() not in keep:
+            path.unlink(missing_ok=True)
             gone += 1
     return gone
+
+
+def _trim_log() -> None:
+    """Cut the autosave log back to its last half once it passes LOG_MAX_BYTES.
+    In place, since launchd and systemd keep appending to the same file."""
+    try:
+        if AUTOSAVE_LOG.stat().st_size <= LOG_MAX_BYTES:
+            return
+        with AUTOSAVE_LOG.open("r+b") as f:
+            f.seek(-(LOG_MAX_BYTES // 2), os.SEEK_END)
+            tail = f.read()
+            tail = tail[tail.find(b"\n") + 1:]
+            f.seek(0)
+            f.write(tail)
+            f.truncate()
+    except OSError:
+        pass
+
+
+def _log_tail(lines: int = 3) -> list[str]:
+    """The last lines of the autosave log, reading only its end."""
+    try:
+        with AUTOSAVE_LOG.open("rb") as f:
+            f.seek(max(0, AUTOSAVE_LOG.stat().st_size - 4096))
+            return f.read().decode(errors="replace").strip().splitlines()[-lines:]
+    except OSError:
+        return []
 
 
 def auto_save() -> int:
     """restore --save --auto, run on a schedule: save the running sessions when
     where they run changed since latest.json, and delete old automatic
     snapshots. Prints one line when it saves, nothing otherwise."""
+    _trim_log()
     active = snapshot_active()
     if not active:
-        return 0       # nothing runs, as right after a reboot: keep latest as it is
+        return 0       # nothing runs, as right after a restart: keep latest as it is
     if _placements(active) == _placements(load_snapshot()):
         return 0
     path = save_snapshot(active, auto=True)
@@ -2405,19 +2504,23 @@ def launchd_plist(minutes: int, env: dict[str, str]) -> bytes:
 
 
 def systemd_units(minutes: int, env: dict[str, str]) -> dict[str, str]:
-    """The user service and timer, keyed by file name."""
-    def quote(v: str) -> str:
-        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """The user service and timer, keyed by file name. systemd expands %
+    specifiers in every setting and $VARIABLES in ExecStart, so both are
+    escaped: a PATH or folder holding them reaches the job as written."""
+    def quote(v: str, exec_line: bool = False) -> str:
+        v = v.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+        return '"' + (v.replace("$", "$$") if exec_line else v) + '"'
     environment = "".join(f"Environment={quote(f'{k}={v}')}\n" for k, v in env.items())
+    log = str(AUTOSAVE_LOG).replace("%", "%%")
     service = (
         "[Unit]\n"
         "Description=Save a snapshot of the running Claude Code and Codex sessions\n\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={' '.join(quote(a) for a in autosave_command())}\n"
+        f"ExecStart={' '.join(quote(a, exec_line=True) for a in autosave_command())}\n"
         f"{environment}"
-        f"StandardOutput=append:{AUTOSAVE_LOG}\n"
-        f"StandardError=append:{AUTOSAVE_LOG}\n"
+        f"StandardOutput=append:{log}\n"
+        f"StandardError=append:{log}\n"
     )
     timer = (
         "[Unit]\n"
@@ -2443,18 +2546,25 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _autosave_loaded() -> bool:
+    """Whether the scheduler has the job: launchd knows the label, or systemd has the timer on."""
+    if IS_MACOS:
+        return _run(["launchctl", "print", f"gui/{os.getuid()}/{AUTOSAVE_NAME}"]).returncode == 0
+    timer = f"{AUTOSAVE_NAME}.timer"
+    return (_run(["systemctl", "--user", "is-active", timer]).stdout.strip() == "active"
+            or _run(["systemctl", "--user", "is-enabled", timer]).stdout.strip() == "enabled")
+
+
 def autosave(args) -> int:
     """restore --autosave MINUTES|off|status: show, install or remove the schedule
     that runs restore --save --auto. Changes nothing without --execute."""
     what = args.autosave
     if what == "status":
         return _autosave_status()
-    if what != "off" and (not what.isdigit() or int(what) < 1):
+    if what != "off" and (not what.isdecimal() or int(what) < 1):
         print(f"  --autosave takes a number of minutes, off or status, not {what!r}", file=sys.stderr)
         return 2
     minutes = 0 if what == "off" else int(what)
-    # stop: unload the old job first, so nothing runs a half-replaced one; it
-    # fails when there is none, which is fine. start: after the files are written.
     if IS_MACOS:
         files = {LAUNCH_AGENT: launchd_plist(minutes or 1, _autosave_env()).decode()}
         stop = [["launchctl", "bootout", f"gui/{os.getuid()}/{AUTOSAVE_NAME}"]]
@@ -2485,24 +2595,41 @@ def autosave(args) -> int:
         print("\n  (dry-run; nothing was changed — add --execute)\n")
         return 0
 
-    for cmd in stop:
-        _run(cmd)
     if not minutes:
+        for cmd in stop:
+            _run(cmd)      # fails when nothing is loaded, which is fine
+        if _autosave_loaded():
+            print(f"  {paint('●', 'alert')} {' '.join(stop[0])} did not unload the job; "
+                  f"its files stay so it can still be found", file=sys.stderr)
+            return 1
         for f in files:
             f.unlink(missing_ok=True)
         if not IS_MACOS:
             _run(["systemctl", "--user", "daemon-reload"])
         print(f"  {paint('done', 'ok')}")
         return 0
-    AUTOSAVE_LOG.parent.mkdir(parents=True, exist_ok=True)
-    for f, text in files.items():
-        f.parent.mkdir(parents=True, exist_ok=True)
-        _write_atomic(f, text)
+
+    # write the new files before touching the running job: if writing fails,
+    # the old schedule is still in place
+    try:
+        AUTOSAVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        for f, text in files.items():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            _write_atomic(f, text)
+    except OSError as e:
+        print(f"  {paint('●', 'alert')} could not write {short_cwd(str(e.filename or ''))}: "
+              f"{e.strerror or e}; the schedule was not changed", file=sys.stderr)
+        return 1
+    for cmd in stop:
+        _run(cmd)          # the old job, if any; fails when there is none
     for cmd in start:
         r = _run(cmd)
         if r.returncode != 0:
             print(f"  {paint('●', 'alert')} {' '.join(cmd)} failed: "
-                  f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+                  f"{(r.stderr or r.stdout).strip()}\n"
+                  f"  the new files are in place but no schedule runs; fix that and run "
+                  f"--autosave again, or remove them with --autosave off --execute",
+                  file=sys.stderr)
             return 1
     print(f"  {paint('done', 'ok')}; restore --autosave status shows the last save")
     return 0
@@ -2522,16 +2649,15 @@ def _ago(seconds: float) -> str:
 
 
 def _autosave_status() -> int:
+    on = _autosave_loaded()
     if IS_MACOS:
-        installed = LAUNCH_AGENT.exists()
+        on = on and LAUNCH_AGENT.exists()
         loaded = _run(["launchctl", "print", f"gui/{os.getuid()}/{AUTOSAVE_NAME}"])
-        on = installed and loaded.returncode == 0
         m = re.search(r"run interval = (\d+) seconds", loaded.stdout)
         every = f" every {_minutes(int(m.group(1)) // 60)}" if m else ""
         where = short_cwd(str(LAUNCH_AGENT))
     else:
         timer = f"{AUTOSAVE_NAME}.timer"
-        on = _run(["systemctl", "--user", "is-active", timer]).stdout.strip() == "active"
         try:
             m = re.search(r"^OnUnitActiveSec=(\d+)min", (SYSTEMD_USER / timer).read_text(), re.MULTILINE)
         except OSError:
@@ -2540,17 +2666,16 @@ def _autosave_status() -> int:
         where = short_cwd(str(SYSTEMD_USER / timer))
     print(f"  automatic snapshots: {paint('on', 'ok') + every if on else paint('off', 'warn')}"
           f"  ({where})")
-    files = snapshot_files()
-    if files:
-        last = files[-1]
-        print(f"  newest snapshot    : {last.name}, {_ago(time.time() - last.stat().st_mtime)}, "
-              f"{len(load_snapshot(last))} session(s)")
-    if AUTOSAVE_LOG.exists():
-        tail = AUTOSAVE_LOG.read_text(errors="replace").strip().splitlines()[-3:]
-        if tail:
-            print(f"  {short_cwd(str(AUTOSAVE_LOG))}:")
-            for line in tail:
-                print(f"    {line}")
+    index = snapshot_index()
+    if index:
+        path, snap = index[-1]
+        print(f"  newest snapshot    : {path.name}, {_ago(time.time() - snap['time'])}, "
+              f"{len(snap['sessions'])} session(s)")
+    tail = _log_tail()
+    if tail:
+        print(f"  {short_cwd(str(AUTOSAVE_LOG))}:")
+        for line in tail:
+            print(f"    {line}")
     return 0
 
 
@@ -3410,8 +3535,9 @@ def main() -> int:
     ap.add_argument("--save", action="store_true",
                     help="snapshot currently running sessions to ~/.ai/snapshots/")
     ap.add_argument("--load", nargs="?", const="latest", default=None, metavar="FILE",
-                    help="restore from a snapshot (default: latest, plus the sessions of the "
-                         "last snapshot before this boot that latest does not list)")
+                    help="restore from a snapshot (default: latest, plus the sessions it "
+                         "lacks from the last snapshot of each earlier boot: the one before this "
+                         "always, older ones from the past 7 days)")
     ap.add_argument("--autosave", nargs="?", const="10", default=None,
                     metavar="MINUTES|off|status",
                     help="run --save --auto every MINUTES (default: 10) with launchd on macOS "
@@ -3449,6 +3575,9 @@ def main() -> int:
     if args.auto and not args.save:
         ap.error("--auto works with --save")
     if args.autosave is not None:
+        if args.save or args.load is not None or args.restart or args.find:
+            ap.error("--autosave sets up the schedule; it does not take --save, --load, "
+                     "--restart or --find")
         return autosave(args)
 
     # --restart: end running sessions and resume each where it runs
@@ -3478,20 +3607,20 @@ def main() -> int:
     if args.load is not None:
         if args.load == "latest":
             snap_path = SNAPSHOTS_DIR / "latest.json"
-            entries, before_boot = load_latest()
+            entries, added = load_latest()
         else:
-            snap_path, before_boot = Path(args.load).expanduser(), None
+            snap_path, added = Path(args.load).expanduser(), []
             entries = load_snapshot(snap_path)
         if not entries:
             print(f"  no snapshot found at {short_cwd(str(snap_path))}")
             return 1
-        extra = len(entries) - len(load_snapshot(snap_path)) if before_boot else 0
+        extra = sum(n for _, n in added)
         print(f"  {paint('loaded', 'ok')} {paint(len(entries) - extra, 'bold')} session(s) "
               f"from {short_cwd(str(snap_path))}")
-        if extra:
-            print(f"  {paint('and', 'ok')} {paint(extra, 'bold')} more from "
-                  f"{short_cwd(str(before_boot))}, the last snapshot before this computer "
-                  f"started, which latest does not list")
+        for path, n in added:
+            print(f"  {paint('and', 'ok')} {paint(n, 'bold')} more from "
+                  f"{short_cwd(str(path))}, the last snapshot before an earlier restart, "
+                  f"which latest does not list")
         ranked = snapshot_to_sessions(entries)
         if not ranked:
             print(f"  {paint('none of the saved sessions could be parsed', 'warn')} (files gone?)")
