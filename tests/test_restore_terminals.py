@@ -1249,5 +1249,347 @@ class RunningInPicker(unittest.TestCase):
         self.assertEqual([s.session_id for s in kept], ["b"])
 
 
+class Snapshots(unittest.TestCase):
+    """Writing, reading and pruning snapshot files, and --load after restarts."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        for name, value in (("SNAPSHOTS_DIR", self.dir), ("AUTOSAVE_LOG", self.dir / "autosave.log")):
+            patcher = mock.patch.object(rt, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    @staticmethod
+    def entry(sid, **kw):
+        return {"tool": "claude", "session_id": sid, "cwd": f"/w/{sid}", "pid": 100,
+                "terminal": "ghostty", "window_id": "w1", "tab_index": 1,
+                "window_title": "✳ working", **kw}
+
+    def write(self, name, sids, at, boot=None, auto=False, mtime=None):
+        """A snapshot file taken at Unix time `at` in the boot that started at `boot`."""
+        f = self.dir / name
+        f.write_text(json.dumps({
+            "format": 1, "timestamp": datetime.fromtimestamp(at, timezone.utc).isoformat(),
+            "boot": boot, "auto": auto, "sessions": [self.entry(s) for s in sids]}))
+        os.utime(f, (mtime or at, mtime or at))
+        return f
+
+    def point_latest(self, f):
+        (self.dir / "latest.json").unlink(missing_ok=True)
+        (self.dir / "latest.json").symlink_to(f.name)
+
+    @staticmethod
+    def ids(entries):
+        return sorted(e["session_id"] for e in entries)
+
+    def test_save_records_the_format_boot_and_moves_latest_in_one_rename(self):
+        with mock.patch.object(rt, "boot_time", return_value=1234.0):
+            first = rt.save_snapshot([self.entry("s1")])
+            second = rt.save_snapshot([self.entry("s2")], auto=True)
+        self.assertNotEqual(first, second)
+        self.assertIn("-auto", second.stem)
+        data = json.loads(second.read_text())
+        self.assertEqual((data["format"], data["auto"], data["boot"]), (rt.SNAPSHOT_FORMAT, True, 1234.0))
+        self.assertEqual(os.readlink(self.dir / "latest.json"), second.name)
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.startswith(".")], [])
+
+    def test_two_saves_in_one_second_keep_both(self):
+        paths = {rt.save_snapshot([self.entry(f"s{i}")]) for i in range(3)}
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(all(json.loads(p.read_text())["sessions"] for p in paths))
+
+    def test_a_failed_write_leaves_no_temporary_file(self):
+        target = self.dir / "x.json"
+        with mock.patch.object(rt.os, "fsync", side_effect=OSError("disk full")), \
+             self.assertRaises(OSError):
+            rt._write_atomic(target, "{}")
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_unreadable_snapshots_load_as_empty_with_a_message(self):
+        cases = {"truncated": '{"sessions": [', "a list": "[1, 2]",
+                 "format as text": '{"format": "2", "sessions": []}',
+                 "sessions as an object": '{"sessions": {"a": 1}}'}
+        for what, text in cases.items():
+            f = self.dir / "bad.json"
+            f.write_text(text)
+            with self.subTest(what), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertEqual(rt.load_snapshot(f), [])
+                self.assertIn("not a readable snapshot", err.getvalue())
+
+    def test_entries_that_are_not_objects_are_dropped(self):
+        f = self.dir / "mixed.json"
+        f.write_text(json.dumps({"sessions": [self.entry("s1"), 3, "x", None]}))
+        self.assertEqual(self.ids(rt.load_snapshot(f)), ["s1"])
+
+    def test_a_name_a_save_has_claimed_is_skipped_quietly(self):
+        (self.dir / "claimed.json").write_text("")
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(rt.snapshot_index(), [])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_newer_format_is_read_with_a_warning(self):
+        f = self.dir / "new.json"
+        f.write_text(json.dumps({"format": rt.SNAPSHOT_FORMAT + 1, "sessions": [self.entry("s1")]}))
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(len(rt.load_snapshot(f)), 1)
+        self.assertIn("newer restore", err.getvalue())
+
+    def test_load_adds_what_the_last_snapshot_before_the_restart_had(self):
+        now = time.time()
+        boot0, boot1 = now - 7200, now - 3600
+        before = self.write("before.json", ["s1", "s2", "s3"], boot1 - 600, boot=boot0)
+        self.point_latest(self.write("after-auto.json", ["s1"], boot1 + 600, boot=boot1, auto=True))
+        entries, added = rt.load_latest(boot1, now)
+        self.assertEqual(self.ids(entries), ["s1", "s2", "s3"])
+        self.assertEqual(added, [(before, 2)])
+
+    def test_a_second_restart_keeps_the_sessions_of_the_first(self):
+        # 3 sessions run, restart; s1 is reopened and saved; restart again
+        now = time.time()
+        boot0, boot1, boot2 = now - 9000, now - 6000, now - 3000
+        self.write("a.json", ["s1", "s2", "s3"], boot1 - 600, boot=boot0)
+        b = self.write("b-auto.json", ["s1"], boot1 + 600, boot=boot1, auto=True)
+        self.point_latest(b)
+        entries, added = rt.load_latest(boot2, now)
+        self.assertEqual(self.ids(entries), ["s1", "s2", "s3"])
+        self.assertEqual([n for _, n in added], [2])
+
+    def test_earlier_boots_count_for_a_week_the_last_one_always(self):
+        now = time.time()
+        day = 86400
+        self.write("old.json", ["old"], now - 20 * day, boot=now - 21 * day)
+        self.write("week.json", ["week"], now - 10 * day, boot=now - 11 * day)
+        last = self.write("last.json", ["s1", "last"], now - 9 * day, boot=now - 10 * day)
+        self.point_latest(self.write("now.json", ["s1"], now - 60, boot=now - 3600))
+        entries, added = rt.load_latest(now - 3600, now)
+        # last.json is 9 days old but is the boot just before this one; the others are older than a week
+        self.assertEqual(self.ids(entries), ["last", "s1"])
+        self.assertEqual(added, [(last, 1)])
+
+    def test_order_comes_from_the_timestamp_not_the_file_time(self):
+        # a copy that reset every mtime to now must not change which snapshot came before the restart
+        now = time.time()
+        boot = now - 3600
+        self.write("before.json", ["s1", "s2"], boot - 600, boot=boot - 7200, mtime=now)
+        self.point_latest(self.write("after.json", ["s1"], boot + 600, boot=boot, mtime=now))
+        entries, _ = rt.load_latest(boot, now)
+        self.assertEqual(self.ids(entries), ["s1", "s2"])
+
+    def test_load_is_latest_alone_when_earlier_boots_add_nothing(self):
+        now = time.time()
+        boot = now - 3600
+        self.write("older.json", ["s1"], boot - 7200, boot=boot - 9000)
+        self.point_latest(self.write("before.json", ["s1", "s2"], boot - 600, boot=boot - 3000))
+        entries, added = rt.load_latest(boot, now)
+        self.assertEqual((self.ids(entries), added), (["s1", "s2"], []))
+
+    def test_latest_from_before_the_restart_still_gets_older_boots(self):
+        # s9 ran two boots ago and was not reopened in the boot latest comes from
+        now = time.time()
+        boot = now - 3600
+        older = self.write("older.json", ["s1", "s9"], boot - 7200, boot=boot - 9000)
+        self.point_latest(self.write("before.json", ["s1"], boot - 600, boot=boot - 3000))
+        entries, added = rt.load_latest(boot, now)
+        self.assertEqual((self.ids(entries), added), (["s1", "s9"], [(older, 1)]))
+
+    def test_load_is_latest_alone_when_the_boot_time_is_unknown(self):
+        now = time.time()
+        self.write("before.json", ["s1", "s2"], now - 7200)
+        self.point_latest(self.write("after.json", ["s1"], now))
+        with mock.patch.object(rt, "boot_time", return_value=None):
+            entries, added = rt.load_latest()
+        self.assertEqual((len(entries), added), (1, []))
+
+    def test_auto_save_skips_when_only_pids_and_titles_changed(self):
+        self.point_latest(self.write("a.json", ["s1"], time.time() - 60))
+        moved = [self.entry("s1", pid=200, window_title="⠂ thinking")]
+        with mock.patch.object(rt, "snapshot_active", return_value=moved), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rt.auto_save()
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(len(list(self.dir.glob("*-auto*.json"))), 0)
+
+    def test_auto_save_saves_when_a_session_moved_or_appeared(self):
+        self.point_latest(self.write("a.json", ["s1"], time.time() - 60))
+        for active in ([self.entry("s1", tab_index=2)], [self.entry("s1"), self.entry("s2")]):
+            with mock.patch.object(rt, "snapshot_active", return_value=active), \
+                 mock.patch.object(rt, "boot_time", return_value=None), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                rt.auto_save()
+            self.assertIn(f"saved {len(active)} session(s)", out.getvalue())
+        self.assertEqual(len(list(self.dir.glob("*-auto*.json"))), 2)
+
+    def test_auto_save_keeps_latest_when_nothing_runs(self):
+        latest = self.write("a.json", ["s1", "s2"], time.time() - 60)
+        self.point_latest(latest)
+        with mock.patch.object(rt, "snapshot_active", return_value=[]):
+            rt.auto_save()
+        self.assertEqual((self.dir / "latest.json").resolve(), latest.resolve())
+
+    def test_prune_deletes_only_old_automatic_snapshots(self):
+        now, old = time.time(), time.time() - (rt.AUTO_KEEP_DAYS + 1) * 86400
+        boot = now - 3600
+        old_auto = self.write("1-auto.json", ["s1"], old - 60, boot=old - 9000, auto=True)
+        old_manual = self.write("2.json", ["s1"], old - 30, boot=old - 9000)
+        last_before_boot = self.write("3-auto.json", ["s1"], old, boot=old - 100, auto=True)
+        new_auto = self.write("4-auto.json", ["s1"], now, boot=boot, auto=True)
+        self.point_latest(new_auto)
+        self.assertEqual(rt.prune_auto_snapshots(boot=boot), 1)
+        self.assertFalse(old_auto.exists())
+        self.assertTrue(all(f.exists() for f in (old_manual, last_before_boot, new_auto)))
+
+    def test_the_log_is_cut_back_from_its_start(self):
+        log = self.dir / "autosave.log"
+        log.write_bytes(b"".join(b"line %06d\n" % i for i in range(rt.LOG_MAX_BYTES // 12 + 5000)))
+        rt._trim_log()
+        text = log.read_text()
+        self.assertLessEqual(len(text), rt.LOG_MAX_BYTES // 2)
+        self.assertTrue(text.startswith("line "))
+        self.assertEqual(rt._log_tail(1), [text.splitlines()[-1]])
+
+
+class BootTime(unittest.TestCase):
+    def test_macos_reads_sysctl_by_its_full_path(self):
+        out = "{ sec = 1794316008, usec = 806823 } Tue Nov 10 07:06:48 2026\n"
+        with mock.patch.object(rt, "IS_MACOS", True), \
+             mock.patch.object(rt.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, out, "")) as run:
+            self.assertEqual(rt.boot_time(), 1794316008.0)
+        self.assertEqual(run.call_args[0][0][0], "/usr/sbin/sysctl")
+
+    def test_macos_without_sysctl_is_unknown_not_a_crash(self):
+        with mock.patch.object(rt, "IS_MACOS", True), \
+             mock.patch.object(rt.subprocess, "run", side_effect=FileNotFoundError("sysctl")):
+            self.assertIsNone(rt.boot_time())
+
+    def test_linux_reads_btime(self):
+        with mock.patch.object(rt, "IS_MACOS", False), \
+             mock.patch.object(rt.Path, "read_text", return_value="cpu  1 2 3\nbtime 1700000000\n"):
+            self.assertEqual(rt.boot_time(), 1700000000.0)
+
+
+class AutosaveSchedule(unittest.TestCase):
+    """restore --autosave: the launchd job and systemd timer it writes."""
+
+    def test_launchd_job_runs_save_auto_on_the_interval_with_this_path(self):
+        import plistlib
+        job = plistlib.loads(rt.launchd_plist(15, {"PATH": "/opt/homebrew/bin:/usr/bin"}))
+        self.assertEqual(job["ProgramArguments"][1:], ["--save", "--auto"])
+        self.assertTrue(job["ProgramArguments"][0].endswith("restore_terminals.py"))
+        self.assertEqual(job["StartInterval"], 900)
+        self.assertEqual(job["EnvironmentVariables"]["PATH"], "/opt/homebrew/bin:/usr/bin")
+        self.assertEqual(job["StandardOutPath"], str(rt.AUTOSAVE_LOG))
+
+    def test_systemd_units_quote_and_escape_what_systemd_would_expand(self):
+        with mock.patch.object(rt, "autosave_command",
+                               return_value=["/home/a b/50%$x/restore_terminals.py", "--save", "--auto"]):
+            units = rt.systemd_units(10, {"PATH": "/opt/%h/bin:/x$y", "DISPLAY": ":0"})
+        service = units[f"{rt.AUTOSAVE_NAME}.service"]
+        timer = units[f"{rt.AUTOSAVE_NAME}.timer"]
+        self.assertIn('ExecStart="/home/a b/50%%$$x/restore_terminals.py" "--save" "--auto"', service)
+        self.assertIn('Environment="PATH=/opt/%%h/bin:/x$y"', service)   # no $ expansion here
+        self.assertIn('Environment="DISPLAY=:0"', service)
+        self.assertIn("OnUnitActiveSec=10min", timer)
+        self.assertIn("WantedBy=timers.target", timer)
+
+    def run_autosave(self, value, execute, mac=True, results=None, loaded=False, unwritable=False):
+        """Run autosave with the scheduler mocked; results maps a command's
+        second word to its exit code. Returns code, commands run, files left, stdout, stderr."""
+        args = types.SimpleNamespace(autosave=value, execute=execute)
+        calls = []
+
+        def run(cmd):
+            calls.append(cmd)
+            word = cmd[1] if cmd[1] != "--user" else cmd[2]
+            if word in ("print", "is-active", "is-enabled"):
+                ok = loaded
+                return subprocess.CompletedProcess(cmd, 0 if ok else 1,
+                                                   "active\n" if ok and word == "is-active" else "", "")
+            return subprocess.CompletedProcess(cmd, (results or {}).get(word, 0), "", "boom")
+        with tempfile.TemporaryDirectory() as d:
+            agents = Path(d) / "LaunchAgents"
+            patches = [mock.patch.object(rt, "IS_MACOS", mac),
+                       mock.patch.object(rt, "LAUNCH_AGENT", agents / "job.plist"),
+                       mock.patch.object(rt, "SYSTEMD_USER", Path(d) / "systemd"),
+                       mock.patch.object(rt, "AUTOSAVE_LOG", Path(d) / "autosave.log"),
+                       mock.patch.object(rt, "_run", side_effect=run),
+                       mock.patch("sys.stdout", new_callable=io.StringIO),
+                       mock.patch("sys.stderr", new_callable=io.StringIO)]
+            if not mac and not Path("/proc").is_dir():
+                patches.append(mock.patch.object(rt.Path, "is_dir", return_value=True))
+            if value == "off":       # something to delete
+                agents.mkdir()
+                (agents / "job.plist").write_text("x")
+            if unwritable:
+                agents.mkdir(exist_ok=True)
+                agents.chmod(0o500)
+            for p in patches:
+                p.start()
+            try:
+                code = rt.autosave(args)
+                out, err = sys.stdout.getvalue(), sys.stderr.getvalue()
+            finally:
+                for p in reversed(patches):
+                    p.stop()
+                if unwritable:
+                    agents.chmod(0o700)
+            files = sorted(str(p.relative_to(d)) for p in Path(d).rglob("*") if p.is_file())
+        return code, calls, files, out, err
+
+    def test_without_execute_it_changes_nothing(self):
+        code, calls, files, out, _ = self.run_autosave("10", execute=False)
+        self.assertEqual((code, calls, files), (0, [], []))
+        self.assertIn("dry-run", out)
+        self.assertIn("--save --auto", out)
+
+    def test_on_macos_it_writes_then_unloads_the_old_job_then_loads(self):
+        code, calls, files, _, _ = self.run_autosave("5", execute=True)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[1] for c in calls], ["bootout", "bootstrap"])
+        self.assertEqual(files, ["LaunchAgents/job.plist"])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root writes anywhere")
+    def test_a_failed_write_leaves_the_old_schedule_running(self):
+        code, calls, files, _, err = self.run_autosave("5", execute=True, unwritable=True)
+        self.assertEqual((code, calls), (1, []))
+        self.assertIn("the schedule was not changed", err)
+
+    def test_a_failed_load_says_no_schedule_runs(self):
+        code, calls, files, _, err = self.run_autosave("5", execute=True, results={"bootstrap": 5})
+        self.assertEqual(code, 1)
+        self.assertIn("no schedule runs", err)
+        self.assertEqual(files, ["LaunchAgents/job.plist"])
+
+    def test_off_unloads_and_deletes_the_job(self):
+        code, calls, files, _, _ = self.run_autosave("off", execute=True)
+        self.assertEqual((code, [c[1] for c in calls], files), (0, ["bootout", "print"], []))
+
+    def test_off_keeps_the_files_when_the_job_is_still_loaded(self):
+        code, _, files, _, err = self.run_autosave("off", execute=True, loaded=True)
+        self.assertEqual((code, files), (1, ["LaunchAgents/job.plist"]))
+        self.assertIn("did not unload", err)
+
+    def test_on_linux_it_enables_a_user_timer(self):
+        code, calls, files, _, _ = self.run_autosave("10", execute=True, mac=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[-1], ["systemctl", "--user", "enable", "--now",
+                                     f"{rt.AUTOSAVE_NAME}.timer"])
+        self.assertEqual(files, [f"systemd/{rt.AUTOSAVE_NAME}.service",
+                                 f"systemd/{rt.AUTOSAVE_NAME}.timer"])
+
+    def test_it_takes_minutes_off_or_status(self):
+        for bad in ("0", "ten", "-5", "²"):
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(rt.autosave(types.SimpleNamespace(autosave=bad, execute=True)), 2)
+
+    def test_flags_it_does_not_combine_with(self):
+        for extra in (["--auto"], ["--autosave", "--save"], ["--autosave", "5", "--load"]):
+            out = subprocess.run([sys.executable, str(ROOT / "restore_terminals.py"), *extra],
+                                 capture_output=True, text=True)
+            self.assertEqual(out.returncode, 2, extra)
+
+
 if __name__ == "__main__":
     unittest.main()
